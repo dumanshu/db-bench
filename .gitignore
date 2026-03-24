@@ -1,0 +1,12 @@
+__pycache__/
+*.pyc
+*.pyo
+*.pem
+*.pem.pub
+*.egg-info/
+dist/
+build/
+.env
+*.state.json
+aurora-bench-state.json
+results/

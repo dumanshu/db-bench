@@ -8,7 +8,7 @@ Monorepo for database benchmarking tools on AWS. Each subdirectory contains scri
 common/          Shared AWS, SSH, and utility modules
 tidb/            TiDB on k3s + TiDB Operator (multi-AZ, TiCDC replication)
 valkey/          Valkey with Envoy proxy (standalone and cluster modes)
-aurora/          Aurora benchmarking (planned)
+aurora/          Aurora MySQL benchmarking (sysbench, IO-Optimized storage)
 ```
 
 ## Common Library
@@ -19,6 +19,66 @@ aurora/          Aurora benchmarking (planned)
 - **ssh.py** -- SSH command execution, SCP file transfer, wait-for-ready
 - **util.py** -- Timestamps, logging, AWS session helpers, AMI resolution
 - **types.py** -- Shared dataclasses (`InstanceInfo`, `BootstrapContext`)
+
+## Aurora MySQL
+
+Provisions an Aurora MySQL cluster with IO-Optimized storage (aurora-iopt1) and an EC2 client instance pre-loaded with sysbench. Includes custom IUD workloads matching production read/write ratios, fill-phase data generation via INSERT...SELECT doubling, snapshot/restore workflow, and production baseline comparison reporting.
+
+### Features
+
+- **IO-Optimized storage**: aurora-iopt1 for consistent throughput
+- **Custom workloads**: IUD (68% insert, 28% update, 4% delete) and mixed (88% read, 8% insert, 3% update, 1% delete) Lua scripts matching production ratios
+- **Fill phase**: INSERT...SELECT doubling to fill buffer pool to N x instance RAM
+- **Snapshot/restore**: Create cluster snapshots after fill, restore to skip re-filling
+- **Parallel sysbench**: Run multiple sysbench processes concurrently
+- **InnoDB row counter measurement**: Tracks actual insert/update/delete/read rates
+- **CloudWatch integration**: Aurora CPU, network throughput metrics
+- **Client CPU monitoring**: mpstat-based EC2 client utilization tracking
+- **Production baseline comparison**: Automatic comparison against known production metrics
+- **Dual AWS profile support**: Separate profiles for EC2/VPC and RDS operations
+
+### Quick Start
+
+```bash
+# Generate SSH key (if not already done)
+ssh-keygen -t ed25519 -f aurora/aurora-bench-key.pem -N ""
+
+# Provision (default: db.r8g.xlarge Aurora, c8g.24xlarge EC2 client)
+python3 -m aurora.setup --seed auroralt-001 --aws-profile sandbox
+
+# Provision with larger instance
+python3 -m aurora.setup --instance-type db.r8g.16xlarge --aws-profile sandbox
+
+# Validate (checks cluster, connectivity, sysbench, runs quick benchmark)
+python3 -m aurora.validate --seed auroralt-001 --aws-profile sandbox
+
+# Fill phase (create background data to pressure buffer pool)
+python3 -m aurora.benchmark --fill --seed auroralt-001 --aws-profile sandbox
+
+# Snapshot after fill (avoids re-filling on future runs)
+python3 -m aurora.setup --snapshot --seed auroralt-001
+
+# Benchmark (custom mixed workload, 64 threads, 5 minutes)
+python3 -m aurora.benchmark --seed auroralt-001 --aws-profile sandbox
+
+# Benchmark with parallel sysbench processes
+python3 -m aurora.benchmark --parallel 4 --threads 64 --seed auroralt-001
+
+# Restore from snapshot (skip fill on next provision)
+python3 -m aurora.setup --restore-snapshot <snapshot-id> --seed auroralt-002
+
+# Cleanup
+python3 -m aurora.setup --cleanup --seed auroralt-001 --aws-profile sandbox
+```
+
+### Additional Tools
+
+- **aurora/ec2_sampler.py** -- EC2 instance type sampling and selection
+- **aurora/parse_window.py** -- CloudWatch metric window parsing and analysis
+- **aurora/generate_report.py** -- Benchmark result report generation
+- **aurora/calibrate.sh** -- Instance calibration shell script
+- **aurora/run_final.sh** -- Full benchmark run orchestration
+- **aurora/modify_instance.sh** -- Live Aurora instance type modification
 
 ## TiDB
 
@@ -115,6 +175,7 @@ All modules are designed to run from the repo root using `python3 -m`:
 # From db-bench/
 python3 -m tidb.setup --help
 python3 -m valkey.setup --help
+python3 -m aurora.setup --help
 ```
 
 ## References
@@ -124,3 +185,5 @@ python3 -m valkey.setup --help
 - [TiCDC Architecture](https://docs.pingcap.com/tidb/stable/ticdc-architecture/)
 - [Valkey Documentation](https://valkey.io/docs/)
 - [Envoy Proxy](https://www.envoyproxy.io/docs/)
+- [Aurora MySQL Documentation](https://docs.aws.amazon.com/AmazonRDS/latest/AuroraUserGuide/Aurora.AuroraMySQL.html)
+- [sysbench](https://github.com/akopytov/sysbench)
