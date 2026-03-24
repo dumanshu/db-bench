@@ -161,6 +161,31 @@ def discover_tidb_host(region: str, profile: Optional[str], seed: str) -> str:
     raise SystemExit("ERROR: Unable to discover TiDB host; specify --host explicitly.")
 
 
+def discover_tidb_endpoint(region: str, profile: Optional[str], seed: str) -> str:
+    """Return a k3s node private IP for NodePort access from a decoupled client."""
+    client = ec2_client(profile, region)
+    stack = f"tidb-loadtest-{seed}"
+    filters = [
+        {"Name": "tag:Project", "Values": [stack]},
+        {"Name": "instance-state-name", "Values": ["running"]},
+    ]
+    resp = client.describe_instances(Filters=filters)
+    for reservation in resp.get("Reservations", []):
+        for inst in reservation.get("Instances", []):
+            tags = {tag["Key"]: tag["Value"] for tag in inst.get("Tags", [])}
+            role = tags.get("Role", "")
+            if role == "control":
+                ip = inst.get("PrivateIpAddress")
+                if ip:
+                    return ip
+    for reservation in resp.get("Reservations", []):
+        for inst in reservation.get("Instances", []):
+            ip = inst.get("PrivateIpAddress")
+            if ip:
+                return ip
+    raise SystemExit("ERROR: Cannot discover TiDB endpoint for remote client.")
+
+
 def get_instance_info(region: str, profile: Optional[str], seed: str) -> dict:
     client = ec2_client(profile, region)
     stack = f"tidb-loadtest-{seed}"
@@ -184,9 +209,10 @@ def get_instance_info(region: str, profile: Optional[str], seed: str) -> dict:
     return info
 
 
-def get_cluster_info(host: str, key_path: Path, port: int = DEFAULT_PORT) -> dict:
+def get_cluster_info(host: str, key_path: Path, port: int = DEFAULT_PORT,
+                     db_host: str = "127.0.0.1") -> dict:
     script = f"""
-mysql -h 127.0.0.1 -P {port} -u root -N -e "
+mysql -h {db_host} -P {port} -u root -N -e "
 SELECT 'tidb_version', TIDB_VERSION();
 SELECT 'tidb_count', COUNT(*) FROM information_schema.cluster_info WHERE TYPE='tidb';
 SELECT 'tikv_count', COUNT(*) FROM information_schema.cluster_info WHERE TYPE='tikv';
@@ -417,13 +443,14 @@ mysql -h "$DOWNSTREAM_IP" -P {self.downstream_port} -u root -N -e \
 # ---------------------------------------------------------------------------
 
 
-def print_cluster_summary(host: str, key_path: Path, region: str, profile: str, seed: str, port: int = DEFAULT_PORT):
+def print_cluster_summary(host: str, key_path: Path, region: str, profile: str, seed: str,
+                          port: int = DEFAULT_PORT, db_host: str = "127.0.0.1"):
     log("")
     log("=" * 80)
     log("CLUSTER CONFIGURATION")
     log("=" * 80)
     inst_info = get_instance_info(region, profile, seed)
-    cluster_info = get_cluster_info(host, key_path, port)
+    cluster_info = get_cluster_info(host, key_path, port, db_host=db_host)
     log(f"Region: {region} | Zone: {inst_info.get('az', 'unknown')}")
     log(f"TiDB Version: {cluster_info.get('tidb_version', 'unknown')}")
     log(f"Regions: {cluster_info.get('region_count', 'N/A')}")
@@ -463,7 +490,8 @@ def print_cluster_summary(host: str, key_path: Path, region: str, profile: str, 
     log(f"  Total server hosts: {server_count} (each pod on its own dedicated host)")
     log("")
 
-    disk_info = get_disk_utilization(host, key_path, port, DEFAULT_EBS_SIZE_GB)
+    disk_info = get_disk_utilization(host, key_path, port, DEFAULT_EBS_SIZE_GB,
+                                     db_host=db_host)
     ebs_type = "gp3"
     ebs_size_gb = disk_info.get('ebs_total_gb', DEFAULT_EBS_SIZE_GB)
     ebs_iops = 3000
@@ -498,18 +526,19 @@ def print_cluster_summary(host: str, key_path: Path, region: str, profile: str, 
 def start_resource_monitor(host: str, key_path: Path, interval: int = 60,
                            cost_tracker: Optional[CostTracker] = None,
                            start_time: Optional[float] = None,
-                           port: int = DEFAULT_PORT) -> threading.Thread:
+                           port: int = DEFAULT_PORT,
+                           db_host: str = "127.0.0.1") -> threading.Thread:
     stop_event = threading.Event()
     _start_time = start_time or time.time()
 
     def monitor_resources():
         while not stop_event.is_set():
             elapsed = time.time() - _start_time
-            script = f"TIDB_PORT={port}\n" + """
+            script = f"TIDB_PORT={port}\nDB_HOST={db_host}\n" + """
 echo "--- $(date +%H:%M:%S) Resource Snapshot ---"
 CPU=$(top -bn1 | grep "Cpu(s)" | awk '{print $2}' | cut -d'%' -f1 2>/dev/null || echo "N/A")
 MEM=$(free -m | awk 'NR==2{printf "%.0f%%", $3*100/$2}' 2>/dev/null || echo "N/A")
-CONN=$(mysql -h 127.0.0.1 -P $TIDB_PORT -u root -N -e "SELECT VARIABLE_VALUE FROM performance_schema.global_status WHERE VARIABLE_NAME='Threads_connected';" 2>/dev/null || echo "N/A")
+CONN=$(mysql -h $DB_HOST -P $TIDB_PORT -u root -N -e "SELECT VARIABLE_VALUE FROM performance_schema.global_status WHERE VARIABLE_NAME='Threads_connected';" 2>/dev/null || echo "N/A")
 echo "Client: CPU=${CPU}% Mem=${MEM} Conn=${CONN}"
 echo "Pods:"
 kubectl top pods -n tidb-cluster --no-headers 2>/dev/null | awk '{printf "  %-20s CPU:%-6s Mem:%s\\n", $1, $2, $3}' | head -8 || echo "  N/A"
@@ -535,13 +564,14 @@ def stop_resource_monitor(thread: threading.Thread):
         thread.stop_event.set()
 
 
-def fetch_resource_snapshot_compact(host: str, key_path: Path, port: int = DEFAULT_PORT) -> str:
-    script = f"TIDB_PORT={port}\n" + '''
+def fetch_resource_snapshot_compact(host: str, key_path: Path, port: int = DEFAULT_PORT,
+                                    db_host: str = "127.0.0.1") -> str:
+    script = f"TIDB_PORT={port}\nDB_HOST={db_host}\n" + '''
 CPU=$(top -bn1 | grep "Cpu(s)" | awk '{printf "%.0f%%", $2+$4}' 2>/dev/null || echo "N/A")
 MEM=$(free -m | awk 'NR==2{printf "%.0f%%", $3*100/$2}' 2>/dev/null || echo "N/A")
 echo "CLIENT cpu=$CPU mem=$MEM"
 
-mysql -h 127.0.0.1 -P $TIDB_PORT -u root -N -e "
+mysql -h $DB_HOST -P $TIDB_PORT -u root -N -e "
 SELECT
     CONCAT('NODE ', TYPE, '-', SUBSTRING_INDEX(SUBSTRING_INDEX(INSTANCE, '.', 1), '-', -1),
            ' cpu=', ROUND((1 - MAX(CASE WHEN NAME='idle' AND DEVICE_NAME='usage' THEN VALUE ELSE NULL END)) * 100), '%',
@@ -556,19 +586,20 @@ ORDER BY TYPE, INSTANCE;
     return result.stdout.strip()
 
 
-def fetch_final_resource_snapshot(host: str, key_path: Path, port: int = DEFAULT_PORT):
+def fetch_final_resource_snapshot(host: str, key_path: Path, port: int = DEFAULT_PORT,
+                                  db_host: str = "127.0.0.1"):
     log("")
     log("=" * 70)
     log("FINAL RESOURCE UTILIZATION")
     log("=" * 70)
-    script = f"TIDB_PORT={port}\n" + '''
+    script = f"TIDB_PORT={port}\nDB_HOST={db_host}\n" + '''
 echo "--- Client VM ---"
 echo "CPU: $(top -bn1 | grep "Cpu(s)" | awk '{printf "%.1f%% user, %.1f%% sys, %.1f%% idle", $2, $4, $8}')"
 echo "Memory: $(free -h | awk 'NR==2{printf "%s used / %s total (%.1f%%)", $3, $2, $3*100/$2}')"
 echo "Load: $(cat /proc/loadavg | awk '{print $1, $2, $3}')"
 echo ""
 echo "--- TiDB Cluster Nodes ---"
-mysql -h 127.0.0.1 -P $TIDB_PORT -u root -N -e "
+mysql -h $DB_HOST -P $TIDB_PORT -u root -N -e "
 SELECT
     CONCAT(UPPER(TYPE), '-', SUBSTRING_INDEX(SUBSTRING_INDEX(INSTANCE, '.', 1), '-', -1),
            '  CPU: ', ROUND((1 - MAX(CASE WHEN NAME='idle' AND DEVICE_NAME='usage' THEN VALUE ELSE NULL END)) * 100), '%',
@@ -593,7 +624,8 @@ ORDER BY TYPE, INSTANCE;
 
 def get_disk_utilization(host: str, key_path: Path, port: int = DEFAULT_PORT,
                          ebs_size_gb: int = DEFAULT_EBS_SIZE_GB,
-                         database: str = DEFAULT_DATABASE) -> dict:
+                         database: str = DEFAULT_DATABASE,
+                         db_host: str = "127.0.0.1") -> dict:
     script = f'''
 DF_LINE=$(df -BG / | tail -1)
 EBS_USED=$(echo "$DF_LINE" | awk '{{print $3}}' | tr -d 'G')
@@ -603,12 +635,12 @@ echo "EBS_USED=$EBS_USED"
 echo "EBS_TOTAL=$EBS_TOTAL"
 echo "EBS_PCT=$EBS_PCT"
 
-mysql -h 127.0.0.1 -P {port} -u root -N -e "
+mysql -h {db_host} -P {port} -u root -N -e "
 SELECT CONCAT('TIKV_STORE_BYTES=', IFNULL(SUM(CAPACITY) - SUM(AVAILABLE), 0))
 FROM INFORMATION_SCHEMA.TIKV_STORE_STATUS;
 " 2>/dev/null || echo "TIKV_STORE_BYTES=0"
 
-mysql -h 127.0.0.1 -P {port} -u root -N -e "
+mysql -h {db_host} -P {port} -u root -N -e "
 SELECT CONCAT('DB_DATA_BYTES=', IFNULL(SUM(data_length + index_length), 0))
 FROM information_schema.tables
 WHERE table_schema = '{database}';
@@ -665,7 +697,10 @@ def calculate_bulk_load_params(target_disk_pct: float, ebs_total_gb: int,
 def run_bulk_data_load(host: str, key_path: Path, target_disk_pct: float,
                        num_tables: int, port: int = DEFAULT_PORT,
                        database: str = DEFAULT_DATABASE,
-                       ebs_size_gb: int = DEFAULT_EBS_SIZE_GB) -> dict:
+                       ebs_size_gb: int = DEFAULT_EBS_SIZE_GB,
+                       db_host: str = "127.0.0.1",
+                       bench_host: str = None,
+                       bench_key: Path = None) -> dict:
     log("")
     log("=" * 70)
     log("PHASE 1: BULK DATA LOAD")
@@ -674,7 +709,8 @@ def run_bulk_data_load(host: str, key_path: Path, target_disk_pct: float,
 
     log("")
     log("Measuring current disk utilization...")
-    disk_before = get_disk_utilization(host, key_path, port, ebs_size_gb, database)
+    disk_before = get_disk_utilization(host, key_path, port, ebs_size_gb, database,
+                                       db_host=db_host)
     log(f"  EBS volume: {disk_before['ebs_total_gb']}GB total, "
         f"{disk_before['ebs_used_gb']}GB used ({disk_before['ebs_used_pct']}%)")
     log(f"  TiKV stores: {disk_before['tikv_store_gb']:.1f}GB ({disk_before['tikv_store_pct']:.1f}% of EBS)")
@@ -695,15 +731,20 @@ def run_bulk_data_load(host: str, key_path: Path, target_disk_pct: float,
     log(f"  Estimated total disk: {params['estimated_total_gb']:.1f}GB ({params['estimated_disk_pct']:.1f}%)")
     log("")
 
+    sb_host = bench_host or host
+    sb_key = bench_key or key_path
+
     load_start = time.time()
-    run_sysbench_prepare(host, key_path, num_tables, params['rows_per_table'], port, database)
+    run_sysbench_prepare(sb_host, sb_key, num_tables, params['rows_per_table'], port, database,
+                         db_host=db_host)
     load_duration = time.time() - load_start
 
     log("")
     log("Waiting 30s for TiKV compaction to settle...")
     time.sleep(30)
 
-    disk_after = get_disk_utilization(host, key_path, port, ebs_size_gb, database)
+    disk_after = get_disk_utilization(host, key_path, port, ebs_size_gb, database,
+                                      db_host=db_host)
     log("")
     log("Disk utilization after bulk load:")
     log(f"  EBS volume: {disk_after['ebs_total_gb']}GB total, "
@@ -731,23 +772,24 @@ def run_bulk_data_load(host: str, key_path: Path, target_disk_pct: float,
 
 
 def run_sysbench_prepare(host: str, key_path: Path, tables: int, table_size: int,
-                          port: int = DEFAULT_PORT, database: str = DEFAULT_DATABASE):
+                          port: int = DEFAULT_PORT, database: str = DEFAULT_DATABASE,
+                          db_host: str = "127.0.0.1"):
     log(f"Preparing sysbench tables: {tables} tables x {table_size:,} rows in database '{database}'")
     estimated_row_size_bytes = 120
     total_rows = tables * table_size
     estimated_size_mb = (total_rows * estimated_row_size_bytes) / (1024 * 1024)
     log(f"  Estimated dataset size: {estimated_size_mb:,.1f} MB ({total_rows:,} total rows)")
     ssh_run(host, f"""
-mysql -h 127.0.0.1 -P {port} -u root -e "CREATE DATABASE IF NOT EXISTS {database};"
-EXISTING=$(mysql -h 127.0.0.1 -P {port} -u root -D {database} -N -e "
+mysql -h {db_host} -P {port} -u root -e "CREATE DATABASE IF NOT EXISTS {database};"
+EXISTING=$(mysql -h {db_host} -P {port} -u root -D {database} -N -e "
   SELECT table_name FROM information_schema.tables
   WHERE table_schema = '{database}' AND table_name LIKE 'sbtest%';
 " 2>/dev/null || true)
 for tbl in $EXISTING; do
-    mysql -h 127.0.0.1 -P {port} -u root -D {database} -e "DROP TABLE IF EXISTS $tbl;" 2>/dev/null || true
+    mysql -h {db_host} -P {port} -u root -D {database} -e "DROP TABLE IF EXISTS $tbl;" 2>/dev/null || true
 done
 sysbench oltp_read_write \\
-    --mysql-host=127.0.0.1 \\
+    --mysql-host={db_host} \\
     --mysql-port={port} \\
     --mysql-user=root \\
     --mysql-db={database} \\
@@ -756,7 +798,7 @@ sysbench oltp_read_write \\
     prepare
 echo ""
 echo "=== Dataset Size Report ==="
-mysql -h 127.0.0.1 -P {port} -u root -e "
+mysql -h {db_host} -P {port} -u root -e "
 SELECT
     table_schema AS db,
     COUNT(*) AS tables,
@@ -772,11 +814,12 @@ GROUP BY table_schema;
 
 
 def run_sysbench_cleanup(host: str, key_path: Path, tables: int,
-                          port: int = DEFAULT_PORT, database: str = DEFAULT_DATABASE):
+                          port: int = DEFAULT_PORT, database: str = DEFAULT_DATABASE,
+                          db_host: str = "127.0.0.1"):
     log("Cleaning up sysbench tables")
     ssh_run(host, f"""
 sysbench oltp_read_write \\
-    --mysql-host=127.0.0.1 \\
+    --mysql-host={db_host} \\
     --mysql-port={port} \\
     --mysql-user=root \\
     --mysql-db={database} \\

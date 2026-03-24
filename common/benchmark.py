@@ -1449,6 +1449,15 @@ def _build_deploy_params(args):
         password = ""
         workload = args.workload or "oltp_read_write"
 
+        client_state = _load_bench_client(seed)
+        if client_state.get("public_ip"):
+            from tidb.driver import discover_tidb_endpoint, DEFAULT_REGION, DEFAULT_PROFILE
+            region = args.region or DEFAULT_REGION
+            aws_profile = args.aws_profile or DEFAULT_PROFILE
+            tidb_endpoint = discover_tidb_endpoint(region, aws_profile, seed)
+        else:
+            tidb_endpoint = "127.0.0.1"
+
         if profile_name:
             profile = WORKLOAD_PROFILES[profile_name]
             tables = args.tables if args.tables is not None else profile["tables"]
@@ -1475,7 +1484,7 @@ def _build_deploy_params(args):
 
         return {
             "server_type": server_type,
-            "endpoint": "127.0.0.1",
+            "endpoint": tidb_endpoint,
             "port": port,
             "user": user,
             "password": password,
@@ -1915,7 +1924,8 @@ def _run_tidb_benchmark(
     from tidb.driver import (
         DEFAULT_EBS_SIZE_GB, TIDB_MYSQL_IGNORE_ERRORS, AWS_COSTS,
         ssh_run, ssh_capture, ssh_stream,
-        discover_tidb_host, get_instance_info, get_cluster_info,
+        discover_tidb_host, discover_tidb_endpoint,
+        get_instance_info, get_cluster_info,
         print_cluster_summary, fetch_resource_snapshot_compact,
         fetch_final_resource_snapshot, get_disk_utilization,
         run_bulk_data_load, run_sysbench_prepare, run_sysbench_cleanup,
@@ -1926,6 +1936,8 @@ def _run_tidb_benchmark(
     if not key_path.exists():
         raise SystemExit(f"ERROR: SSH key not found: {key_path}")
 
+    client_state = _load_bench_client(seed)
+
     if args.host:
         host = args.host
     else:
@@ -1933,11 +1945,29 @@ def _run_tidb_benchmark(
         host = discover_tidb_host(region, aws_profile, seed)
     log(f"Using TiDB host: {host}")
 
+    if client_state.get("public_ip"):
+        db_host = discover_tidb_endpoint(region, aws_profile, seed)
+        log(f"Using TiDB endpoint: {db_host}:{port} (from control node private IP)")
+    else:
+        db_host = "127.0.0.1"
+
+    # Determine benchmark execution host (sysbench runs on client VM when
+    # a decoupled benchmark client exists; cluster management stays on
+    # the control node via host/key_path).
+    if client_state and client_state.get("public_ip"):
+        bench_host = client_state["public_ip"]
+        bench_key = Path(client_state["key_path"])
+        log(f"Using decoupled client for benchmark: {bench_host}")
+    else:
+        bench_host = host
+        bench_key = key_path
+
     database = seeded_database_name(seed)
     log(f"Using seeded database name: {database} (seed={seed})")
 
     if args.cleanup_only:
-        run_sysbench_cleanup(host, key_path, tables, port, database)
+        run_sysbench_cleanup(bench_host, bench_key, tables, port, database,
+                             db_host=db_host)
         log("Cleanup complete.")
         return
 
@@ -1960,7 +1990,8 @@ def _run_tidb_benchmark(
             disk_fill_pct = 30
 
     try:
-        print_cluster_summary(host, key_path, region, aws_profile, seed, port)
+        print_cluster_summary(host, key_path, region, aws_profile, seed, port,
+                              db_host=db_host)
     except Exception as exc:
         log(f"WARNING: Could not fetch cluster summary "
             f"(AWS creds may be expired): {exc}")
@@ -1968,7 +1999,7 @@ def _run_tidb_benchmark(
 
     log("Disabling TiDB resource control (avoids error 8249)...")
     ssh_run(host, f"""
-mysql -h 127.0.0.1 -P {port} -u root -e \
+mysql -h {db_host} -P {port} -u root -e \
 "SET GLOBAL tidb_enable_resource_control = OFF;" 2>/dev/null || true
 """, key_path, strict=False)
 
@@ -1989,7 +2020,7 @@ mysql -h 127.0.0.1 -P {port} -u root -e \
         "host", role_types.get("client", "c7g.4xlarge"))
     server_type = role_types.get("tikv", default_type)
 
-    cluster_info = get_cluster_info(host, key_path, port)
+    cluster_info = get_cluster_info(host, key_path, port, db_host=db_host)
     server_count = (cluster_info.get("tidb_count", 2) +
                     cluster_info.get("tikv_count", 3) +
                     cluster_info.get("pd_count", 3))
@@ -1997,7 +2028,8 @@ mysql -h 127.0.0.1 -P {port} -u root -e \
         server_count += 8
 
     _disk_probe = get_disk_utilization(
-        host, key_path, port, DEFAULT_EBS_SIZE_GB, database)
+        host, key_path, port, DEFAULT_EBS_SIZE_GB, database,
+        db_host=db_host)
     detected_ebs_gb = _disk_probe.get("ebs_total_gb", DEFAULT_EBS_SIZE_GB)
     log(f"Detected EBS volume size: {detected_ebs_gb}GB")
 
@@ -2021,15 +2053,16 @@ mysql -h 127.0.0.1 -P {port} -u root -e \
         load_stats = run_bulk_data_load(
             host, key_path, target_disk_pct=disk_fill_pct,
             num_tables=tables, port=port, database=database,
-            ebs_size_gb=detected_ebs_gb,
+            ebs_size_gb=detected_ebs_gb, db_host=db_host,
+            bench_host=bench_host, bench_key=bench_key,
         )
         table_size = load_stats["rows_per_table"]
         log(f"Phase 1 complete: {load_stats['total_rows']:,} rows loaded")
         log(f"  Actual disk: {load_stats['disk_after']['ebs_used_pct']}% "
             f"of {load_stats['disk_after']['ebs_total_gb']}GB EBS")
     elif not args.skip_prepare:
-        run_sysbench_prepare(host, key_path, tables, table_size, port,
-                             database)
+        run_sysbench_prepare(bench_host, bench_key, tables, table_size, port,
+                             database, db_host=db_host)
 
     if args.prepare_only:
         log("Tables prepared. Skipping benchmark (--prepare-only).")
@@ -2064,16 +2097,17 @@ mysql -h 127.0.0.1 -P {port} -u root -e \
         return build_sysbench_cmd(
             host_ip="", key_path="", workload=workload,
             threads=w_threads, duration=w_duration, tables=tables,
-            table_size=table_size, endpoint="127.0.0.1", port=port,
+            table_size=table_size, endpoint=db_host, port=port,
             user="root", password="", db=database,
             report_interval=report_interval, extra_args=extra,
         )
 
     def _run_capture(cmd_str):
-        return ssh_capture(host, cmd_str + " 2>&1", key_path)
+        return ssh_capture(bench_host, cmd_str + " 2>&1", bench_key)
 
     def _resource_fn():
-        return fetch_resource_snapshot_compact(host, key_path, port)
+        return fetch_resource_snapshot_compact(host, key_path, port,
+                                               db_host=db_host)
 
     def _run_streaming(w_threads, w_duration):
         cmd = _build_cmd(w_threads, w_duration)
@@ -2085,7 +2119,7 @@ mysql -h 127.0.0.1 -P {port} -u root -e \
         if skip_trx:
             log(f"  Read-only mode: --skip_trx=true")
         result = run_benchmark_streaming(
-            host, key_path, cmd, ssh_stream,
+            bench_host, bench_key, cmd, ssh_stream,
             resource_fn=_resource_fn,
             format_report_fn=format_minute_report,
         )
@@ -2134,10 +2168,11 @@ mysql -h 127.0.0.1 -P {port} -u root -e \
         avg_row_size_bytes=200,
     )
 
-    fetch_final_resource_snapshot(host, key_path, port)
+    fetch_final_resource_snapshot(host, key_path, port, db_host=db_host)
     if load_stats:
         disk_final = get_disk_utilization(
-            host, key_path, port, detected_ebs_gb, database)
+            host, key_path, port, detected_ebs_gb, database,
+            db_host=db_host)
         log("")
         log("--- Final Disk Utilization ---")
         log(f"  EBS: {disk_final['ebs_used_gb']}GB / "
@@ -2154,6 +2189,7 @@ mysql -h 127.0.0.1 -P {port} -u root -e \
         cdc_tracker.print_summary()
 
     if args.cleanup:
-        run_sysbench_cleanup(host, key_path, tables, port, database)
+        run_sysbench_cleanup(bench_host, bench_key, tables, port, database,
+                             db_host=db_host)
 
     log("Benchmark complete.")
