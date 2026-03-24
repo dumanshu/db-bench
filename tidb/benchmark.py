@@ -17,7 +17,6 @@ import re
 import os
 import subprocess
 import sys
-import textwrap
 import threading
 import time
 from datetime import datetime
@@ -25,7 +24,9 @@ from pathlib import Path
 from typing import Optional
 
 import boto3
-from botocore.config import Config
+
+from common.util import BOTO_CONFIG, log, ts
+from common.ssh import ssh_run_simple, ssh_capture_simple, ssh_stream_simple
 
 DEFAULT_REGION = "us-east-1"
 DEFAULT_SEED = "tidblt-001"
@@ -531,28 +532,6 @@ MULTI_PHASE_PROFILES = {
     },
 }
 
-BOTO_CONFIG = Config(
-    retries={"max_attempts": 10, "mode": "adaptive"},
-    connect_timeout=15,
-    read_timeout=60,
-)
-
-# Global log file handle
-_log_file = None
-
-
-def ts():
-    return datetime.now().strftime("[%Y-%m-%dT%H:%M:%S]")
-
-
-def log(msg):
-    """Log message to stdout and optionally to log file."""
-    line = f"{ts()} {msg}"
-    print(line, flush=True)
-    if _log_file:
-        _log_file.write(line + "\n")
-        _log_file.flush()
-
 def ec2_client(profile: Optional[str], region: str):
     session = boto3.session.Session(profile_name=profile, region_name=region)
     return session.client("ec2", region_name=region, config=BOTO_CONFIG)
@@ -604,39 +583,11 @@ def get_instance_info(region: str, profile: Optional[str], seed: str) -> dict:
 
 
 def ssh_run(host: str, script: str, key_path: Path, strict: bool = True):
-    """Run a script on the remote host via SSH."""
-    full = textwrap.dedent(script).lstrip()
-    if strict:
-        full = "set -euo pipefail\n" + full
-    cmd = [
-        "ssh",
-        "-o", "BatchMode=yes",
-        "-o", "StrictHostKeyChecking=no",
-        "-o", "IdentitiesOnly=yes",
-        "-o", "ConnectTimeout=30",
-        "-i", str(key_path),
-        f"ec2-user@{host}",
-        "bash", "-s"
-    ]
-    subprocess.run(cmd, input=full, text=True, check=strict)
+    ssh_run_simple(host, key_path, script, strict=strict)
 
 
 def ssh_capture(host: str, script: str, key_path: Path):
-    """Run a script on the remote host and capture output."""
-    full = textwrap.dedent(script).lstrip()
-    full = "set -euo pipefail\n" + full
-    cmd = [
-        "ssh",
-        "-o", "BatchMode=yes",
-        "-o", "StrictHostKeyChecking=no",
-        "-o", "IdentitiesOnly=yes",
-        "-o", "ConnectTimeout=30",
-        "-i", str(key_path),
-        f"ec2-user@{host}",
-        "bash", "-s"
-    ]
-    result = subprocess.run(cmd, input=full, text=True, capture_output=True)
-    return result
+    return ssh_capture_simple(host, key_path, script, strict=True)
 
 
 def get_cluster_info(host: str, key_path: Path, port: int = DEFAULT_PORT) -> dict:
@@ -1163,25 +1114,7 @@ def format_minute_report(minute: int, intervals: list, resource_text: str) -> st
 
 
 def ssh_stream(host: str, script: str, key_path: Path):
-    """Run a script on the remote host, streaming stdout line by line."""
-    full = "set -euo pipefail\n" + textwrap.dedent(script).lstrip()
-    cmd = [
-        "ssh",
-        "-o", "BatchMode=yes",
-        "-o", "StrictHostKeyChecking=no",
-        "-o", "IdentitiesOnly=yes",
-        "-o", "ConnectTimeout=30",
-        "-i", str(key_path),
-        f"ec2-user@{host}",
-        "bash", "-s"
-    ]
-    proc = subprocess.Popen(
-        cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE, text=True
-    )
-    proc.stdin.write(full)
-    proc.stdin.close()
-    return proc
+    return ssh_stream_simple(host, key_path, script)
 
 
 def run_sysbench_streaming(
@@ -2027,27 +1960,27 @@ def parse_args():
 
 
 def main():
-    global _log_file
+    import common.util as _cu
+
     args = parse_args()
 
-    # Set up log file output
     log_path = None
     if args.output and args.output.lower() != 'none':
         log_path = Path(args.output).expanduser().resolve()
-    elif args.output is None:  # Auto-generate log file
+    elif args.output is None:
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         log_path = Path(f"tidb_benchmark_{args.profile}_{timestamp}.log").resolve()
 
     if log_path:
         log_path.parent.mkdir(parents=True, exist_ok=True)
-        _log_file = open(log_path, 'w')
+        _cu.LOG_TO_FILE = log_path
         print(f"Logging output to: {log_path}")
 
     try:
         _run_benchmark(args)
     finally:
-        if _log_file:
-            _log_file.close()
+        if log_path:
+            _cu.LOG_TO_FILE = None
             print(f"\nLog saved to: {log_path}")
 
 

@@ -9,38 +9,25 @@ import os
 import re
 import subprocess
 import sys
-from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, Tuple
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-import boto3
 import botocore
-from botocore.config import Config
+
+from common.types import InstanceInfo
+from common.util import BOTO_CONFIG
 
 DEFAULT_REGION = "us-east-1"
 DEFAULT_SEED = "vlklt-001"
 DEFAULT_PROFILE = os.environ.get("AWS_PROFILE", "sandbox")
-# Default to Envoy's end-to-end downstream request latency histogram
-# (includes listener processing; adjust with --stat-name as needed).
 DEFAULT_STAT = "downstream_rq_time"
 DEFAULT_WINDOW = 30
-BOTO_CONFIG = Config(
-    retries={"max_attempts": 10, "mode": "adaptive"},
-    connect_timeout=10,
-    read_timeout=10,
-)
-
-
-@dataclass
-class InstanceInfo:
-    role: str
-    public_ip: str
-    private_ip: str
 
 
 def aws_session(profile: str, region: str):
+    import boto3
     try:
         return boto3.session.Session(profile_name=profile, region_name=region)
     except botocore.exceptions.ProfileNotFound as exc:
@@ -64,6 +51,7 @@ def discover_instances(region: str, seed: str, profile: str) -> Dict[str, Instan
                 continue
             infos[role] = InstanceInfo(
                 role=role,
+                instance_id=inst["InstanceId"],
                 public_ip=inst.get("PublicIpAddress"),
                 private_ip=inst.get("PrivateIpAddress"),
             )

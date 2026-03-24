@@ -14,24 +14,13 @@ from pathlib import Path
 from typing import Optional
 
 import boto3
-from botocore.config import Config
 
-from common.util import ts
+from common.util import BOTO_CONFIG, log
 
 DEFAULT_REGION = "us-east-1"
 DEFAULT_SEED = "tidblt-001"
 DEFAULT_PROFILE = os.environ.get("AWS_PROFILE", "sandbox")
 DEFAULT_PORT = 30400
-
-BOTO_CONFIG = Config(
-    retries={"max_attempts": 10, "mode": "adaptive"},
-    connect_timeout=15,
-    read_timeout=60,
-)
-
-
-def log(msg):
-    print(f"{ts()} {msg}", flush=True)
 
 
 def ec2_client(profile: Optional[str], region: str):

@@ -8,32 +8,20 @@ import subprocess
 import sys
 import textwrap
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, Tuple
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-import boto3
 import botocore
-from botocore.config import Config
+
+from common.types import InstanceInfo
+from common.util import BOTO_CONFIG
 
 DEFAULT_REGION = "us-east-1"
 DEFAULT_SEED = "vlklt-001"
 DEFAULT_PROFILE = os.environ.get("AWS_PROFILE", "sandbox")
 STACK_FMT = "valkey-loadtest-{seed}"
-BOTO_CONFIG = Config(
-    retries={"max_attempts": 10, "mode": "adaptive"},
-    connect_timeout=15,
-    read_timeout=60,
-)
-
-
-@dataclass
-class InstanceInfo:
-    role: str
-    public_ip: str
-    private_ip: str
 
 
 def parse_args():
@@ -50,6 +38,7 @@ def parse_args():
 
 
 def aws_session(profile: str, region: str):
+    import boto3
     try:
         return boto3.session.Session(profile_name=profile, region_name=region)
     except botocore.exceptions.ProfileNotFound as exc:
@@ -74,6 +63,7 @@ def describe_stack_instances(region: str, seed: str, profile: str):
                 continue
             infos[role] = InstanceInfo(
                 role=role,
+                instance_id=inst["InstanceId"],
                 public_ip=inst.get("PublicIpAddress"),
                 private_ip=inst.get("PrivateIpAddress"),
             )

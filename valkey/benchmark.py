@@ -20,7 +20,8 @@ from typing import Optional
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import boto3
-from botocore.config import Config
+
+from common.util import BOTO_CONFIG
 
 DEFAULT_REGION = "us-east-1"
 DEFAULT_SEED = "vlklt-001"
@@ -28,12 +29,6 @@ DEFAULT_PROFILE = os.environ.get("AWS_PROFILE", "sandbox")
 DEFAULT_TARGET = "valkey-loadtest-vlklt-001-nlb-194011211c572f50.elb.us-east-1.amazonaws.com"
 DEFAULT_PORT = 6379
 DEFAULT_S3_BUCKET = "valkey-loadtest-vlklt-001-flamegraphs"
-
-BOTO_CONFIG = Config(
-    retries={"max_attempts": 10, "mode": "adaptive"},
-    connect_timeout=15,
-    read_timeout=60,
-)
 
 
 def build_proxy_option(jump_host: Optional[str], jump_user: str, jump_key: Optional[Path]) -> Optional[str]:
