@@ -73,7 +73,7 @@ def load_state(script_dir: Path) -> dict:
 def discover_stack(script_dir: Path, region: str, profile: str,
                    seed: str) -> dict:
     state = load_state(script_dir)
-    if state and state.get("endpoint") and state.get("client_public_ip"):
+    if state and state.get("endpoint"):
         log(f"Loaded stack from {STATE_FILE}")
         return state
 

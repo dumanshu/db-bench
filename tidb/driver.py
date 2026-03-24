@@ -154,7 +154,7 @@ def discover_tidb_host(region: str, profile: Optional[str], seed: str) -> str:
         for inst in reservation.get("Instances", []):
             tags = {tag["Key"]: tag["Value"] for tag in inst.get("Tags", [])}
             role = tags.get("Role", "")
-            if role in ("host", "client"):
+            if role in ("host", "client", "control"):
                 ip = inst.get("PublicIpAddress")
                 if ip:
                     return ip

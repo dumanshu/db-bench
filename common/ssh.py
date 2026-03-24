@@ -14,10 +14,10 @@ def host_target_and_jump(host, ctx):
     if not target:
         raise RuntimeError(f"Instance {host.role} has no reachable IP.")
     jump = None
-    if host.role != ctx.client.role and not host.public_ip:
-        if not ctx.client.public_ip:
-            raise RuntimeError("Client instance missing public IP for ProxyJump.")
-        jump = ctx.client.public_ip
+    if host.role != ctx.jump_host.role and not host.public_ip:
+        if not ctx.jump_host.public_ip:
+            raise RuntimeError("Jump-host instance missing public IP for ProxyJump.")
+        jump = ctx.jump_host.public_ip
     return target, jump
 
 

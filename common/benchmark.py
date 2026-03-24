@@ -20,6 +20,21 @@ from common.ssh import ssh_run_simple, ssh_capture_simple, scp_put_simple
 from common.util import log
 
 # ---------------------------------------------------------------------------
+# Bench-client state discovery
+# ---------------------------------------------------------------------------
+
+def _load_bench_client(seed):
+    """Try to load bench-client state from common/client-{seed}-state.json.
+
+    Returns dict with ``public_ip`` and ``key_path`` keys, or empty dict.
+    """
+    from common.client import load_state
+    state = load_state(seed)
+    if state and state.get("public_ip") and state.get("key_path"):
+        return state
+    return {}
+
+# ---------------------------------------------------------------------------
 # Constants
 # ---------------------------------------------------------------------------
 
@@ -1426,8 +1441,12 @@ def _main_aurora(args):
                 or os.environ.get("AURORA_MASTER_PASSWORD", "BenchMark2024!"))
     script_dir = Path(__file__).resolve().parent.parent / "aurora"
 
+    client_state = _load_bench_client(seed)
+
     if args.ssh_key:
         key_path = args.ssh_key
+    elif client_state.get("key_path"):
+        key_path = client_state["key_path"]
     else:
         key_path = str(script_dir / f"{KEY_NAME}.pem")
 
@@ -1435,7 +1454,7 @@ def _main_aurora(args):
         log(f"WARNING: SSH key not found at {key_path}")
 
     info = discover_stack(script_dir, region, aws_profile, seed)
-    host = args.host or info.get("client_public_ip", "")
+    host = args.host or client_state.get("public_ip") or info.get("client_public_ip", "")
     endpoint = args.endpoint or info.get("endpoint", "")
     port = args.port or info.get("cluster_port", DEFAULT_PORT)
 
@@ -1630,10 +1649,21 @@ def _main_tidb(args):
     downstream_port = (args.downstream_port if args.downstream_port is not None
                        else INTERNAL_SERVICE_PORT)
 
-    ssh_key_default = str(
-        Path(__file__).resolve().parent.parent / "tidb" /
-        "tidb-load-test-key.pem")
-    key_path = Path(args.ssh_key or ssh_key_default).expanduser().resolve()
+    client_state = _load_bench_client(seed)
+
+    if not args.host and client_state.get("public_ip"):
+        args.host = client_state["public_ip"]
+        log(f"Using bench-client from state file: {args.host}")
+
+    if args.ssh_key:
+        ssh_key_resolved = args.ssh_key
+    elif client_state.get("key_path"):
+        ssh_key_resolved = client_state["key_path"]
+    else:
+        ssh_key_resolved = str(
+            Path(__file__).resolve().parent.parent / "tidb" /
+            "tidb-load-test-key.pem")
+    key_path = Path(ssh_key_resolved).expanduser().resolve()
 
     # Log file setup
     log_path = None

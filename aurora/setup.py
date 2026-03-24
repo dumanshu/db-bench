@@ -65,7 +65,7 @@ SUBNET_A_CIDR = "10.44.1.0/24"
 SUBNET_B_CIDR = "10.44.2.0/24"
 
 DEFAULT_AURORA_INSTANCE = "db.r8g.xlarge"
-DEFAULT_EC2_INSTANCE = "c8g.24xlarge"
+
 AURORA_ENGINE = "aurora-mysql"
 AURORA_ENGINE_VERSION = "8.0.mysql_aurora.3.10.3"
 AURORA_MASTER_USER = "admin"
@@ -143,39 +143,6 @@ def configure_from_args(args):
 
 
 # ---------------------------------------------------------------------------
-# EC2 user-data script (installs sysbench + mysql-client)
-# ---------------------------------------------------------------------------
-USER_DATA = """#!/bin/bash
-set -euo pipefail
-exec > /var/log/aurora-bench-setup.log 2>&1
-
-echo "=== aurora-bench client setup ==="
-date
-
-dnf install -y gcc make automake libtool openssl-devel pkg-config git
-dnf install -y mariadb105 mariadb105-devel
-
-cd /tmp
-if [ ! -d sysbench ]; then
-    git clone https://github.com/akopytov/sysbench.git
-fi
-cd sysbench
-git checkout 1.0.20
-./autogen.sh
-./configure --with-mysql
-make -j$(nproc)
-make install
-ldconfig
-
-sysbench --version
-mysql --version
-
-echo "=== aurora-bench client setup complete ==="
-date
-"""
-
-
-# ---------------------------------------------------------------------------
 # AMI lookup
 # ---------------------------------------------------------------------------
 def is_arm64_instance(instance_type: str) -> bool:
@@ -244,41 +211,15 @@ def create_networking(ec2_client) -> dict:
 def create_security_groups(ec2_client, vpc_id: str) -> dict:
     log("Creating security groups...")
 
-    # EC2 client SG: SSH from user CIDR + all outbound
-    ec2_sg_id = _caws.ensure_sg(
-        vpc_id,
-        f"{_cu.STACK}-ec2-sg",
-        f"Aurora bench EC2 client ({_cu.STACK})",
-    )
-    try:
-        ssh_cidr = my_public_cidr()
-    except Exception:
-        ssh_cidr = "0.0.0.0/0"
-    _caws.ensure_ingress_tcp_cidr(ec2_sg_id, 22, ssh_cidr)
-    log(f"  EC2 SG: {ec2_sg_id}")
-
-    # Aurora SG: MySQL from EC2 SG (UserIdGroupPairs -- aurora-specific)
     rds_sg_id = _caws.ensure_sg(
         vpc_id,
         f"{_cu.STACK}-rds-sg",
         f"Aurora bench RDS ({_cu.STACK})",
     )
-    try:
-        ec2_client.authorize_security_group_ingress(
-            GroupId=rds_sg_id,
-            IpPermissions=[{
-                "IpProtocol": "tcp",
-                "FromPort": AURORA_PORT,
-                "ToPort": AURORA_PORT,
-                "UserIdGroupPairs": [{"GroupId": ec2_sg_id, "Description": "MySQL from EC2"}],
-            }],
-        )
-    except ClientError as e:
-        if e.response["Error"]["Code"] != "InvalidPermission.Duplicate":
-            raise
-    log(f"  RDS SG: {rds_sg_id}")
+    _caws.ensure_ingress_tcp_cidr(rds_sg_id, AURORA_PORT, VPC_CIDR)
+    log(f"  RDS SG: {rds_sg_id} (MySQL from VPC CIDR)")
 
-    return {"ec2_sg_id": ec2_sg_id, "rds_sg_id": rds_sg_id}
+    return {"rds_sg_id": rds_sg_id}
 
 
 # ---------------------------------------------------------------------------
@@ -457,30 +398,6 @@ def create_aurora_instance(rds, cluster_id: str,
     )
     log(f"  Writer instance '{instance_id}' available")
     return instance_id
-
-
-# ---------------------------------------------------------------------------
-# EC2 client instance  (delegates to common.aws.ensure_instance)
-# ---------------------------------------------------------------------------
-def create_ec2_client(ami_id: str, subnet_id: str,
-                      sg_id: str, ec2_instance_type: str) -> dict:
-    log(f"Creating EC2 client ({ec2_instance_type})...")
-    iid = _caws.ensure_instance(
-        name=f"{_cu.STACK}-client",
-        role="client",
-        itype=ec2_instance_type,
-        subnet_id=subnet_id,
-        sg_id=sg_id,
-        resolved_ami_id_fn=lambda: ami_id,
-        key_name=KEY_NAME,
-        ensure_keypair_fn=lambda: None,  # key pair created separately
-        root_volume_size=50,
-        associate_public_ip=True,
-        user_data=USER_DATA,
-    )
-    info = _caws.instance_info_from_id(iid, "client")
-    log(f"  EC2 running. Public IP: {info.public_ip}")
-    return {"instance_id": iid, "public_ip": info.public_ip}
 
 
 # ---------------------------------------------------------------------------
@@ -798,8 +715,6 @@ def parse_args() -> argparse.Namespace:
                    help="AWS CLI profile for RDS operations (default: same as --aws-profile)")
     p.add_argument("--instance-type", default=DEFAULT_AURORA_INSTANCE,
                    help=f"Aurora instance type (default: {DEFAULT_AURORA_INSTANCE})")
-    p.add_argument("--ec2-instance-type", default=DEFAULT_EC2_INSTANCE,
-                   help=f"EC2 client instance type (default: {DEFAULT_EC2_INSTANCE})")
     p.add_argument("--password", default=None,
                    help="Aurora master password (default: env AURORA_MASTER_PASSWORD "
                         "or BenchMark2024!)")
@@ -866,7 +781,6 @@ def main() -> None:
 
     log(f"Provisioning stack '{stack}' in {args.region}...")
     log(f"  Aurora instance type: {args.instance_type}")
-    log(f"  EC2 client type:      {args.ec2_instance_type}")
     log(f"  EC2/VPC profile:      {args.aws_profile}")
     log(f"  RDS profile:          {rds_profile}")
     if args.restore_snapshot:
@@ -909,20 +823,12 @@ def main() -> None:
     if args.restore_snapshot:
         state["restored_from_snapshot"] = args.restore_snapshot
 
-    ami_id = get_al2023_ami(session, args.ec2_instance_type)
-    client = create_ec2_client(ami_id, net["subnet_a_id"],
-                               sgs["ec2_sg_id"], args.ec2_instance_type)
-    state["client_instance_id"] = client["instance_id"]
-    state["client_public_ip"] = client["public_ip"]
-    state["ec2_instance_type"] = args.ec2_instance_type
-
     state["created_at"] = ts()
     save_state(state, script_dir)
 
-    # Done
     print()
     print("=" * 60)
-    print("Aurora Benchmark Stack Ready")
+    print("Aurora Server Stack Ready")
     print("=" * 60)
     print(f"  Stack:            {stack}")
     print(f"  Aurora endpoint:  {state['endpoint']}")
@@ -930,12 +836,9 @@ def main() -> None:
     print(f"  Aurora storage:   aurora-iopt1 (IO-Optimized)")
     if args.restore_snapshot:
         print(f"  Restored from:    {args.restore_snapshot}")
-    print(f"  EC2 client IP:    {state['client_public_ip']}")
-    print(f"  EC2 instance:     {args.ec2_instance_type}")
-    print(f"  SSH key:          {key_path}")
     print()
-    print("Wait 3-5 min for EC2 user-data (sysbench install) to complete, then:")
-    print(f"  ssh -i {key_path} ec2-user@{state['client_public_ip']}")
+    print("Next: provision a benchmark client in this VPC:")
+    print(f"  python3 -m common.client --seed {args.seed} --server-type aurora --size small")
     print()
     if args.restore_snapshot:
         print("Data restored from snapshot. Run benchmark directly (skip fill + prepare):")
@@ -950,8 +853,9 @@ def main() -> None:
     print("Snapshot (after fill):")
     print(f"  python3 -m aurora.setup --snapshot --seed {args.seed}")
     print()
-    print("Cleanup:")
+    print("Cleanup (server only -- client cleaned separately):")
     print(f"  python3 -m aurora.setup --cleanup --seed {args.seed}")
+    print(f"  python3 -m common.client --cleanup --seed {args.seed} --server-type aurora")
     print()
 
 

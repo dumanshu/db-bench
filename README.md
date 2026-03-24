@@ -36,9 +36,11 @@ aurora/          Aurora MySQL benchmarking (sysbench, IO-Optimized storage)
 - **types.py** -- Shared dataclasses (`InstanceInfo`, `BootstrapContext`)
 
 ### Client Provisioning
-- **client.py** -- Unified client VM tool installation via `install_client_tools(host_ip, key_path, server_type)`:
-  - `server_type="tidb"` or `"aurora"`: base packages, sysctl tuning, mysql client, sysbench
-  - `server_type="valkey"`: base packages, sysctl tuning, memtier_benchmark, docker
+- **client.py** -- Standalone benchmark client provisioner (`python3 -m common.client`):
+  - Discovers server VPC by `--seed` and `--server-type`, provisions an EC2 instance with all benchmark tools (sysbench, mysql client, memtier, docker)
+  - Supports `--size small` (c7g.4xlarge) or `--size heavy` (c8g.24xlarge)
+  - Saves state to `common/client-{seed}-state.json` (auto-discovered by benchmark CLI)
+  - `--cleanup` tears down the client instance and security group
 
 ### Benchmarking (sysbench)
 - **benchmark.py** -- Unified sysbench orchestration AND CLI entry point for tidb and aurora:
@@ -71,6 +73,16 @@ aurora/          Aurora MySQL benchmarking (sysbench, IO-Optimized storage)
   - `save_results()` / `print_summary()` -- result persistence and display
   - Instance pricing for Aurora db.r* families and TiDB c7g/c8g EC2 families
 
+## Workflow
+
+All benchmarks follow a 3-step workflow:
+
+1. **Provision server** -- `python3 -m {aurora,tidb,valkey}.setup` creates the database cluster and VPC
+2. **Provision client** -- `python3 -m common.client --seed <seed> --server-type <type> --size small|heavy` creates a benchmark EC2 in the server's VPC with all tools pre-installed
+3. **Run benchmark** -- `python3 -m common.benchmark --server-type <type>` (the client IP and SSH key are auto-discovered from the state file)
+
+The client is independent of the server type -- one client VM has sysbench, mysql, memtier, docker, and works against any database.
+
 ## Unified Benchmark CLI
 
 Both Aurora and TiDB benchmarks are invoked through a single entry point:
@@ -93,7 +105,7 @@ Valkey uses a different benchmark tool (valkey-benchmark / memtier) and has its 
 
 ## Aurora MySQL
 
-Provisions an Aurora MySQL cluster with IO-Optimized storage (aurora-iopt1) and an EC2 client instance pre-loaded with sysbench. Uses common benchmark and reporting modules.
+Provisions an Aurora MySQL cluster with IO-Optimized storage (aurora-iopt1). The benchmark client is provisioned separately via `common/client.py`.
 
 ### Features
 
@@ -110,10 +122,13 @@ Provisions an Aurora MySQL cluster with IO-Optimized storage (aurora-iopt1) and 
 ### Quick Start
 
 ```bash
-# Provision (default: db.r8g.xlarge Aurora, c8g.24xlarge EC2 client)
+# 1. Provision Aurora cluster (default: db.r8g.xlarge, IO-Optimized)
 python3 -m aurora.setup --seed auroralt-001 --aws-profile sandbox
 
-# Benchmark (custom mixed workload, 64 threads, 5 minutes) -- unified CLI
+# 2. Provision benchmark client in the Aurora VPC
+python3 -m common.client --seed auroralt-001 --server-type aurora --size small
+
+# 3. Benchmark (custom mixed workload, 64 threads, 5 minutes)
 python3 -m common.benchmark --server-type aurora --seed auroralt-001 --aws-profile sandbox
 
 # Benchmark with parallel sysbench processes
@@ -131,7 +146,8 @@ python3 -m aurora.setup --snapshot --seed auroralt-001
 # Restore from snapshot
 python3 -m aurora.setup --restore-snapshot <snapshot-id> --seed auroralt-002
 
-# Cleanup
+# Cleanup (server and client separately)
+python3 -m common.client --cleanup --seed auroralt-001 --server-type aurora
 python3 -m aurora.setup --cleanup --seed auroralt-001 --aws-profile sandbox
 ```
 
@@ -154,16 +170,19 @@ Provisions a multi-AZ TiDB cluster on EC2 via k3s and TiDB Operator, with option
 ### Quick Start
 
 ```bash
-# Provision (default: 3 PD, 3 TiKV, 2 TiDB across 3 AZs)
+# 1. Provision TiDB cluster (default: 3 PD, 3 TiKV, 2 TiDB across 3 AZs)
 AWS_PROFILE=sandbox python3 -m tidb.setup
 
 # With TiCDC replication
 python3 -m tidb.setup --aws-profile sandbox --ticdc
 
+# 2. Provision benchmark client in the TiDB VPC
+python3 -m common.client --seed <seed> --server-type tidb --size small
+
 # Validate
 AWS_PROFILE=sandbox python3 -m tidb.validate
 
-# Benchmark (standard profile, 5 minutes) -- unified CLI
+# 3. Benchmark (standard profile, 5 minutes) -- unified CLI
 python3 -m common.benchmark --server-type tidb --profile standard --aws-profile sandbox
 
 # Benchmark with TiCDC lag measurement
@@ -172,7 +191,8 @@ python3 -m common.benchmark --server-type tidb --profile standard --ticdc --aws-
 # Legacy entry point still works
 python3 -m tidb.benchmark --profile standard --aws-profile sandbox
 
-# Cleanup
+# Cleanup (server and client separately)
+python3 -m common.client --cleanup --seed <seed> --server-type tidb
 python3 -m tidb.setup --cleanup --aws-profile sandbox
 ```
 
@@ -200,24 +220,28 @@ Provisions Valkey instances with an Envoy sidecar proxy on EC2, supporting stand
 ### Quick Start
 
 ```bash
-# Provision
+# 1. Provision Valkey cluster + bastion
 AWS_PROFILE=sandbox python3 -m valkey.setup \
   --region us-east-1 \
   --seed vlklt-001 \
   --ssh-private-key-path ./valkey-load-test-key.pem
 
+# 2. Provision benchmark client in the Valkey VPC
+python3 -m common.client --seed vlklt-001 --server-type valkey --size small
+
 # Validate
 AWS_PROFILE=sandbox python3 -m valkey.validate \
   --ssh-private-key-path ./valkey-load-test-key.pem
 
-# Benchmark with FlameGraph
+# 3. Benchmark with FlameGraph
 AWS_PROFILE=sandbox python3 -m valkey.benchmark \
   --ssh-host <CLIENT_IP> \
   --ssh-user ec2-user \
   --ssh-key ./valkey-load-test-key.pem \
   --mode proxy
 
-# Cleanup
+# Cleanup (server and client separately)
+python3 -m common.client --cleanup --seed vlklt-001 --server-type valkey
 python3 -m valkey.setup --cleanup \
   --seed vlklt-001 \
   --ssh-private-key-path ./valkey-load-test-key.pem
