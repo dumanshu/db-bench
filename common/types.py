@@ -12,3 +12,4 @@ class InstanceInfo:
     public_ip: str
     private_ip: str
     availability_zone: Optional[str] = None
+    instance_type: Optional[str] = None

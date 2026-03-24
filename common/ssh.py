@@ -98,6 +98,54 @@ def scp_get(host, remote_path, local_path, ctx):
     subprocess.run(cmd, check=True)
 
 
+def _simple_ssh_cmd(host_ip: str, key_path):
+    """Build an SSH command for direct (no ProxyJump) access to *host_ip*."""
+    return [
+        "ssh",
+        "-o", "BatchMode=yes",
+        "-o", "StrictHostKeyChecking=no",
+        "-o", "IdentitiesOnly=yes",
+        "-o", "ConnectTimeout=30",
+        "-i", str(key_path),
+        f"ec2-user@{host_ip}",
+        "bash", "-s",
+    ]
+
+
+def ssh_run_simple(host_ip: str, key_path, script: str, strict: bool = True):
+    """Run *script* on a directly-reachable host (no ProxyJump)."""
+    full = textwrap.dedent(script).lstrip()
+    if strict:
+        full = "set -euo pipefail\n" + full
+    subprocess.run(_simple_ssh_cmd(host_ip, key_path), input=full, text=True, check=strict)
+
+
+def ssh_capture_simple(host_ip: str, key_path, script: str, strict: bool = True):
+    """Run *script* on a directly-reachable host and capture stdout/stderr."""
+    full = textwrap.dedent(script).lstrip()
+    if strict:
+        full = "set -euo pipefail\n" + full
+    result = subprocess.run(
+        _simple_ssh_cmd(host_ip, key_path), input=full, text=True, capture_output=True,
+    )
+    if strict:
+        result.check_returncode()
+    return result
+
+
+def ssh_stream_simple(host_ip: str, key_path, script: str):
+    """Run *script* on a directly-reachable host, returning a streaming Popen."""
+    full = "set -euo pipefail\n" + textwrap.dedent(script).lstrip()
+    proc = subprocess.Popen(
+        _simple_ssh_cmd(host_ip, key_path),
+        stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE, text=True,
+    )
+    proc.stdin.write(full)
+    proc.stdin.close()
+    return proc
+
+
 def wait_for_ssh(node, ctx, max_attempts=30):
     for attempt in range(max_attempts):
         result = ssh_capture(node, "echo ready", ctx, strict=False)
