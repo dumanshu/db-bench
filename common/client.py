@@ -53,7 +53,7 @@ AL2023_SSM_ARM64 = "/aws/service/ami-amazon-linux-latest/al2023-ami-kernel-defau
 
 KEY_NAME_PREFIX = "db-bench-client"
 
-MEMTIER_VERSION = "2.1.1.0"
+MEMTIER_VERSION = "2.3.0"
 MEMTIER_SRC_URL = (
     f"https://github.com/RedisLabs/memtier_benchmark/archive/"
     f"refs/tags/{MEMTIER_VERSION}.tar.gz"

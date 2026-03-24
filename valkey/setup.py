@@ -798,7 +798,9 @@ rm -rf valkey-{VALKEY_VERSION} valkey-src.tgz
 curl -L -o valkey-src.tgz '{VALKEY_SRC_URL}'
 tar -xzf valkey-src.tgz
 cd valkey-{VALKEY_VERSION}
-make -j $(nproc) BUILD_TLS=no
+# Ensure cc symlink exists (AL2 installs gcc but not always cc)
+sudo ln -sf /usr/bin/gcc /usr/bin/cc 2>/dev/null || true
+make -j $(nproc) BUILD_TLS=no CC=gcc
 sudo install -m 0755 src/valkey-server /usr/local/bin/valkey-server
 sudo install -m 0755 src/valkey-cli /usr/local/bin/valkey-cli
 sudo install -m 0755 src/valkey-benchmark /usr/local/bin/valkey-benchmark
