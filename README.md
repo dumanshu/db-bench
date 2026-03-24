@@ -11,13 +11,18 @@ common/          Shared AWS, SSH, benchmarking, metrics, and reporting modules
   util.py        Timestamps, logging, AWS session helpers, AMI resolution
   types.py       Shared dataclasses (InstanceInfo, BootstrapContext)
   client.py      Unified client VM provisioning (all tools for any server type)
-  benchmark.py   Sysbench orchestration (prepare, run, stream, parallel, fill)
+  benchmark.py   Unified sysbench orchestration + CLI entry point (--server-type aurora|tidb)
   sampler.py     EC2 metrics sampling + CloudWatch queries + post-processing
   report.py      Markdown report generation + cost tracking
   lua/           Custom sysbench Lua workloads (IUD, mixed read/write)
+  __main__.py    Allows `python3 -m common` to run the unified benchmark CLI
 tidb/            TiDB on k3s + TiDB Operator (multi-AZ, TiCDC replication)
+  driver.py      TiDB-specific helpers (SSH, cluster discovery, CDC lag, disk, bulk load)
+  benchmark.py   Thin redirect to common.benchmark --server-type tidb
 valkey/          Valkey with Envoy proxy (standalone and cluster modes)
 aurora/          Aurora MySQL benchmarking (sysbench, IO-Optimized storage)
+  driver.py      Aurora-specific helpers (stack discovery, CloudWatch, InnoDB counters)
+  benchmark.py   Thin redirect to common.benchmark --server-type aurora
 ```
 
 ## Common Library
@@ -36,15 +41,19 @@ aurora/          Aurora MySQL benchmarking (sysbench, IO-Optimized storage)
   - `server_type="valkey"`: base packages, sysctl tuning, memtier_benchmark, docker
 
 ### Benchmarking (sysbench)
-- **benchmark.py** -- Unified sysbench orchestration for tidb and aurora:
+- **benchmark.py** -- Unified sysbench orchestration AND CLI entry point for tidb and aurora:
+  - **Unified CLI**: `python3 -m common.benchmark --server-type {aurora,tidb}` (single entry point for all sysbench-based benchmarks)
   - `build_sysbench_cmd()` -- parameterized by endpoint, port, user, password, workload
   - `run_sysbench()` / `run_sysbench_streaming()` / `run_sysbench_parallel()` -- execution modes
+  - `run_benchmark_streaming()` / `run_adaptive_phase()` / `run_multi_phase_benchmark()` -- generalized orchestration with callable callbacks
   - `sysbench_prepare()` / `sysbench_cleanup()` -- table lifecycle
   - `fast_fill()` -- INSERT...SELECT doubling for buffer pool pressure
   - `upload_lua_scripts()` -- deploy custom Lua workloads to EC2
   - `parse_sysbench_output()` -- unified result parser
   - Built-in profiles: quick, light, medium, heavy, stress, scaling
   - Workloads: oltp_read_write, oltp_read_only, oltp_write_only, oltp_point_select, oltp_insert, oltp_delete, oltp_update_index, oltp_update_non_index, custom_iud, custom_mixed
+- **aurora/driver.py** -- Aurora-specific: stack discovery, CloudWatch metrics, InnoDB counters, result display
+- **tidb/driver.py** -- TiDB-specific: SSH helpers, EC2/cluster discovery, CdcLagTracker, resource monitoring, bulk load
 - **lua/** -- Custom sysbench Lua scripts:
   - `custom_iud.lua` -- 68% insert, 28% update, 4% delete (production ratio)
   - `custom_mixed.lua` -- 88% read, 8% insert, 3% update, 1% delete (production ratio)
@@ -61,6 +70,26 @@ aurora/          Aurora MySQL benchmarking (sysbench, IO-Optimized storage)
   - `CostTracker` -- AWS cost estimation during benchmark runs
   - `save_results()` / `print_summary()` -- result persistence and display
   - Instance pricing for Aurora db.r* families and TiDB c7g/c8g EC2 families
+
+## Unified Benchmark CLI
+
+Both Aurora and TiDB benchmarks are invoked through a single entry point:
+
+```bash
+# Aurora benchmark
+python3 -m common.benchmark --server-type aurora [options]
+
+# TiDB benchmark
+python3 -m common.benchmark --server-type tidb [options]
+
+# Equivalently, the legacy module entry points still work (thin redirects):
+python3 -m aurora.benchmark [options]   # injects --server-type aurora
+python3 -m tidb.benchmark [options]     # injects --server-type tidb
+```
+
+Run `python3 -m common.benchmark --help` to see all shared and server-specific options.
+
+Valkey uses a different benchmark tool (valkey-benchmark / memtier) and has its own entry point: `python3 -m valkey.benchmark`.
 
 ## Aurora MySQL
 
@@ -84,14 +113,17 @@ Provisions an Aurora MySQL cluster with IO-Optimized storage (aurora-iopt1) and 
 # Provision (default: db.r8g.xlarge Aurora, c8g.24xlarge EC2 client)
 python3 -m aurora.setup --seed auroralt-001 --aws-profile sandbox
 
-# Benchmark (custom mixed workload, 64 threads, 5 minutes)
-python3 -m aurora.benchmark --seed auroralt-001 --aws-profile sandbox
+# Benchmark (custom mixed workload, 64 threads, 5 minutes) -- unified CLI
+python3 -m common.benchmark --server-type aurora --seed auroralt-001 --aws-profile sandbox
 
 # Benchmark with parallel sysbench processes
-python3 -m aurora.benchmark --parallel 4 --threads 64 --seed auroralt-001
+python3 -m common.benchmark --server-type aurora --parallel 4 --threads 64 --seed auroralt-001
 
 # Fill phase (create background data to pressure buffer pool)
-python3 -m aurora.benchmark --fill --seed auroralt-001 --aws-profile sandbox
+python3 -m common.benchmark --server-type aurora --fill --seed auroralt-001 --aws-profile sandbox
+
+# Legacy entry point still works
+python3 -m aurora.benchmark --seed auroralt-001 --aws-profile sandbox
 
 # Snapshot after fill
 python3 -m aurora.setup --snapshot --seed auroralt-001
@@ -131,11 +163,14 @@ python3 -m tidb.setup --aws-profile sandbox --ticdc
 # Validate
 AWS_PROFILE=sandbox python3 -m tidb.validate
 
-# Benchmark (standard profile, 5 minutes)
-AWS_PROFILE=sandbox python3 -m tidb.benchmark --profile standard
+# Benchmark (standard profile, 5 minutes) -- unified CLI
+python3 -m common.benchmark --server-type tidb --profile standard --aws-profile sandbox
 
 # Benchmark with TiCDC lag measurement
-python3 -m tidb.benchmark --aws-profile sandbox --profile standard --ticdc
+python3 -m common.benchmark --server-type tidb --profile standard --ticdc --aws-profile sandbox
+
+# Legacy entry point still works
+python3 -m tidb.benchmark --profile standard --aws-profile sandbox
 
 # Cleanup
 python3 -m tidb.setup --cleanup --aws-profile sandbox
@@ -199,9 +234,16 @@ python3 -m valkey.setup --cleanup \
 All modules are designed to run from the repo root using `python3 -m`:
 
 ```bash
+# Unified benchmark CLI (Aurora + TiDB)
+python3 -m common.benchmark --help
+
+# Setup commands
 python3 -m tidb.setup --help
 python3 -m valkey.setup --help
 python3 -m aurora.setup --help
+
+# Valkey benchmark (separate tool)
+python3 -m valkey.benchmark --help
 ```
 
 ## References

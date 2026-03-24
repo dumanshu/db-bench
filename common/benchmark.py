@@ -940,3 +940,974 @@ FINAL_ROWS=$(mysql -h "$DB_HOST" -P "$DB_PORT" -u "$DB_USER" {pw_flag} "$DB_NAME
     WHERE table_schema='$DB_NAME'" 2>/dev/null)
 echo "DOUBLING_COMPLETE errors=$ERRORS total_rows=$FINAL_ROWS"
 """
+
+
+# ---------------------------------------------------------------------------
+# Generalized benchmark runners (used by unified CLI)
+# ---------------------------------------------------------------------------
+
+
+def run_benchmark_streaming(
+    host: str,
+    key_path,
+    cmd_str: str,
+    stream_fn: Callable,
+    parse_interval_fn: Callable = None,
+    parse_output_fn: Callable = None,
+    resource_fn: Optional[Callable[[], str]] = None,
+    format_report_fn: Optional[Callable[[int, list, str], str]] = None,
+) -> dict:
+    """Run sysbench with real-time streaming and optional per-minute resource reports.
+
+    Generalised from tidb/benchmark.py ``run_sysbench_benchmark()``.
+
+    Args:
+        host: SSH target (unused if stream_fn handles it).
+        key_path: SSH key path.
+        cmd_str: Full sysbench command string.
+        stream_fn: ``stream_fn(host, cmd_str + " 2>&1", key_path)`` ->
+            Popen-like object with ``.stdout`` iterable and ``.wait()``.
+        parse_interval_fn: Parse an interval line (default:
+            :func:`parse_interval_line`).
+        parse_output_fn: Parse full sysbench text (default:
+            :func:`parse_sysbench_output`).
+        resource_fn: Optional callable returning a resource snapshot string
+            at each minute boundary.
+        format_report_fn: Optional ``(minute_num, intervals, resource_text)``
+            -> formatted report string.
+
+    Returns:
+        Unified result dict with ``"workload"`` placeholder.
+    """
+    if parse_interval_fn is None:
+        parse_interval_fn = parse_interval_line
+    if parse_output_fn is None:
+        parse_output_fn = parse_sysbench_output
+
+    proc = stream_fn(host, cmd_str + " 2>&1", key_path)
+    full_output: list[str] = []
+    current_minute = 0
+    minute_intervals: list[dict] = []
+    all_intervals: list[dict] = []
+
+    for raw_line in proc.stdout:
+        line = raw_line.rstrip("\n")
+        full_output.append(line)
+        iv = parse_interval_fn(line)
+        if iv:
+            all_intervals.append(iv)
+            elapsed_s = iv["elapsed_s"]
+            minute_of = (int(elapsed_s) - 1) // 60 + 1
+            if minute_of > current_minute:
+                if current_minute > 0 and minute_intervals:
+                    res_text = resource_fn() if resource_fn else ""
+                    if format_report_fn:
+                        report = format_report_fn(current_minute, minute_intervals, res_text)
+                        log(report)
+                        log("")
+                current_minute = minute_of
+                minute_intervals = []
+            minute_intervals.append(iv)
+        elif line.strip():
+            log(line)
+
+    proc.wait()
+
+    # Flush last partial minute
+    if minute_intervals:
+        res_text = resource_fn() if resource_fn else ""
+        if format_report_fn:
+            report = format_report_fn(current_minute, minute_intervals, res_text)
+            log(report)
+            log("")
+
+    full_text = "\n".join(full_output)
+    result = parse_output_fn(full_text)
+    result["intervals"] = all_intervals
+    return result
+
+
+def run_adaptive_phase(
+    phase: dict,
+    workload: str,
+    build_cmd_fn: Callable[..., str],
+    run_capture_fn: Callable[..., object],
+    parse_output_fn: Callable = None,
+) -> list:
+    """Run an adaptive (overload-finding) phase with ramping thread counts.
+
+    Generalised from tidb/benchmark.py ``run_adaptive_phase()``.
+
+    Args:
+        phase: Phase dict with keys ``threads``, ``thread_step``,
+            ``max_threads``, ``decay_threshold``, ``latency_multiplier``,
+            ``duration``.
+        workload: Sysbench workload name.
+        build_cmd_fn: ``(threads, duration) -> cmd_str``.  The caller is
+            responsible for baking in tables/table_size/port/db/etc.
+        run_capture_fn: ``(cmd_str) -> result`` where *result* has
+            ``.stdout`` text attribute.
+        parse_output_fn: Parse full sysbench text (default:
+            :func:`parse_sysbench_output`).
+
+    Returns:
+        List of per-iteration result dicts.
+    """
+    if parse_output_fn is None:
+        parse_output_fn = parse_sysbench_output
+
+    results = []
+    start_threads = phase["threads"]
+    thread_step = phase.get("thread_step", 32)
+    max_threads = phase.get("max_threads", 512)
+    decay_threshold = phase.get("decay_threshold", 0.50)
+    latency_multiplier = phase.get("latency_multiplier", 10)
+    phase_duration = phase.get("duration", 30)
+
+    current_threads = start_threads
+    iteration = 0
+    peak_qps = 0
+    peak_threads = start_threads
+    baseline_p95 = None
+
+    log(f"    Adaptive mode: starting at {start_threads} threads, "
+        f"step={thread_step}, max={max_threads}")
+    log(f"    Breaking conditions: QPS decay >= {decay_threshold*100:.0f}% "
+        f"OR latency >= {latency_multiplier}x baseline")
+
+    while current_threads <= max_threads:
+        iteration += 1
+        log(f"")
+        log(f"    >> Iteration {iteration}: {current_threads} threads, "
+            f"{phase_duration}s")
+
+        cmd = build_cmd_fn(current_threads, phase_duration)
+        result = run_capture_fn(cmd)
+        output = result.stdout
+        print(output)
+
+        metrics = parse_output_fn(output)
+        metrics["phase"] = f"overload_iter{iteration}"
+        metrics["threads"] = current_threads
+        metrics["duration"] = phase_duration
+        metrics["workload"] = workload
+        results.append(metrics)
+
+        current_qps = metrics.get("qps", 0) or 0
+        current_p95 = metrics.get("latency_p95_ms", 0) or 0
+        current_p99 = metrics.get("latency_p99_ms", 0) or 0
+        avail = metrics.get("availability_pct", 100.0) or 100.0
+        errors = metrics.get("ignored_errors", 0) or 0
+
+        if baseline_p95 is None and current_p95 > 0:
+            baseline_p95 = current_p95
+            log(f"       Baseline P95: {baseline_p95:.1f}ms")
+
+        if current_qps > peak_qps:
+            peak_qps = current_qps
+            peak_threads = current_threads
+
+        decay_from_peak = ((peak_qps - current_qps) / peak_qps
+                           if peak_qps > 0 else 0)
+        latency_ratio = (current_p95 / baseline_p95
+                         if baseline_p95 and baseline_p95 > 0 else 1)
+
+        log(f"       QPS: {current_qps:,.1f} | Peak: {peak_qps:,.1f} "
+            f"@ {peak_threads} thr | Decay: {decay_from_peak*100:.1f}%")
+        log(f"       P95: {current_p95:.1f}ms P99: {current_p99:.1f}ms | "
+            f"Ratio: {latency_ratio:.1f}x | Avail: {avail:.2f}% (err: {errors})")
+
+        broken = False
+        break_reason = ""
+        if decay_from_peak >= decay_threshold:
+            broken = True
+            break_reason = (
+                f"QPS decayed {decay_from_peak*100:.1f}% from peak "
+                f"(threshold: {decay_threshold*100:.0f}%)")
+        elif latency_ratio >= latency_multiplier:
+            broken = True
+            break_reason = (
+                f"Latency {latency_ratio:.1f}x baseline "
+                f"(threshold: {latency_multiplier}x)")
+
+        if broken:
+            log(f"")
+            log(f"    !! BREAKING POINT REACHED: {break_reason}")
+            log(f"    !! Peak QPS: {peak_qps:,.1f} at {peak_threads} threads")
+            log(f"    !! Final: {current_qps:,.1f} QPS, "
+                f"P95={current_p95:.1f}ms, P99={current_p99:.1f}ms "
+                f"@ {current_threads} threads")
+            break
+
+        current_threads += thread_step
+        if current_threads <= max_threads:
+            log(f"       Ramping up to {current_threads} threads...")
+            time.sleep(3)
+
+    if current_threads > max_threads:
+        log(f"    !! Reached max threads ({max_threads}) without breaking")
+        log(f"    !! Peak QPS: {peak_qps:,.1f} at {peak_threads} threads")
+
+    return results
+
+
+def run_multi_phase_benchmark(
+    profile_name: str,
+    workload: str,
+    build_cmd_fn: Callable[..., str],
+    run_capture_fn: Callable[..., object],
+    run_streaming_fn: Callable[..., dict],
+    error_codes: str = "",
+    parse_output_fn: Callable = None,
+) -> list:
+    """Run a multi-phase benchmark profile (warmup -> steady -> overload).
+
+    Generalised from tidb/benchmark.py ``run_multi_phase_benchmark()``.
+
+    Args:
+        profile_name: Key in :data:`MULTI_PHASE_PROFILES`.
+        workload: Sysbench workload name.
+        build_cmd_fn: ``(threads, duration) -> cmd_str``.
+        run_capture_fn: ``(cmd_str) -> result`` with ``.stdout``.
+        run_streaming_fn: ``(threads, duration) -> result_dict``.
+            Called for non-adaptive phases.
+        error_codes: Ignored-error string for display.
+        parse_output_fn: Parse full sysbench text (default:
+            :func:`parse_sysbench_output`).
+
+    Returns:
+        List of per-phase result dicts.
+    """
+    if parse_output_fn is None:
+        parse_output_fn = parse_sysbench_output
+
+    profile = MULTI_PHASE_PROFILES[profile_name]
+    log("")
+    log("=" * 70)
+    log(f"MULTI-PHASE BENCHMARK: {profile_name.upper()}")
+    log(f"  {profile['description']}")
+
+    total_phases = len(profile["phases"])
+    if profile["total_duration"] == "adaptive":
+        estimated = sum(p.get("duration", 30) for p in profile["phases"])
+        log(f"  Phases: {total_phases} (adaptive duration, min ~{estimated}s)")
+    else:
+        log(f"  Total duration: {profile['total_duration']}s "
+            f"({total_phases} phases)")
+    if error_codes:
+        log(f"  Error handling: ignoring {error_codes}")
+    log("=" * 70)
+
+    all_results = []
+    for i, phase in enumerate(profile["phases"]):
+        phase_name = phase["name"]
+        threads = phase["threads"]
+        duration = phase["duration"]
+        is_adaptive = phase.get("adaptive", False)
+
+        log("")
+        log(f">>> PHASE {i+1}/{len(profile['phases'])}: {phase_name.upper()}")
+        if is_adaptive:
+            log(f"    Mode: ADAPTIVE (start={threads}, "
+                f"step={phase.get('thread_step', 32)}, "
+                f"max={phase.get('max_threads', 512)})")
+        else:
+            log(f"    Threads: {threads}, Duration: {duration}s")
+        log("-" * 50)
+
+        if is_adaptive:
+            phase_results = run_adaptive_phase(
+                phase, workload, build_cmd_fn, run_capture_fn,
+                parse_output_fn,
+            )
+            all_results.extend(phase_results)
+        else:
+            metrics = run_streaming_fn(threads, duration)
+            metrics["phase"] = phase_name
+            metrics["threads"] = threads
+            metrics["duration"] = duration
+            all_results.append(metrics)
+
+            tps = metrics.get("tps", 0) or 0
+            qps = metrics.get("qps", 0) or 0
+            p95 = metrics.get("latency_p95_ms", "N/A")
+            p99 = metrics.get("latency_p99_ms", "N/A")
+            avail = metrics.get("availability_pct", 100.0) or 100.0
+            log(f"    Result: TPS={tps:,.1f} QPS={qps:,.1f} "
+                f"P95={p95}ms P99={p99}ms Avail={avail:.2f}%")
+
+    return all_results
+
+
+# ---------------------------------------------------------------------------
+# Unified CLI (parse_args + main)
+# ---------------------------------------------------------------------------
+
+
+def parse_args():
+    """Unified argument parser for ``python3 -m common.benchmark``.
+
+    Supports ``--server-type {aurora,tidb}`` with shared and
+    server-specific arguments.
+    """
+    import argparse
+
+    p = argparse.ArgumentParser(
+        description="Run sysbench benchmarks against Aurora MySQL or TiDB.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=textwrap.dedent("""\
+            Examples:
+              python3 -m common.benchmark --server-type aurora
+              python3 -m common.benchmark --server-type tidb --profile heavy
+              python3 -m aurora.benchmark   (equivalent to --server-type aurora)
+              python3 -m tidb.benchmark     (equivalent to --server-type tidb)
+        """),
+    )
+
+    # Required: server type
+    p.add_argument("--server-type", required=True, choices=["aurora", "tidb"],
+                   help="Database server type to benchmark")
+
+    # --- Shared arguments ---
+    p.add_argument("--host", default=None,
+                   help="Client/host IP (auto-discovered if omitted)")
+    p.add_argument("--port", type=int, default=None,
+                   help="Database port (default: server-specific)")
+    p.add_argument("--region", default=None,
+                   help="AWS region (default: us-east-1)")
+    p.add_argument("--seed", default=None,
+                   help="Stack seed (default: server-specific)")
+    p.add_argument("--aws-profile", default=None,
+                   help="AWS profile (default: env AWS_PROFILE or sandbox)")
+    p.add_argument("--ssh-key", default=None,
+                   help="Path to SSH private key")
+
+    p.add_argument("--workload", default=None,
+                   help="Sysbench workload type (default: server-specific)")
+    p.add_argument("--tables", type=int, default=None,
+                   help="Number of sysbench tables")
+    p.add_argument("--table-size", type=int, default=None,
+                   help="Rows per table")
+    p.add_argument("--threads", type=int, default=None,
+                   help="Number of concurrent threads")
+    p.add_argument("--duration", type=int, default=None,
+                   help="Benchmark duration in seconds")
+    p.add_argument("--report-interval", type=int, default=None,
+                   help="Report interval in seconds")
+    p.add_argument("--skip-prepare", action="store_true",
+                   help="Skip table preparation")
+    p.add_argument("--cleanup", action="store_true",
+                   help="Clean up tables after benchmark")
+    p.add_argument("--verbose", "-v", action="store_true")
+
+    # --- Aurora-specific arguments ---
+    aurora_g = p.add_argument_group("Aurora-specific options")
+    aurora_g.add_argument("--endpoint", default=None,
+                          help="Aurora endpoint (auto-discovered if omitted)")
+    aurora_g.add_argument("--password", default=None,
+                          help="Aurora master password")
+    aurora_g.add_argument("--db", default=None,
+                          help="Database name (Aurora default: sbtest)")
+    aurora_g.add_argument("--rds-profile", default=None,
+                          help="AWS profile for CloudWatch RDS metrics")
+    aurora_g.add_argument("--skip-iud-measurement", action="store_true",
+                          help="Skip InnoDB row counter measurement")
+    aurora_g.add_argument("--skip-cleanup", action="store_true",
+                          help="Keep tables after benchmark (Aurora)")
+    aurora_g.add_argument("--parallel", type=int, default=1,
+                          help="Run N sysbench processes in parallel")
+    aurora_g.add_argument("--prepare-threads", type=int, default=None,
+                          help="Threads for parallel table creation (Aurora)")
+    aurora_g.add_argument("--fill", action="store_true",
+                          help="Run fill phase only (Aurora)")
+    aurora_g.add_argument("--fill-target-gb", type=int, default=None,
+                          help="Target fill data size in GB")
+    aurora_g.add_argument("--fill-tables", type=int, default=None,
+                          help="Number of fill tables")
+    aurora_g.add_argument("--fill-seed-rows", type=int, default=None,
+                          help="Seed rows per fill table")
+    aurora_g.add_argument("--fill-threads", type=int, default=None,
+                          help="Parallel threads for fill operations")
+    aurora_g.add_argument("--fill-db", default=None,
+                          help="Database name for fill data")
+
+    # --- TiDB-specific arguments ---
+    tidb_g = p.add_argument_group("TiDB-specific options")
+    tidb_g.add_argument("--profile", choices=list(WORKLOAD_PROFILES.keys()),
+                        default=None,
+                        help="Workload profile (TiDB: quick/light/medium/heavy/stress/scaling)")
+    tidb_g.add_argument("--prepare-only", action="store_true",
+                        help="Only prepare tables (TiDB)")
+    tidb_g.add_argument("--cleanup-only", action="store_true",
+                        help="Only clean up tables (TiDB)")
+    tidb_g.add_argument("--no-resource-monitor", action="store_true",
+                        help="Disable per-minute resource monitoring (TiDB)")
+    tidb_g.add_argument("--no-disk-fill", action="store_true",
+                        help="Skip Phase 1 bulk data load (TiDB)")
+    tidb_g.add_argument("--disk-fill-pct", type=int, default=None,
+                        help="Override disk fill target percentage (TiDB)")
+    tidb_g.add_argument("--output", "-o", default=None,
+                        help="Output log file path (TiDB)")
+    tidb_g.add_argument("--ticdc", action="store_true",
+                        help="Enable TiCDC replication lag tracking")
+    tidb_g.add_argument("--downstream-host", default=None,
+                        help="Downstream TiDB cluster IP")
+    tidb_g.add_argument("--downstream-port", type=int, default=None,
+                        help="Downstream TiDB internal service port")
+
+    return p.parse_args()
+
+
+def main():
+    """Unified entry point for ``python3 -m common.benchmark``."""
+    args = parse_args()
+
+    if args.server_type == "aurora":
+        _main_aurora(args)
+    elif args.server_type == "tidb":
+        _main_tidb(args)
+    else:
+        raise SystemExit(f"Unknown server type: {args.server_type}")
+
+
+# ---------------------------------------------------------------------------
+# Aurora main
+# ---------------------------------------------------------------------------
+
+
+def _main_aurora(args):
+    """Run Aurora benchmark flow (fill or benchmark)."""
+    import sys
+    from datetime import datetime, timezone
+
+    from aurora.driver import (
+        DEFAULT_REGION, DEFAULT_SEED, DEFAULT_PROFILE, KEY_NAME,
+        DEFAULT_PORT, DEFAULT_DB, DEFAULT_WORKLOAD, WORKLOADS as AURORA_WORKLOADS,
+        DEFAULT_THREADS, DEFAULT_DURATION, DEFAULT_TABLES,
+        DEFAULT_REPORT_INTERVAL, DEFAULT_PREPARE_THREADS,
+        DEFAULT_FILL_DB, DEFAULT_FILL_TABLES, DEFAULT_FILL_SEED_ROWS,
+        DEFAULT_FILL_THREADS, DEFAULT_BENCH_TABLE_SIZE,
+        VERBOSE,
+        discover_stack, get_aurora_cpu, get_aurora_network_metrics,
+        get_innodb_rows, print_results, save_results,
+    )
+    import aurora.driver as adrv
+
+    # Apply defaults for unset args
+    region = args.region or DEFAULT_REGION
+    seed = args.seed or DEFAULT_SEED
+    aws_profile = args.aws_profile or DEFAULT_PROFILE
+    port = args.port or DEFAULT_PORT
+    db = args.db or DEFAULT_DB
+    workload = args.workload or DEFAULT_WORKLOAD
+    threads = args.threads if args.threads is not None else DEFAULT_THREADS
+    duration = args.duration if args.duration is not None else DEFAULT_DURATION
+    tables = args.tables if args.tables is not None else DEFAULT_TABLES
+    table_size = args.table_size  # None means auto-compute
+    report_interval = (args.report_interval if args.report_interval is not None
+                       else DEFAULT_REPORT_INTERVAL)
+    prepare_threads = (args.prepare_threads if args.prepare_threads is not None
+                       else DEFAULT_PREPARE_THREADS)
+    fill_tables = (args.fill_tables if args.fill_tables is not None
+                   else DEFAULT_FILL_TABLES)
+    fill_seed_rows = (args.fill_seed_rows if args.fill_seed_rows is not None
+                      else DEFAULT_FILL_SEED_ROWS)
+    fill_threads = (args.fill_threads if args.fill_threads is not None
+                    else DEFAULT_FILL_THREADS)
+    fill_db = args.fill_db or DEFAULT_FILL_DB
+
+    if workload not in AURORA_WORKLOADS:
+        raise SystemExit(
+            f"Invalid workload '{workload}' for Aurora. "
+            f"Choose from: {', '.join(AURORA_WORKLOADS)}")
+
+    adrv.VERBOSE = args.verbose
+    password = (args.password
+                or os.environ.get("AURORA_MASTER_PASSWORD", "BenchMark2024!"))
+    script_dir = Path(__file__).resolve().parent.parent / "aurora"
+
+    if args.ssh_key:
+        key_path = args.ssh_key
+    else:
+        key_path = str(script_dir / f"{KEY_NAME}.pem")
+
+    if not os.path.isfile(key_path):
+        log(f"WARNING: SSH key not found at {key_path}")
+
+    info = discover_stack(script_dir, region, aws_profile, seed)
+    host = args.host or info.get("client_public_ip", "")
+    endpoint = args.endpoint or info.get("endpoint", "")
+    port = args.port or info.get("cluster_port", DEFAULT_PORT)
+
+    if not host or not endpoint:
+        log("ERROR: Could not determine host or endpoint. "
+            "Run aurora_setup.py first or pass --host/--endpoint.")
+        sys.exit(1)
+
+    instance_type = info.get("aurora_instance_type", "")
+
+    # --- Fill mode ---
+    if args.fill:
+        log(f"Stack: {info.get('stack', 'unknown')}")
+        log(f"Aurora endpoint: {endpoint}")
+        log(f"EC2 client: {host}")
+        doublings, est_gb = compute_fill_params(
+            instance_type, fill_tables, fill_seed_rows,
+            args.fill_target_gb)
+        fast_fill(host, key_path, endpoint, port, "admin", password,
+                  fill_db, fill_tables, fill_seed_rows,
+                  doublings, fill_threads)
+        log("Fill done. Run without --fill to start benchmark.")
+        return
+
+    # --- Benchmark mode ---
+    if table_size is None:
+        table_size = DEFAULT_BENCH_TABLE_SIZE
+        total_gb = round(tables * table_size * BYTES_PER_ROW / 1e9, 1)
+        log(f"Benchmark tables: {tables} x {table_size:,} rows "
+            f"(~{total_gb} GB)")
+
+    thread_label = (f"{args.parallel}x{threads}"
+                    if args.parallel > 1 else str(threads))
+
+    log(f"Stack: {info.get('stack', 'unknown')}")
+    log(f"Aurora endpoint: {endpoint}")
+    log(f"EC2 client: {host}")
+    log(f"Workload: {workload}, threads: {thread_label}, "
+        f"duration: {duration}s")
+    print()
+
+    # Upload Lua scripts
+    lua_dir = None
+    if workload in ("custom_iud", "custom_mixed"):
+        lua_dir = upload_lua_scripts(host, key_path)
+
+    if not args.skip_prepare:
+        sysbench_prepare(host, key_path, endpoint, port, "admin", password,
+                         db, tables, table_size, prepare_threads)
+
+    iud_rates = None
+    rows_before = None
+    if not args.skip_iud_measurement:
+        log("Taking InnoDB row counter snapshot (before)...")
+        rows_before = get_innodb_rows(host, key_path, endpoint, port, password)
+
+    cmd_str = build_sysbench_cmd(
+        host_ip=host, key_path=key_path,
+        workload=workload, threads=threads,
+        duration=duration, tables=tables,
+        table_size=table_size, endpoint=endpoint,
+        port=port, user="admin", password=password,
+        db=db, report_interval=report_interval,
+        lua_dir=lua_dir,
+    )
+
+    bench_start = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+    if args.parallel > 1:
+        result = run_sysbench_parallel(host, key_path, cmd_str, args.parallel)
+    else:
+        result = run_sysbench(host, key_path, cmd_str,
+                              timeout=duration + 120)
+
+    if "error" in result:
+        log("Benchmark failed.")
+        sys.exit(1)
+
+    bench_end = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+    result.setdefault("workload", workload)
+    result.setdefault("threads", threads)
+    result["duration_s"] = duration
+
+    if args.parallel > 1:
+        result["parallel"] = args.parallel
+        result["thread_label"] = f"{args.parallel}x{threads}"
+    else:
+        result["parallel"] = 1
+        result["thread_label"] = str(threads)
+
+    if result.get("latency_p95_ms") and not result.get("latency_95th_pct_ms"):
+        result["latency_95th_pct_ms"] = result["latency_p95_ms"]
+
+    client_cpu_pct = None
+
+    if not args.skip_iud_measurement and rows_before is not None:
+        log("Taking InnoDB row counter snapshot (after)...")
+        rows_after = get_innodb_rows(host, key_path, endpoint, port, password)
+        elapsed = result.get("elapsed_s", duration)
+        iud_rates = {}
+        for op in ["innodb_rows_inserted", "innodb_rows_updated",
+                    "innodb_rows_deleted", "innodb_rows_read"]:
+            b = rows_before.get(op, 0)
+            a = rows_after.get(op, 0)
+            iud_rates[op.replace("innodb_rows_", "") + "_per_sec"] = round(
+                (a - b) / elapsed, 1)
+        total_iud = (iud_rates.get("inserted_per_sec", 0) +
+                     iud_rates.get("updated_per_sec", 0) +
+                     iud_rates.get("deleted_per_sec", 0))
+        iud_rates["total_iud_per_sec"] = round(total_iud, 1)
+
+    cpu_pct = None
+    net_metrics = {}
+    writer_id = info.get("writer_id", "")
+    rds_profile = args.rds_profile or aws_profile
+    if writer_id:
+        log("Fetching Aurora CPU from CloudWatch...")
+        cpu_pct = get_aurora_cpu(writer_id, region, rds_profile,
+                                 bench_start, bench_end)
+        if cpu_pct is not None:
+            log(f"  Aurora writer CPU avg: {cpu_pct:.1f}%")
+        else:
+            log("  Could not retrieve CPU metrics "
+                "(may need 1-2 min to appear)")
+
+        log("Fetching Aurora network metrics from CloudWatch...")
+        net_metrics = get_aurora_network_metrics(
+            writer_id, region, rds_profile, bench_start, bench_end)
+        recv = net_metrics.get("aurora_net_recv_mbps")
+        xmit = net_metrics.get("aurora_net_xmit_mbps")
+        if recv is not None:
+            log(f"  Network recv: {recv:.1f} Mbps")
+        if xmit is not None:
+            log(f"  Network xmit: {xmit:.1f} Mbps")
+
+    print_results(result, iud_rates, cpu_pct, tables, table_size,
+                  client_cpu_pct, net_metrics)
+    save_results(result, iud_rates, script_dir, workload,
+                 state=info, tables=tables, table_size=table_size,
+                 cpu_pct=cpu_pct, client_cpu_pct=client_cpu_pct,
+                 net_metrics=net_metrics, parallel=args.parallel)
+
+    if not args.skip_cleanup:
+        sysbench_cleanup(host, key_path, endpoint, port, "admin", password,
+                         db, tables)
+
+    log("Done.")
+
+
+# ---------------------------------------------------------------------------
+# TiDB main
+# ---------------------------------------------------------------------------
+
+
+def _main_tidb(args):
+    """Run TiDB benchmark flow (prepare/cleanup/benchmark)."""
+    from datetime import datetime
+
+    import common.util as _cu
+    from tidb.driver import (
+        DEFAULT_REGION, DEFAULT_SEED, DEFAULT_PROFILE, DEFAULT_PORT,
+        INTERNAL_SERVICE_PORT, DEFAULT_DATABASE, DEFAULT_EBS_SIZE_GB,
+        TIDB_MYSQL_IGNORE_ERRORS, AWS_COSTS,
+        ssh_run, ssh_capture, ssh_stream,
+        discover_tidb_host, get_instance_info, get_cluster_info,
+        print_cluster_summary, fetch_resource_snapshot_compact,
+        fetch_final_resource_snapshot, get_disk_utilization,
+        calculate_bulk_load_params, run_bulk_data_load,
+        run_sysbench_prepare, run_sysbench_cleanup,
+        format_minute_report, set_session_variables,
+        CdcLagTracker,
+    )
+    from common.report import CostTracker, print_summary
+
+    # Apply defaults for unset args
+    region = args.region or DEFAULT_REGION
+    seed = args.seed or DEFAULT_SEED
+    aws_profile = args.aws_profile or DEFAULT_PROFILE
+    port = args.port if args.port is not None else DEFAULT_PORT
+    database = DEFAULT_DATABASE
+
+    workload = args.workload or "oltp_read_write"
+    tables_arg = args.tables if args.tables is not None else 16
+    table_size_arg = args.table_size if args.table_size is not None else 100000
+    threads_arg = args.threads if args.threads is not None else 64
+    duration_arg = args.duration if args.duration is not None else 120
+    report_interval = (args.report_interval if args.report_interval is not None
+                       else 10)
+    profile_name = args.profile or "heavy"
+    disk_fill_pct = args.disk_fill_pct
+    downstream_port = (args.downstream_port if args.downstream_port is not None
+                       else INTERNAL_SERVICE_PORT)
+
+    ssh_key_default = str(
+        Path(__file__).resolve().parent.parent / "tidb" /
+        "tidb-load-test-key.pem")
+    key_path = Path(args.ssh_key or ssh_key_default).expanduser().resolve()
+
+    # Log file setup
+    log_path = None
+    if args.output and args.output.lower() != "none":
+        log_path = Path(args.output).expanduser().resolve()
+    elif args.output is None:
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        log_path = Path(
+            f"tidb_benchmark_{profile_name}_{timestamp}.log").resolve()
+
+    if log_path:
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+        _cu.LOG_TO_FILE = log_path
+        print(f"Logging output to: {log_path}")
+
+    try:
+        _run_tidb_benchmark(
+            args, key_path, region, seed, aws_profile, port, database,
+            workload, tables_arg, table_size_arg, threads_arg, duration_arg,
+            report_interval, profile_name, disk_fill_pct, downstream_port,
+        )
+    finally:
+        if log_path:
+            print(f"\nLog saved to: {log_path}")
+
+
+def _run_tidb_benchmark(
+    args, key_path, region, seed, aws_profile, port, database,
+    workload, tables, table_size, threads, duration,
+    report_interval, profile_name, disk_fill_pct, downstream_port,
+):
+    """Inner TiDB benchmark logic (matches tidb/benchmark.py _run_benchmark)."""
+    from tidb.driver import (
+        DEFAULT_EBS_SIZE_GB, TIDB_MYSQL_IGNORE_ERRORS, AWS_COSTS,
+        ssh_run, ssh_capture, ssh_stream,
+        discover_tidb_host, get_instance_info, get_cluster_info,
+        print_cluster_summary, fetch_resource_snapshot_compact,
+        fetch_final_resource_snapshot, get_disk_utilization,
+        run_bulk_data_load, run_sysbench_prepare, run_sysbench_cleanup,
+        format_minute_report, CdcLagTracker,
+    )
+    from common.report import CostTracker, print_summary
+
+    if not key_path.exists():
+        raise SystemExit(f"ERROR: SSH key not found: {key_path}")
+
+    if args.host:
+        host = args.host
+    else:
+        log("Discovering TiDB host from EC2 tags...")
+        host = discover_tidb_host(region, aws_profile, seed)
+    log(f"Using TiDB host: {host}")
+
+    database = seeded_database_name(seed)
+    log(f"Using seeded database name: {database} (seed={seed})")
+
+    if args.cleanup_only:
+        run_sysbench_cleanup(host, key_path, tables, port, database)
+        log("Cleanup complete.")
+        return
+
+    multi_phase = None
+    if profile_name:
+        profile = WORKLOAD_PROFILES[profile_name]
+        tables = profile["tables"]
+        table_size = profile["table_size"]
+        threads = profile["threads"]
+        duration = profile["duration"]
+        multi_phase = profile.get("multi_phase")
+        if disk_fill_pct is None:
+            disk_fill_pct = profile.get("disk_fill_pct", 30)
+        log(f"Using profile '{profile_name}': {tables} tables, "
+            f"{threads} threads, {duration}s")
+        if multi_phase:
+            log(f"  Multi-phase mode: {multi_phase}")
+    else:
+        if disk_fill_pct is None:
+            disk_fill_pct = 30
+
+    try:
+        print_cluster_summary(host, key_path, region, aws_profile, seed, port)
+    except Exception as exc:
+        log(f"WARNING: Could not fetch cluster summary "
+            f"(AWS creds may be expired): {exc}")
+        log("Continuing with benchmark...")
+
+    log("Disabling TiDB resource control (avoids error 8249)...")
+    ssh_run(host, f"""
+mysql -h 127.0.0.1 -P {port} -u root -e \
+"SET GLOBAL tidb_enable_resource_control = OFF;" 2>/dev/null || true
+""", key_path, strict=False)
+
+    # Initialize cost tracker
+    try:
+        inst_info = get_instance_info(region, aws_profile, seed)
+    except Exception:
+        inst_info = {}
+
+    role_types = {}
+    for inst in inst_info.get("instances", []):
+        role = inst.get("role", "unknown")
+        itype = inst.get("type", "")
+        base_role = role.rsplit("-", 1)[0] if "-" in role else role
+        if base_role not in role_types and itype:
+            role_types[base_role] = itype
+    default_type = role_types.get(
+        "host", role_types.get("client", "c7g.4xlarge"))
+    server_type = role_types.get("tikv", default_type)
+
+    cluster_info = get_cluster_info(host, key_path, port)
+    server_count = (cluster_info.get("tidb_count", 2) +
+                    cluster_info.get("tikv_count", 3) +
+                    cluster_info.get("pd_count", 3))
+    if args.ticdc:
+        server_count += 8
+
+    _disk_probe = get_disk_utilization(
+        host, key_path, port, DEFAULT_EBS_SIZE_GB, database)
+    detected_ebs_gb = _disk_probe.get("ebs_total_gb", DEFAULT_EBS_SIZE_GB)
+    log(f"Detected EBS volume size: {detected_ebs_gb}GB")
+
+    cost_tracker = CostTracker("tidb", server_type, region)
+    cost_tracker.set_infrastructure(
+        server_count=server_count, ebs_gb=detected_ebs_gb)
+    cost_tracker.start()
+
+    benchmark_start_time = time.time()
+
+    cdc_tracker = None
+    if args.ticdc:
+        cdc_tracker = CdcLagTracker(
+            host=host, key_path=key_path,
+            downstream_port=downstream_port)
+        cdc_tracker.start()
+
+    # Phase 1: Bulk data load
+    load_stats = None
+    if not args.no_disk_fill and not args.skip_prepare:
+        load_stats = run_bulk_data_load(
+            host, key_path, target_disk_pct=disk_fill_pct,
+            num_tables=tables, port=port, database=database,
+            ebs_size_gb=detected_ebs_gb,
+        )
+        table_size = load_stats["rows_per_table"]
+        log(f"Phase 1 complete: {load_stats['total_rows']:,} rows loaded")
+        log(f"  Actual disk: {load_stats['disk_after']['ebs_used_pct']}% "
+            f"of {load_stats['disk_after']['ebs_total_gb']}GB EBS")
+    elif not args.skip_prepare:
+        run_sysbench_prepare(host, key_path, tables, table_size, port,
+                             database)
+
+    if args.prepare_only:
+        log("Tables prepared. Skipping benchmark (--prepare-only).")
+        return
+
+    # Phase 2: Benchmark
+    log("")
+    log("=" * 70)
+    log("PHASE 2: BENCHMARK (updates + reads on loaded data)")
+    log("=" * 70)
+
+    server_specs = AWS_COSTS["ec2"].get(server_type, {})
+    server_hourly = server_specs.get("hourly", 0.29)
+    tikv_count = cluster_info.get("tikv_count", 3)
+    ebs_monthly = (detected_ebs_gb * tikv_count *
+                   AWS_COSTS["ebs"]["gp3_per_gb_month"])
+    server_compute_monthly = server_hourly * server_count * 730
+    server_total_monthly = server_compute_monthly + ebs_monthly
+    log("")
+    log(f"Server Monthly Cost ({server_count} hosts): "
+        f"EC2=${server_compute_monthly:.0f} + EBS=${ebs_monthly:.0f} "
+        f"= ${server_total_monthly:.0f}/mo")
+    log("")
+
+    # Build closures for the generalized runners
+    skip_trx = workload in ("oltp_read_only", "oltp_point_select")
+
+    def _build_cmd(w_threads, w_duration):
+        extra = [f"--mysql-ignore-errors={TIDB_MYSQL_IGNORE_ERRORS}"]
+        if skip_trx:
+            extra.append("--skip_trx=true")
+        return build_sysbench_cmd(
+            host_ip="", key_path="", workload=workload,
+            threads=w_threads, duration=w_duration, tables=tables,
+            table_size=table_size, endpoint="127.0.0.1", port=port,
+            user="root", password="", db=database,
+            report_interval=report_interval, extra_args=extra,
+        )
+
+    def _run_capture(cmd_str):
+        return ssh_capture(host, cmd_str + " 2>&1", key_path)
+
+    def _resource_fn():
+        return fetch_resource_snapshot_compact(host, key_path, port)
+
+    def _run_streaming(w_threads, w_duration):
+        cmd = _build_cmd(w_threads, w_duration)
+        log(f"Running sysbench {workload} benchmark")
+        log(f"  Tables: {tables}, Table size: {table_size:,}")
+        log(f"  Threads: {w_threads}, Duration: {w_duration}s")
+        log(f"  Error handling: ignoring errors "
+            f"{TIDB_MYSQL_IGNORE_ERRORS}")
+        if skip_trx:
+            log(f"  Read-only mode: --skip_trx=true")
+        result = run_benchmark_streaming(
+            host, key_path, cmd, ssh_stream,
+            resource_fn=_resource_fn,
+            format_report_fn=format_minute_report,
+        )
+        result["workload"] = workload
+        return result
+
+    total_queries = 0
+    total_transactions = 0
+    avg_qps = 0
+    avg_tps = 0
+
+    if multi_phase:
+        phase_results = run_multi_phase_benchmark(
+            multi_phase, workload,
+            _build_cmd, _run_capture, _run_streaming,
+            error_codes=TIDB_MYSQL_IGNORE_ERRORS,
+        )
+        print_summary(phase_results, "tidb")
+        total_duration = 0
+        weighted_qps = 0
+        weighted_tps = 0
+        for r in phase_results:
+            total_queries += r.get("total_queries", 0) or 0
+            total_transactions += r.get("total_transactions", 0) or 0
+            phase_dur = r.get("duration", 0) or 0
+            total_duration += phase_dur
+            weighted_qps += (r.get("qps", 0) or 0) * phase_dur
+            weighted_tps += (r.get("tps", 0) or 0) * phase_dur
+        if total_duration > 0:
+            avg_qps = weighted_qps / total_duration
+            avg_tps = weighted_tps / total_duration
+    else:
+        benchmark_metrics = _run_streaming(threads, duration)
+        print_summary(benchmark_metrics, "tidb")
+        total_queries = benchmark_metrics.get("total_queries", 0) or 0
+        total_transactions = (benchmark_metrics.get("total_transactions", 0)
+                              or 0)
+        avg_qps = benchmark_metrics.get("qps", 0) or 0
+        avg_tps = benchmark_metrics.get("tps", 0) or 0
+
+    cost_tracker.stop()
+    cost_tracker.add_queries(
+        query_count=total_queries,
+        transaction_count=total_transactions,
+        avg_qps=avg_qps, avg_tps=avg_tps,
+        avg_row_size_bytes=200,
+    )
+
+    fetch_final_resource_snapshot(host, key_path, port)
+    if load_stats:
+        disk_final = get_disk_utilization(
+            host, key_path, port, detected_ebs_gb, database)
+        log("")
+        log("--- Final Disk Utilization ---")
+        log(f"  EBS: {disk_final['ebs_used_gb']}GB / "
+            f"{disk_final['ebs_total_gb']}GB "
+            f"({disk_final['ebs_used_pct']}%)")
+        log(f"  TiKV stores: {disk_final['tikv_store_gb']:.1f}GB "
+            f"({disk_final['tikv_store_pct']:.1f}%)")
+        log(f"  Benchmark DB: {disk_final['db_data_gb']:.2f}GB")
+
+    cost_tracker.print_cost_summary()
+
+    if cdc_tracker:
+        cdc_tracker.stop()
+        cdc_tracker.print_summary()
+
+    if args.cleanup:
+        run_sysbench_cleanup(host, key_path, tables, port, database)
+
+    log("Benchmark complete.")
