@@ -466,6 +466,13 @@ def install_base_packages(host: InstanceInfo, ctx: BootstrapContext):
 sudo dnf -y update || true
 sudo dnf -y install jq htop sysstat mtr || true
 
+# mysql client needed on control node for create_sysbench_database()
+if ! command -v mysql &>/dev/null; then
+    sudo dnf -y install mariadb105 2>/dev/null || \
+    sudo dnf -y install mariadb 2>/dev/null || \
+    echo "WARNING: mysql client not installed"
+fi
+
 sudo tee /etc/sysctl.d/99-k8s.conf >/dev/null <<'EOF'
 net.bridge.bridge-nf-call-iptables = 1
 net.bridge.bridge-nf-call-ip6tables = 1

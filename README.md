@@ -5,17 +5,18 @@ Monorepo for database benchmarking tools on AWS. Each subdirectory contains scri
 ## Structure
 
 ```
-common/          Shared AWS, SSH, benchmarking, metrics, and reporting modules
-  aws.py         VPC, subnets, security groups, EC2 instance lifecycle, cleanup
-  ssh.py         SSH command execution, SCP file transfer, wait-for-ready
-  util.py        Timestamps, logging, AWS session helpers, AMI resolution
-  types.py       Shared dataclasses (InstanceInfo, BootstrapContext)
-  client.py      Unified client VM provisioning (all tools for any server type)
-  benchmark.py   Unified sysbench orchestration + CLI entry point (--server-type aurora|tidb)
-  sampler.py     EC2 metrics sampling + CloudWatch queries + post-processing
-  report.py      Markdown report generation + cost tracking
-  lua/           Custom sysbench Lua workloads (IUD, mixed read/write)
-  __main__.py    Allows `python3 -m common` to run the unified benchmark CLI
+common/              Shared AWS, SSH, benchmarking, metrics, and reporting modules
+  aws.py             VPC, subnets, security groups, EC2 instance lifecycle, cleanup
+  ssh.py             SSH command execution, SCP file transfer, wait-for-ready
+  util.py            Timestamps, logging, AWS session helpers, AMI resolution
+  types.py           Shared dataclasses (InstanceInfo, BootstrapContext)
+  client.py          Unified client VM provisioning (all tools for any server type)
+  benchmark.py       Unified sysbench orchestration + CLI entry point (--server-type aurora|tidb)
+  remote_runner.py   Autonomous benchmark execution on client VM (deploy/status/fetch)
+  sampler.py         EC2 metrics sampling + CloudWatch queries + post-processing
+  report.py          Markdown report generation + cost tracking
+  lua/               Custom sysbench Lua workloads (IUD, mixed read/write)
+  __main__.py        Allows `python3 -m common` to run the unified benchmark CLI
 tidb/            TiDB on k3s + TiDB Operator (multi-AZ, TiCDC replication)
   driver.py      TiDB-specific helpers (SSH, cluster discovery, CDC lag, disk, bulk load)
   benchmark.py   Thin redirect to common.benchmark --server-type tidb
@@ -42,9 +43,19 @@ aurora/          Aurora MySQL benchmarking (sysbench, IO-Optimized storage)
   - Saves state to `common/client-{seed}-state.json` (auto-discovered by benchmark CLI)
   - `--cleanup` tears down the client instance and security group
 
+### Remote Runner
+- **remote_runner.py** -- Autonomous benchmark execution on client VMs:
+  - `generate_sysbench_script()` -- Self-contained bash script for Aurora/TiDB benchmarks (prepare/run/cleanup phases, atomic `status.json` writes)
+  - `generate_memtier_script()` -- Self-contained bash script for Valkey benchmarks (memtier_benchmark with JSON output per run)
+  - `deploy()` -- Upload script + optional Lua files to client VM, start in tmux session
+  - `status()` -- Check tmux session state + read `status.json` for phase/progress/errors
+  - `fetch()` -- Download results directory from client VM via SCP
+  - Scripts run inside tmux so they survive SSH disconnects and expired AWS credentials
+
 ### Benchmarking (sysbench)
 - **benchmark.py** -- Unified sysbench orchestration AND CLI entry point for tidb and aurora:
   - **Unified CLI**: `python3 -m common.benchmark --server-type {aurora,tidb}` (single entry point for all sysbench-based benchmarks)
+  - **Remote actions**: `--action deploy|status|fetch` for autonomous benchmark execution via remote_runner.py
   - `build_sysbench_cmd()` -- parameterized by endpoint, port, user, password, workload
   - `run_sysbench()` / `run_sysbench_streaming()` / `run_sysbench_parallel()` -- execution modes
   - `run_benchmark_streaming()` / `run_adaptive_phase()` / `run_multi_phase_benchmark()` -- generalized orchestration with callable callbacks
@@ -79,7 +90,9 @@ All benchmarks follow a 3-step workflow:
 
 1. **Provision server** -- `python3 -m {aurora,tidb,valkey}.setup` creates the database cluster and VPC
 2. **Provision client** -- `python3 -m common.client --seed <seed> --server-type <type> --size small|heavy` creates a benchmark EC2 in the server's VPC with all tools pre-installed
-3. **Run benchmark** -- `python3 -m common.benchmark --server-type <type>` (the client IP and SSH key are auto-discovered from the state file)
+3. **Run benchmark** -- two modes:
+   - **Interactive** (requires continuous SSH): `python3 -m common.benchmark --server-type <type>`
+   - **Remote** (fire-and-forget): deploy a self-contained script to the client VM, then poll status and fetch results later (see Remote Runner below)
 
 The client is independent of the server type -- one client VM has sysbench, mysql, memtier, docker, and works against any database.
 
@@ -102,6 +115,32 @@ python3 -m tidb.benchmark [options]     # injects --server-type tidb
 Run `python3 -m common.benchmark --help` to see all shared and server-specific options.
 
 Valkey uses a different benchmark tool (valkey-benchmark / memtier) and has its own entry point: `python3 -m valkey.benchmark`.
+
+## Remote Runner (Autonomous Benchmarks)
+
+The remote runner deploys a self-contained bash script to the client VM and runs it inside a tmux session. This eliminates the need for a continuous SSH connection -- expired AWS credentials won't interrupt a running benchmark.
+
+```bash
+# Deploy a TiDB benchmark (generates script, uploads to client, starts in tmux)
+python3 -m common.benchmark --server-type tidb --seed e2e-001 --action deploy --profile quick
+
+# Check progress (reads status.json from the client)
+python3 -m common.benchmark --server-type tidb --seed e2e-001 --action status
+
+# Fetch results when done
+python3 -m common.benchmark --server-type tidb --seed e2e-001 --action fetch
+
+# Aurora example
+python3 -m common.benchmark --server-type aurora --seed auroralt-001 --action deploy \
+  --password 'BenchMark2024!' --threads 64 --duration 300
+
+# Manual monitoring (SSH to client, attach to tmux)
+ssh -i <key> ec2-user@<client-ip> 'tmux attach -t bench'
+# Or tail the log:
+ssh -i <key> ec2-user@<client-ip> 'tail -f /home/ec2-user/bench-results/*/benchmark.log'
+```
+
+The generated scripts handle prepare/run/cleanup phases for sysbench (TiDB, Aurora) and multi-run test loops for memtier (Valkey). Each phase writes an atomic `status.json` file with current state, timestamps, and any errors.
 
 ## Aurora MySQL
 

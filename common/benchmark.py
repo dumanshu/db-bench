@@ -1283,6 +1283,11 @@ def parse_args():
     p.add_argument("--server-type", required=True, choices=["aurora", "tidb"],
                    help="Database server type to benchmark")
 
+    p.add_argument("--action", choices=["run", "deploy", "status", "fetch"],
+                   default="run",
+                   help="Action: run (interactive, default), deploy (remote),"
+                        " status (check), fetch (download)")
+
     # --- Shared arguments ---
     p.add_argument("--host", default=None,
                    help="Client/host IP (auto-discovered if omitted)")
@@ -1377,12 +1382,223 @@ def main():
     """Unified entry point for ``python3 -m common.benchmark``."""
     args = parse_args()
 
-    if args.server_type == "aurora":
+    if args.action == "deploy":
+        _action_deploy(args)
+    elif args.action == "status":
+        _action_status(args)
+    elif args.action == "fetch":
+        _action_fetch(args)
+    elif args.server_type == "aurora":
         _main_aurora(args)
     elif args.server_type == "tidb":
         _main_tidb(args)
     else:
         raise SystemExit(f"Unknown server type: {args.server_type}")
+
+
+# ---------------------------------------------------------------------------
+# Remote runner actions (deploy / status / fetch)
+# ---------------------------------------------------------------------------
+
+
+def _resolve_host_and_key(args):
+    """Resolve host IP and SSH key path from args and client state."""
+    import sys
+
+    seed = args.seed
+    server_type = args.server_type
+
+    client_state = _load_bench_client(seed) if seed else {}
+
+    if args.host:
+        host = args.host
+    elif client_state.get("public_ip"):
+        host = client_state["public_ip"]
+    else:
+        host = None
+
+    if args.ssh_key:
+        key_path = args.ssh_key
+    elif client_state.get("key_path"):
+        key_path = client_state["key_path"]
+    else:
+        base_dir = Path(__file__).resolve().parent.parent
+        if server_type == "aurora":
+            key_path = str(base_dir / "aurora" / "aurora-bench-key.pem")
+        else:
+            key_path = str(base_dir / "tidb" / "tidb-load-test-key.pem")
+
+    if not host:
+        log("ERROR: Could not determine host IP. "
+            "Use --host or ensure client state exists (--seed).")
+        sys.exit(1)
+
+    return host, key_path
+
+
+def _build_deploy_params(args):
+    """Build the params dict for remote_runner.deploy() from CLI args."""
+    server_type = args.server_type
+    profile_name = getattr(args, "profile", None)
+
+    if server_type == "tidb":
+        seed = args.seed or "default"
+        db = seeded_database_name(seed)
+        port = args.port if args.port is not None else 4000
+        user = "root"
+        password = ""
+        workload = args.workload or "oltp_read_write"
+
+        if profile_name:
+            profile = WORKLOAD_PROFILES[profile_name]
+            tables = args.tables if args.tables is not None else profile["tables"]
+            table_size = (args.table_size if args.table_size is not None
+                          else profile["table_size"])
+            threads = (args.threads if args.threads is not None
+                       else profile["threads"])
+            duration = (args.duration if args.duration is not None
+                        else profile["duration"])
+            multi_phase_name = profile.get("multi_phase")
+            multi_phase = (MULTI_PHASE_PROFILES[multi_phase_name]["phases"]
+                           if multi_phase_name else None)
+        else:
+            tables = args.tables if args.tables is not None else 16
+            table_size = args.table_size if args.table_size is not None else 100000
+            threads = args.threads if args.threads is not None else 64
+            duration = args.duration if args.duration is not None else 120
+            multi_phase = None
+
+        extra_args = [f"--mysql-ignore-errors={MYSQL_IGNORE_ERRORS}"]
+        skip_trx = workload in ("oltp_read_only", "oltp_point_select")
+        if skip_trx:
+            extra_args.append("--skip_trx=true")
+
+        return {
+            "server_type": server_type,
+            "endpoint": "127.0.0.1",
+            "port": port,
+            "user": user,
+            "password": password,
+            "db": db,
+            "workload": workload,
+            "tables": tables,
+            "table_size": table_size,
+            "threads": threads,
+            "duration": duration,
+            "report_interval": (args.report_interval
+                                if args.report_interval is not None else 10),
+            "extra_args": extra_args,
+            "lua_dir": "/tmp/lua",
+            "skip_prepare": args.skip_prepare,
+            "skip_cleanup": not args.cleanup,
+            "multi_phase": multi_phase,
+        }
+
+    else:  # aurora
+        password = (args.password
+                    or os.environ.get("AURORA_MASTER_PASSWORD", "BenchMark2024!"))
+        port = args.port if args.port is not None else 3306
+        db = args.db or "sbtest"
+        workload = args.workload or "oltp_read_write"
+        tables = args.tables if args.tables is not None else 16
+        table_size = args.table_size if args.table_size is not None else 100000
+        threads = args.threads if args.threads is not None else 64
+        duration = args.duration if args.duration is not None else 300
+        endpoint = getattr(args, "endpoint", None) or ""
+
+        if not endpoint:
+            seed = args.seed
+            if seed:
+                try:
+                    from aurora.driver import discover_stack, DEFAULT_REGION, DEFAULT_PROFILE
+                    region = args.region or DEFAULT_REGION
+                    aws_profile = args.aws_profile or DEFAULT_PROFILE
+                    script_dir = Path(__file__).resolve().parent.parent / "aurora"
+                    info = discover_stack(script_dir, region, aws_profile, seed)
+                    endpoint = info.get("endpoint", "")
+                except Exception as exc:
+                    log(f"WARNING: Could not discover Aurora endpoint: {exc}")
+
+        if not endpoint:
+            raise SystemExit(
+                "ERROR: Aurora endpoint required. Use --endpoint or ensure "
+                "stack is discoverable via --seed.")
+
+        return {
+            "server_type": server_type,
+            "endpoint": endpoint,
+            "port": port,
+            "user": "admin",
+            "password": password,
+            "db": db,
+            "workload": workload,
+            "tables": tables,
+            "table_size": table_size,
+            "threads": threads,
+            "duration": duration,
+            "report_interval": (args.report_interval
+                                if args.report_interval is not None else 10),
+            "extra_args": [],
+            "lua_dir": "/tmp/lua",
+            "skip_prepare": args.skip_prepare,
+            "skip_cleanup": getattr(args, "skip_cleanup", False),
+        }
+
+
+def _action_deploy(args):
+    """Deploy a benchmark to run autonomously on the remote host."""
+    from common.remote_runner import deploy
+
+    host, key_path = _resolve_host_and_key(args)
+    params = _build_deploy_params(args)
+
+    needs_lua = params["workload"] in ("custom_iud", "custom_mixed")
+
+    log(f"Deploying {params['server_type']} benchmark to {host}...")
+    log(f"  Workload : {params['workload']}")
+    log(f"  Tables   : {params['tables']} x {params['table_size']:,} rows")
+    log(f"  Threads  : {params['threads']}, Duration: {params['duration']}s")
+
+    result = deploy(host, key_path, params, lua_files=needs_lua)
+    log("")
+    log(f"Benchmark is running in tmux session '{result['tmux_session']}'")
+    log(f"Check progress:  python3 -m common.benchmark "
+        f"--server-type {args.server_type} --action status"
+        + (f" --host {host}" if args.host else "")
+        + (f" --seed {args.seed}" if args.seed else ""))
+
+
+def _action_status(args):
+    """Check the status of a remote benchmark."""
+    from common.remote_runner import status as remote_status
+
+    host, key_path = _resolve_host_and_key(args)
+
+    log(f"Checking benchmark status on {host}...")
+    st = remote_status(host, key_path)
+
+    running_str = "RUNNING" if st["running"] else "STOPPED"
+    log(f"  Status     : {running_str}")
+    log(f"  Phase      : {st['phase']}")
+    log(f"  Started at : {st['started_at'] or 'N/A'}")
+    if st.get("progress"):
+        log(f"  Progress   : {st['progress']}")
+    if st.get("completed_at"):
+        log(f"  Completed  : {st['completed_at']}")
+    if st.get("error"):
+        log(f"  Error      : {st['error']}")
+    log(f"  Results dir: {st['results_dir'] or 'N/A'}")
+
+
+def _action_fetch(args):
+    """Fetch benchmark results from the remote host."""
+    from common.remote_runner import fetch
+
+    host, key_path = _resolve_host_and_key(args)
+
+    local_dir = None
+    local_path = fetch(host, key_path, local_dir)
+    log(f"Results downloaded to: {local_path}")
 
 
 # ---------------------------------------------------------------------------
