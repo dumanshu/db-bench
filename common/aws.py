@@ -292,7 +292,8 @@ def describe_instance(iid):
 
 def ensure_instance(name, role, itype, subnet_id, sg_id,
                     resolved_ami_id_fn, key_name, ensure_keypair_fn,
-                    root_volume_size=100, associate_public_ip=True):
+                    root_volume_size=100, associate_public_ip=True,
+                    user_data=None):
     iid = find_instance_id_by_name(name)
     if iid:
         log(f"REUSED  instance {role}: {iid}")
@@ -312,7 +313,7 @@ def ensure_instance(name, role, itype, subnet_id, sg_id,
             "DeleteOnTermination": True
         }
     }]
-    resp = ec2().run_instances(
+    kwargs = dict(
         ImageId=resolved_ami_id_fn(),
         InstanceType=itype,
         KeyName=key_name,
@@ -325,8 +326,11 @@ def ensure_instance(name, role, itype, subnet_id, sg_id,
                 {"Key": "Role", "Value": role}
             ]
         }],
-        MinCount=1, MaxCount=1
+        MinCount=1, MaxCount=1,
     )
+    if user_data:
+        kwargs["UserData"] = user_data
+    resp = ec2().run_instances(**kwargs)
     iid = resp["Instances"][0]["InstanceId"]
     log(f"CREATED instance {role}: {iid}")
     wait_running(iid)

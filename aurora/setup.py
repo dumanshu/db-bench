@@ -460,38 +460,27 @@ def create_aurora_instance(rds, cluster_id: str,
 
 
 # ---------------------------------------------------------------------------
-# EC2 client instance  (kept as-is -- needs UserData not in common.aws)
+# EC2 client instance  (delegates to common.aws.ensure_instance)
 # ---------------------------------------------------------------------------
-def create_ec2_client(ec2_client, ami_id: str, subnet_id: str,
+def create_ec2_client(ami_id: str, subnet_id: str,
                       sg_id: str, ec2_instance_type: str) -> dict:
     log(f"Creating EC2 client ({ec2_instance_type})...")
-
-    resp = ec2_client.run_instances(
-        ImageId=ami_id,
-        InstanceType=ec2_instance_type,
-        KeyName=KEY_NAME,
-        MinCount=1, MaxCount=1,
-        SubnetId=subnet_id,
-        SecurityGroupIds=[sg_id],
-        UserData=USER_DATA,
-        BlockDeviceMappings=[{
-            "DeviceName": "/dev/xvda",
-            "Ebs": {"VolumeSize": 50, "VolumeType": "gp3", "DeleteOnTermination": True},
-        }],
-        TagSpecifications=_tag_spec("instance", "client"),
+    iid = _caws.ensure_instance(
+        name=f"{_cu.STACK}-client",
+        role="client",
+        itype=ec2_instance_type,
+        subnet_id=subnet_id,
+        sg_id=sg_id,
+        resolved_ami_id_fn=lambda: ami_id,
+        key_name=KEY_NAME,
+        ensure_keypair_fn=lambda: None,  # key pair created separately
+        root_volume_size=50,
+        associate_public_ip=True,
+        user_data=USER_DATA,
     )
-    instance_id = resp["Instances"][0]["InstanceId"]
-    log(f"  EC2 instance: {instance_id}")
-
-    log("  Waiting for EC2 to start...")
-    waiter = ec2_client.get_waiter("instance_running")
-    waiter.wait(InstanceIds=[instance_id])
-
-    desc = ec2_client.describe_instances(InstanceIds=[instance_id])
-    public_ip = desc["Reservations"][0]["Instances"][0].get("PublicIpAddress", "")
-    log(f"  EC2 running. Public IP: {public_ip}")
-
-    return {"instance_id": instance_id, "public_ip": public_ip}
+    info = _caws.instance_info_from_id(iid, "client")
+    log(f"  EC2 running. Public IP: {info.public_ip}")
+    return {"instance_id": iid, "public_ip": info.public_ip}
 
 
 # ---------------------------------------------------------------------------
@@ -921,7 +910,7 @@ def main() -> None:
         state["restored_from_snapshot"] = args.restore_snapshot
 
     ami_id = get_al2023_ami(session, args.ec2_instance_type)
-    client = create_ec2_client(ec2_client, ami_id, net["subnet_a_id"],
+    client = create_ec2_client(ami_id, net["subnet_a_id"],
                                sgs["ec2_sg_id"], args.ec2_instance_type)
     state["client_instance_id"] = client["instance_id"]
     state["client_public_ip"] = client["public_ip"]

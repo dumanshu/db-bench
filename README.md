@@ -5,7 +5,16 @@ Monorepo for database benchmarking tools on AWS. Each subdirectory contains scri
 ## Structure
 
 ```
-common/          Shared AWS, SSH, and utility modules
+common/          Shared AWS, SSH, benchmarking, metrics, and reporting modules
+  aws.py         VPC, subnets, security groups, EC2 instance lifecycle, cleanup
+  ssh.py         SSH command execution, SCP file transfer, wait-for-ready
+  util.py        Timestamps, logging, AWS session helpers, AMI resolution
+  types.py       Shared dataclasses (InstanceInfo, BootstrapContext)
+  client.py      Unified client VM provisioning (all tools for any server type)
+  benchmark.py   Sysbench orchestration (prepare, run, stream, parallel, fill)
+  sampler.py     EC2 metrics sampling + CloudWatch queries + post-processing
+  report.py      Markdown report generation + cost tracking
+  lua/           Custom sysbench Lua workloads (IUD, mixed read/write)
 tidb/            TiDB on k3s + TiDB Operator (multi-AZ, TiCDC replication)
 valkey/          Valkey with Envoy proxy (standalone and cluster modes)
 aurora/          Aurora MySQL benchmarking (sysbench, IO-Optimized storage)
@@ -13,50 +22,67 @@ aurora/          Aurora MySQL benchmarking (sysbench, IO-Optimized storage)
 
 ## Common Library
 
-`common/` provides shared infrastructure used by all database modules:
+`common/` provides shared infrastructure and benchmark tooling used by all database modules:
 
+### Infrastructure
 - **aws.py** -- VPC, subnets, security groups, EC2 instance lifecycle, cleanup
 - **ssh.py** -- SSH command execution, SCP file transfer, wait-for-ready
 - **util.py** -- Timestamps, logging, AWS session helpers, AMI resolution
 - **types.py** -- Shared dataclasses (`InstanceInfo`, `BootstrapContext`)
 
+### Client Provisioning
+- **client.py** -- Unified client VM tool installation via `install_client_tools(host_ip, key_path, server_type)`:
+  - `server_type="tidb"` or `"aurora"`: base packages, sysctl tuning, mysql client, sysbench
+  - `server_type="valkey"`: base packages, sysctl tuning, memtier_benchmark, docker
+
+### Benchmarking (sysbench)
+- **benchmark.py** -- Unified sysbench orchestration for tidb and aurora:
+  - `build_sysbench_cmd()` -- parameterized by endpoint, port, user, password, workload
+  - `run_sysbench()` / `run_sysbench_streaming()` / `run_sysbench_parallel()` -- execution modes
+  - `sysbench_prepare()` / `sysbench_cleanup()` -- table lifecycle
+  - `fast_fill()` -- INSERT...SELECT doubling for buffer pool pressure
+  - `upload_lua_scripts()` -- deploy custom Lua workloads to EC2
+  - `parse_sysbench_output()` -- unified result parser
+  - Built-in profiles: quick, light, medium, heavy, stress, scaling
+  - Workloads: oltp_read_write, oltp_read_only, oltp_write_only, oltp_point_select, oltp_insert, oltp_delete, oltp_update_index, oltp_update_non_index, custom_iud, custom_mixed
+- **lua/** -- Custom sysbench Lua scripts:
+  - `custom_iud.lua` -- 68% insert, 28% update, 4% delete (production ratio)
+  - `custom_mixed.lua` -- 88% read, 8% insert, 3% update, 1% delete (production ratio)
+
+### Metrics and Reporting
+- **sampler.py** -- EC2 metrics sampling, parameterized by `--server-type`:
+  - Always: CPU jiffies from /proc/stat, memory from /proc/meminfo
+  - tidb/aurora: InnoDB row counters via mysql CLI
+  - valkey: valkey-cli INFO stats
+  - Post-processing: windowed analysis, safe_stats, sysbench output parsing
+  - CloudWatch queries per server type (Aurora RDS metrics, EC2 metrics, ElastiCache metrics)
+- **report.py** -- Benchmark report generation:
+  - `generate_report()` -- Markdown report from JSON results
+  - `CostTracker` -- AWS cost estimation during benchmark runs
+  - `save_results()` / `print_summary()` -- result persistence and display
+  - Instance pricing for Aurora db.r* families and TiDB c7g/c8g EC2 families
+
 ## Aurora MySQL
 
-Provisions an Aurora MySQL cluster with IO-Optimized storage (aurora-iopt1) and an EC2 client instance pre-loaded with sysbench. Includes custom IUD workloads matching production read/write ratios, fill-phase data generation via INSERT...SELECT doubling, snapshot/restore workflow, and production baseline comparison reporting.
+Provisions an Aurora MySQL cluster with IO-Optimized storage (aurora-iopt1) and an EC2 client instance pre-loaded with sysbench. Uses common benchmark and reporting modules.
 
 ### Features
 
 - **IO-Optimized storage**: aurora-iopt1 for consistent throughput
-- **Custom workloads**: IUD (68% insert, 28% update, 4% delete) and mixed (88% read, 8% insert, 3% update, 1% delete) Lua scripts matching production ratios
+- **Custom workloads**: IUD and mixed Lua scripts from common/lua/ matching production ratios
 - **Fill phase**: INSERT...SELECT doubling to fill buffer pool to N x instance RAM
 - **Snapshot/restore**: Create cluster snapshots after fill, restore to skip re-filling
 - **Parallel sysbench**: Run multiple sysbench processes concurrently
 - **InnoDB row counter measurement**: Tracks actual insert/update/delete/read rates
-- **CloudWatch integration**: Aurora CPU, network throughput metrics
-- **Client CPU monitoring**: mpstat-based EC2 client utilization tracking
+- **CloudWatch integration**: Aurora CPU, network throughput, IOPS, latency metrics
 - **Production baseline comparison**: Automatic comparison against known production metrics
 - **Dual AWS profile support**: Separate profiles for EC2/VPC and RDS operations
 
 ### Quick Start
 
 ```bash
-# Generate SSH key (if not already done)
-ssh-keygen -t ed25519 -f aurora/aurora-bench-key.pem -N ""
-
 # Provision (default: db.r8g.xlarge Aurora, c8g.24xlarge EC2 client)
 python3 -m aurora.setup --seed auroralt-001 --aws-profile sandbox
-
-# Provision with larger instance
-python3 -m aurora.setup --instance-type db.r8g.16xlarge --aws-profile sandbox
-
-# Validate (checks cluster, connectivity, sysbench, runs quick benchmark)
-python3 -m aurora.validate --seed auroralt-001 --aws-profile sandbox
-
-# Fill phase (create background data to pressure buffer pool)
-python3 -m aurora.benchmark --fill --seed auroralt-001 --aws-profile sandbox
-
-# Snapshot after fill (avoids re-filling on future runs)
-python3 -m aurora.setup --snapshot --seed auroralt-001
 
 # Benchmark (custom mixed workload, 64 threads, 5 minutes)
 python3 -m aurora.benchmark --seed auroralt-001 --aws-profile sandbox
@@ -64,7 +90,13 @@ python3 -m aurora.benchmark --seed auroralt-001 --aws-profile sandbox
 # Benchmark with parallel sysbench processes
 python3 -m aurora.benchmark --parallel 4 --threads 64 --seed auroralt-001
 
-# Restore from snapshot (skip fill on next provision)
+# Fill phase (create background data to pressure buffer pool)
+python3 -m aurora.benchmark --fill --seed auroralt-001 --aws-profile sandbox
+
+# Snapshot after fill
+python3 -m aurora.setup --snapshot --seed auroralt-001
+
+# Restore from snapshot
 python3 -m aurora.setup --restore-snapshot <snapshot-id> --seed auroralt-002
 
 # Cleanup
@@ -73,11 +105,6 @@ python3 -m aurora.setup --cleanup --seed auroralt-001 --aws-profile sandbox
 
 ### Additional Tools
 
-- **aurora/ec2_sampler.py** -- EC2 instance type sampling and selection
-- **aurora/parse_window.py** -- CloudWatch metric window parsing and analysis
-- **aurora/generate_report.py** -- Benchmark result report generation
-- **aurora/calibrate.sh** -- Instance calibration shell script
-- **aurora/run_final.sh** -- Full benchmark run orchestration
 - **aurora/modify_instance.sh** -- Live Aurora instance type modification
 
 ## TiDB
@@ -90,7 +117,7 @@ Provisions a multi-AZ TiDB cluster on EC2 via k3s and TiDB Operator, with option
 - **Dedicated VMs**: Each TiKV pod consumes the entire EC2 instance
 - **TiCDC replication**: Deploys upstream + downstream clusters with changefeed lag measurement
 - **Benchmark profiles**: quick, light, medium, heavy, standard, stress, scaling
-- **Workloads**: oltp_read_write, oltp_read_only, oltp_write_only, oltp_point_select, oltp_insert, and more
+- **Workloads**: All standard sysbench workloads plus custom IUD and mixed from common/lua/
 
 ### Quick Start
 
@@ -165,14 +192,13 @@ python3 -m valkey.setup --cleanup \
 
 - Python 3.9+ with `boto3`
 - AWS CLI v2 configured with a profile pointing at the target account
-- SSH key pair uploaded to EC2 (see individual module READMEs in the original repos for key generation steps)
+- SSH key pair uploaded to EC2 (see individual module quick starts)
 
 ## Running
 
 All modules are designed to run from the repo root using `python3 -m`:
 
 ```bash
-# From db-bench/
 python3 -m tidb.setup --help
 python3 -m valkey.setup --help
 python3 -m aurora.setup --help

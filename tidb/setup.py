@@ -28,6 +28,7 @@ from typing import List, Optional
 
 import common.util as _cu
 import common.aws as _caws
+from common.client import install_client_tools
 from common.util import (
     ts, log, need_cmd, my_public_cidr, aws_session, ec2, ssm, tags_common,
     configure_from_args as _common_configure_from_args,
@@ -1190,64 +1191,8 @@ kubectl exec -n tidb-cluster $TICDC_POD -- /cdc cli changefeed list \
 
 
 # ---------------------------------------------------------------------------
-# Client Tools (only on client node)
+# Client Tools -- delegated to common.client.install_client_tools
 # ---------------------------------------------------------------------------
-
-def install_mysql_client(host: InstanceInfo, ctx: BootstrapContext):
-    log(f"Installing MySQL client on {host.role}")
-    ssh_run(host, """
-if command -v mysql >/dev/null 2>&1; then
-    echo "MySQL client already installed"
-    exit 0
-fi
-sudo dnf -y install mariadb105 || sudo dnf -y install mysql || true
-""", ctx)
-
-
-def install_sysbench(host: InstanceInfo, ctx: BootstrapContext):
-    log(f"Installing sysbench on {host.role}")
-    ssh_run(host, """
-if command -v sysbench >/dev/null 2>&1; then
-    echo "sysbench already installed"
-    exit 0
-fi
-
-# Try package manager first
-if sudo dnf -y install sysbench 2>/dev/null; then
-    exit 0
-fi
-
-# Build from source - need to handle Amazon Linux 2023 which uses MariaDB
-sudo dnf -y install git mariadb-connector-c-devel libaio-devel automake libtool make gcc gcc-c++ || true
-
-# Create symlinks for MySQL compatibility (AL2023 uses mariadb paths)
-if [ -d /usr/include/mariadb ] && [ ! -f /usr/include/mysql.h ]; then
-    sudo ln -sf /usr/include/mariadb/mysql.h /usr/include/mysql.h
-    sudo ln -sf /usr/include/mariadb/mysqld_error.h /usr/include/mysqld_error.h 2>/dev/null || true
-    sudo ln -sf /usr/include/mariadb/errmsg.h /usr/include/errmsg.h 2>/dev/null || true
-fi
-
-cd /tmp
-rm -rf sysbench
-git clone https://github.com/akopytov/sysbench.git
-cd sysbench
-./autogen.sh
-
-# Configure with explicit MariaDB paths for Amazon Linux 2023
-if [ -d /usr/include/mariadb ]; then
-    export CPPFLAGS="-I/usr/include/mariadb"
-    ./configure --with-mysql-includes=/usr/include/mariadb --with-mysql-libs=/usr/lib64/mariadb
-else
-    ./configure --with-mysql
-fi
-
-make -j $(nproc)
-sudo make install
-cd /tmp && rm -rf sysbench
-
-# Verify installation
-sysbench --version
-""", ctx)
 
 
 def create_sysbench_database(host: InstanceInfo, ctx: BootstrapContext):
@@ -1506,8 +1451,7 @@ def main():
     # Client Tools
     # -----------------------------------------------------------------------
     log("=== Installing Client Tools ===")
-    install_mysql_client(client, ctx)
-    install_sysbench(client, ctx)
+    install_client_tools(client.public_ip, str(ctx.ssh_key_path), "tidb")
     create_sysbench_database(client, ctx)
 
     if ctx.multi_az:

@@ -33,7 +33,9 @@ from common.aws import (
     revoke_all_permissions, remove_group_references,
     delete_stack_security_groups, delete_route_table_by_name,
     delete_stack_subnets, delete_stack_igw_and_vpc,
+    ensure_instance as _common_ensure_instance,
 )
+from common.client import install_client_tools
 from common.ssh import (
     host_target_and_jump, ssh_base_cmd, ssh_run, ssh_capture, scp_put, scp_get,
 )
@@ -383,37 +385,11 @@ def instance_public_ip(iid):
     return r["Reservations"][0]["Instances"][0].get("PublicIpAddress")
 
 def ensure_instance(name, role, itype, subnet_id, sg_id, associate_public_ip):
-    iid = find_instance_id_by_name(name)
-    if iid:
-        log(f"REUSED  instance {role}: {iid}")
-        return iid
-    # Verify KeyPair exists (and credentials are still valid)
-    ensure_keypair_accessible()
-    # Launch
-    ni = [{
-        "DeviceIndex": 0,
-        "SubnetId": subnet_id,
-        "AssociatePublicIpAddress": associate_public_ip,
-        "Groups": [sg_id]
-    }]
-    resp = ec2().run_instances(
-        ImageId=resolved_ami_id(),
-        InstanceType=itype,
-        KeyName=KEY_NAME,
-        NetworkInterfaces=ni,
-        TagSpecifications=[{
-            "ResourceType":"instance",
-            "Tags": tags_common() + [
-                {"Key":"Name","Value":name},
-                {"Key":"Role","Value":role}
-            ]
-        }],
-        MinCount=1, MaxCount=1
+    return _common_ensure_instance(
+        name, role, itype, subnet_id, sg_id,
+        resolved_ami_id, KEY_NAME, ensure_keypair_accessible,
+        associate_public_ip=associate_public_ip,
     )
-    iid = resp["Instances"][0]["InstanceId"]
-    log(f"CREATED instance {role}: {iid}")
-    wait_running(iid)
-    return iid
 
 
 def get_stack_instance_ids(roles=None):
@@ -1490,20 +1466,18 @@ def bootstrap_cluster(args, provisioned):
     ensure_sg_ingress_from_group(provisioned["security_groups"]["valkey"], provisioned["security_groups"]["client"], "tcp", REDIS_PORT, REDIS_PORT)
     ensure_ingress_tcp_cidr(provisioned["security_groups"]["envoy"], REDIS_PORT, f"{role_info['client'].private_ip}/32")
 
-    hosts_for_base = [role_info["client"]]
-    hosts_for_base.extend(role_info[r] for r in envoy_roles + valkey_roles)
-
-    # Basic SSH + deps
-    for host in hosts_for_base:
-        log(f"Testing SSH to {host.role}")
-        ssh_run(host, "echo ok", ctx)
-        install_base(host, ctx)
-
     valkey_hosts = [role_info[r] for r in valkey_roles]
     envoy_hosts = [role_info[r] for r in envoy_roles]
     client_entries = [("client", client.instance_id)]
     valkey_entries = [(host.role, host.instance_id) for host in valkey_hosts]
     envoy_entries = [(host.role, host.instance_id) for host in envoy_hosts]
+
+    install_client_tools(client.public_ip, str(key_path), server_type="valkey")
+
+    for host in envoy_hosts + valkey_hosts:
+        log(f"Testing SSH to {host.role}")
+        ssh_run(host, "echo ok", ctx)
+        install_base(host, ctx)
 
     for host in valkey_hosts + envoy_hosts:
         ensure_docker(host, ctx)
@@ -1512,7 +1486,6 @@ def bootstrap_cluster(args, provisioned):
         local_tar = Path(tmpdir) / f"valkey-{VALKEY_VERSION}-binaries.tar.gz"
         ensure_valkey_artifact(client, ctx, local_tar)
         install_valkey_cli_from_tar(client, ctx, local_tar)
-        ensure_memtier_tool(client, ctx)
 
     for host in valkey_hosts:
         configure_valkey_container(host, ctx, cluster_mode)
