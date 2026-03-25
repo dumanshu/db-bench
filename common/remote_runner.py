@@ -130,85 +130,84 @@ def generate_sysbench_script(params: dict) -> tuple[str, str]:
             echo ">>> Phase cleanup completed with exit code $?"
         """)
 
-    script = dedent(f"""\
-        #!/usr/bin/env bash
-        # Auto-generated benchmark runner -- do not edit
-        # Server type : {server_type}
-        # Generated   : {ts}
-        set -euo pipefail
+    script = f"""#!/usr/bin/env bash
+# Auto-generated benchmark runner -- do not edit
+# Server type : {server_type}
+# Generated   : {ts}
+set -euo pipefail
 
-        RESULTS_DIR="{results_dir}"
-        mkdir -p "$RESULTS_DIR"
+RESULTS_DIR="{results_dir}"
+mkdir -p "$RESULTS_DIR"
 
-        # --- status.json helper -------------------------------------------
-        update_status() {{
-            local phase="$1"
-            local progress="$2"
-            local error="$3"
-            local now
-            now=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+# --- status.json helper -------------------------------------------
+update_status() {{
+    local phase="$1"
+    local progress="$2"
+    local error="$3"
+    local now
+    now=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
 
-            if [ -n "$error" ]; then
-                cat > "$RESULTS_DIR/status.json.tmp" <<STATUSEOF
-        {{"phase": "$phase", "started_at": "$BENCH_START", "progress": "$progress", "error": "$error", "completed_at": "$now"}}
-        STATUSEOF
-            else
-                cat > "$RESULTS_DIR/status.json.tmp" <<STATUSEOF
-        {{"phase": "$phase", "started_at": "$BENCH_START", "progress": "$progress", "completed_at": null}}
-        STATUSEOF
-            fi
-            mv "$RESULTS_DIR/status.json.tmp" "$RESULTS_DIR/status.json"
-        }}
-
-        # --- error trap ----------------------------------------------------
-        on_error() {{
-            local lineno="$1"
-            echo "ERROR at line $lineno" >&2
-            update_status "error" "" "Script failed at line $lineno"
-            exit 1
-        }}
-        trap 'on_error $LINENO' ERR
-
-        BENCH_START=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
-
-        # --- banner --------------------------------------------------------
-        echo "============================================================"
-        echo "Benchmark Runner"
-        echo "============================================================"
-        echo "Server type    : {server_type}"
-        echo "Endpoint       : {endpoint}:{port}"
-        echo "Database       : {db}"
-        echo "Workload       : {workload}"
-        echo "Tables         : {tables}"
-        echo "Table size     : {table_size}"
-        echo "Threads        : {threads}"
-        echo "Duration       : {duration}s"
-        echo "Report interval: {report_interval}s"
-        echo "Extra args     : {extra_str}"
-        echo "Results dir    : $RESULTS_DIR"
-        echo "Started at     : $BENCH_START"
-        echo "============================================================"
-        echo ""
-
-        # --- prepare -------------------------------------------------------
-        {prepare_block}
-        # --- run -----------------------------------------------------------
-        {run_block}
-        # --- cleanup -------------------------------------------------------
-        {cleanup_block}
-        # --- done ----------------------------------------------------------
-        BENCH_END=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+    if [ -n "$error" ]; then
         cat > "$RESULTS_DIR/status.json.tmp" <<STATUSEOF
-        {{"phase": "done", "started_at": "$BENCH_START", "completed_at": "$BENCH_END"}}
-        STATUSEOF
-        mv "$RESULTS_DIR/status.json.tmp" "$RESULTS_DIR/status.json"
+{{"phase": "$phase", "started_at": "$BENCH_START", "progress": "$progress", "error": "$error", "completed_at": "$now"}}
+STATUSEOF
+    else
+        cat > "$RESULTS_DIR/status.json.tmp" <<STATUSEOF
+{{"phase": "$phase", "started_at": "$BENCH_START", "progress": "$progress", "completed_at": null}}
+STATUSEOF
+    fi
+    mv "$RESULTS_DIR/status.json.tmp" "$RESULTS_DIR/status.json"
+}}
 
-        echo ""
-        echo "============================================================"
-        echo "Benchmark complete at $BENCH_END"
-        echo "Results in $RESULTS_DIR"
-        echo "============================================================"
-    """)
+# --- error trap ----------------------------------------------------
+on_error() {{
+    local lineno="$1"
+    echo "ERROR at line $lineno" >&2
+    update_status "error" "" "Script failed at line $lineno"
+    exit 1
+}}
+trap 'on_error $LINENO' ERR
+
+BENCH_START=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+
+# --- banner --------------------------------------------------------
+echo "============================================================"
+echo "Benchmark Runner"
+echo "============================================================"
+echo "Server type    : {server_type}"
+echo "Endpoint       : {endpoint}:{port}"
+echo "Database       : {db}"
+echo "Workload       : {workload}"
+echo "Tables         : {tables}"
+echo "Table size     : {table_size}"
+echo "Threads        : {threads}"
+echo "Duration       : {duration}s"
+echo "Report interval: {report_interval}s"
+echo "Extra args     : {extra_str}"
+echo "Results dir    : $RESULTS_DIR"
+echo "Started at     : $BENCH_START"
+echo "============================================================"
+echo ""
+
+# --- prepare -------------------------------------------------------
+{prepare_block}
+# --- run -----------------------------------------------------------
+{run_block}
+# --- cleanup -------------------------------------------------------
+{cleanup_block}
+# --- done ----------------------------------------------------------
+BENCH_END=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+cat > "$RESULTS_DIR/status.json.tmp" <<STATUSEOF
+{{"phase": "done", "started_at": "$BENCH_START", "completed_at": "$BENCH_END"}}
+STATUSEOF
+mv "$RESULTS_DIR/status.json.tmp" "$RESULTS_DIR/status.json"
+
+echo ""
+echo "============================================================"
+echo "Benchmark complete at $BENCH_END"
+echo "Results in $RESULTS_DIR"
+echo "============================================================"
+"""
     return script, results_dir
 
 
@@ -253,92 +252,91 @@ def generate_memtier_script(params: dict) -> tuple[str, str]:
     data_size = params.get("data_size", 256)
     random_range = params.get("random_range", 1000000)
 
-    script = dedent(f"""\
-        #!/usr/bin/env bash
-        # Auto-generated memtier benchmark runner -- do not edit
-        # Generated: {ts}
-        set -euo pipefail
+    script = f"""#!/usr/bin/env bash
+# Auto-generated memtier benchmark runner -- do not edit
+# Generated: {ts}
+set -euo pipefail
 
-        RESULTS_DIR="{results_dir}"
-        mkdir -p "$RESULTS_DIR"
+RESULTS_DIR="{results_dir}"
+mkdir -p "$RESULTS_DIR"
 
-        update_status() {{
-            local phase="$1"
-            local progress="$2"
-            local error="$3"
-            local now
-            now=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+update_status() {{
+    local phase="$1"
+    local progress="$2"
+    local error="$3"
+    local now
+    now=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
 
-            if [ -n "$error" ]; then
-                cat > "$RESULTS_DIR/status.json.tmp" <<STATUSEOF
-        {{"phase": "$phase", "started_at": "$BENCH_START", "progress": "$progress", "error": "$error", "completed_at": "$now"}}
-        STATUSEOF
-            else
-                cat > "$RESULTS_DIR/status.json.tmp" <<STATUSEOF
-        {{"phase": "$phase", "started_at": "$BENCH_START", "progress": "$progress", "completed_at": null}}
-        STATUSEOF
-            fi
-            mv "$RESULTS_DIR/status.json.tmp" "$RESULTS_DIR/status.json"
-        }}
-
-        on_error() {{
-            local lineno="$1"
-            echo "ERROR at line $lineno" >&2
-            update_status "error" "" "Script failed at line $lineno"
-            exit 1
-        }}
-        trap 'on_error $LINENO' ERR
-
-        BENCH_START=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
-
-        echo "============================================================"
-        echo "Memtier Benchmark Runner"
-        echo "============================================================"
-        echo "Target         : {target_host}:{target_port}"
-        echo "Tests          : {tests}"
-        echo "Operations     : {operations}"
-        echo "Clients        : {clients}"
-        echo "Threads        : {threads}"
-        echo "Data size      : {data_size}"
-        echo "Random range   : {random_range}"
-        echo "Results dir    : $RESULTS_DIR"
-        echo "Started at     : $BENCH_START"
-        echo "============================================================"
-        echo ""
-
-        update_status "run" "" ""
-
-        for i in $(seq 1 {tests}); do
-            echo ">>> Test run $i/{tests}"
-            update_status "run" "test $i/{tests}" ""
-            memtier_benchmark \\
-                -s {target_host} \\
-                -p {target_port} \\
-                -n {operations} \\
-                -c {clients} \\
-                -t {threads} \\
-                -d {data_size} \\
-                --key-maximum={random_range} \\
-                --ratio=1:10 \\
-                --key-pattern=G:G \\
-                --hide-histogram \\
-                --json-out-file="$RESULTS_DIR/memtier_run_$i.json" \\
-                2>&1
-            echo ">>> Test run $i completed with exit code $?"
-            echo ""
-        done
-
-        BENCH_END=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+    if [ -n "$error" ]; then
         cat > "$RESULTS_DIR/status.json.tmp" <<STATUSEOF
-        {{"phase": "done", "started_at": "$BENCH_START", "completed_at": "$BENCH_END"}}
-        STATUSEOF
-        mv "$RESULTS_DIR/status.json.tmp" "$RESULTS_DIR/status.json"
+{{"phase": "$phase", "started_at": "$BENCH_START", "progress": "$progress", "error": "$error", "completed_at": "$now"}}
+STATUSEOF
+    else
+        cat > "$RESULTS_DIR/status.json.tmp" <<STATUSEOF
+{{"phase": "$phase", "started_at": "$BENCH_START", "progress": "$progress", "completed_at": null}}
+STATUSEOF
+    fi
+    mv "$RESULTS_DIR/status.json.tmp" "$RESULTS_DIR/status.json"
+}}
 
-        echo "============================================================"
-        echo "Benchmark complete at $BENCH_END"
-        echo "Results in $RESULTS_DIR"
-        echo "============================================================"
-    """)
+on_error() {{
+    local lineno="$1"
+    echo "ERROR at line $lineno" >&2
+    update_status "error" "" "Script failed at line $lineno"
+    exit 1
+}}
+trap 'on_error $LINENO' ERR
+
+BENCH_START=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+
+echo "============================================================"
+echo "Memtier Benchmark Runner"
+echo "============================================================"
+echo "Target         : {target_host}:{target_port}"
+echo "Tests          : {tests}"
+echo "Operations     : {operations}"
+echo "Clients        : {clients}"
+echo "Threads        : {threads}"
+echo "Data size      : {data_size}"
+echo "Random range   : {random_range}"
+echo "Results dir    : $RESULTS_DIR"
+echo "Started at     : $BENCH_START"
+echo "============================================================"
+echo ""
+
+update_status "run" "" ""
+
+for i in $(seq 1 {tests}); do
+    echo ">>> Test run $i/{tests}"
+    update_status "run" "test $i/{tests}" ""
+    memtier_benchmark \\
+        -s {target_host} \\
+        -p {target_port} \\
+        -n {operations} \\
+        -c {clients} \\
+        -t {threads} \\
+        -d {data_size} \\
+        --key-maximum={random_range} \\
+        --ratio=1:10 \\
+        --key-pattern=G:G \\
+        --hide-histogram \\
+        --json-out-file="$RESULTS_DIR/memtier_run_$i.json" \\
+        2>&1
+    echo ">>> Test run $i completed with exit code $?"
+    echo ""
+done
+
+BENCH_END=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+cat > "$RESULTS_DIR/status.json.tmp" <<STATUSEOF
+{{"phase": "done", "started_at": "$BENCH_START", "completed_at": "$BENCH_END"}}
+STATUSEOF
+mv "$RESULTS_DIR/status.json.tmp" "$RESULTS_DIR/status.json"
+
+echo "============================================================"
+echo "Benchmark complete at $BENCH_END"
+echo "Results in $RESULTS_DIR"
+echo "============================================================"
+"""
     return script, results_dir
 
 
@@ -399,6 +397,7 @@ def deploy(host_ip: str, key_path: str, params: dict,
     ssh_run_simple(
         host_ip, key_path,
         f"chmod +x {_RUNNER_PATH} && "
+        f"mkdir -p {results_dir} && "
         f"tmux new-session -d -s {_TMUX_SESSION} "
         f"'bash {_RUNNER_PATH} > {results_dir}/benchmark.log 2>&1'",
         timeout=15,

@@ -395,7 +395,7 @@ def _install_base_packages(host_ip, key_path, timeout=300):
         sudo $PKG -y install \\
             gcc make automake libtool git jq htop sysstat mtr \\
             openssl-devel pkg-config binutils iproute \\
-            tar xz perf ethtool iperf3 \\
+            tar xz perf ethtool iperf3 tmux \\
             jemalloc-devel || true
     """, timeout=timeout)
 
