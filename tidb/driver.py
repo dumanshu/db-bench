@@ -464,7 +464,7 @@ def print_cluster_summary(host: str, key_path: Path, region: str, profile: str, 
         if base_role not in role_types:
             role_types[base_role] = itype
 
-    default_type = role_types.get("host", role_types.get("client", "c7g.4xlarge"))
+    default_type = role_types.get("host", role_types.get("client", "c8g.4xlarge"))
     tidb_type = role_types.get("tidb", default_type)
     tikv_type = role_types.get("tikv", default_type)
     pd_type = role_types.get("pd", default_type)

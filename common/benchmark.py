@@ -2083,7 +2083,7 @@ mysql -h {db_host} -P {port} -u root -e \
         if base_role not in role_types and itype:
             role_types[base_role] = itype
     default_type = role_types.get(
-        "host", role_types.get("client", "c7g.4xlarge"))
+        "host", role_types.get("client", "c8g.4xlarge"))
     server_type = role_types.get("tikv", default_type)
 
     cluster_info = get_cluster_info(host, key_path, port, db_host=db_host)
