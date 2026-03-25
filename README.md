@@ -11,7 +11,7 @@ common/              Shared AWS, SSH, benchmarking, metrics, and reporting modul
   util.py            Timestamps, logging, AWS session helpers, AMI resolution
   types.py           Shared dataclasses (InstanceInfo, BootstrapContext)
   client.py          Unified client VM provisioning (all tools for any server type)
-  benchmark.py       Unified sysbench orchestration + CLI entry point (--server-type aurora|tidb)
+  benchmark.py       Unified benchmark CLI entry point (--server-type aurora|tidb|valkey)
   remote_runner.py   Autonomous benchmark execution on client VM (deploy/status/fetch)
   sampler.py         EC2 metrics sampling + CloudWatch queries + post-processing
   report.py          Markdown report generation + cost tracking
@@ -74,8 +74,8 @@ AWS_PROFILE=sandbox python3 -m common.client --seed my-001 --server-type tidb --
 # 3. Run benchmark (interactive)
 AWS_PROFILE=sandbox python3 -m common --server-type tidb --seed my-001 --profile quick
 
-# 3b. Or fire-and-forget (remote runner)
-AWS_PROFILE=sandbox python3 -m common --server-type tidb --seed my-001 --action deploy --profile heavy
+# 3b. Or fire-and-forget (remote runner) -- deploy is the default action
+AWS_PROFILE=sandbox python3 -m common --server-type tidb --seed my-001 --profile heavy
 AWS_PROFILE=sandbox python3 -m common --server-type tidb --seed my-001 --action status
 AWS_PROFILE=sandbox python3 -m common --server-type tidb --seed my-001 --action fetch
 
@@ -90,7 +90,7 @@ AWS_PROFILE=sandbox python3 -m aurora.setup --seed my-001 --rds-profile sandbox-
 # 2. Provision client
 AWS_PROFILE=sandbox python3 -m common.client --seed my-001 --server-type aurora --size small
 
-# 3. Run benchmark
+# 3. Run benchmark (deploy is the default -- fire-and-forget on client VM)
 AWS_PROFILE=sandbox python3 -m common --server-type aurora --seed my-001 \
   --rds-profile sandbox-storage --tables 4 --table-size 10000 --threads 16 --duration 30
 
@@ -105,9 +105,12 @@ AWS_PROFILE=sandbox python3 -m valkey.setup --seed my-001
 # 2. Provision client
 AWS_PROFILE=sandbox python3 -m common.client --seed my-001 --server-type valkey --size small
 
-# 3. Run benchmark (valkey has its own benchmark CLI)
+# 3. Run benchmark (via unified CLI -- deploys memtier on client VM)
+AWS_PROFILE=sandbox python3 -m common --server-type valkey --seed vlklt-001 --endpoint <NLB_DNS>
+
+# Or use the standalone Valkey benchmark CLI for more control:
 AWS_PROFILE=sandbox python3 -m valkey.benchmark \
-  --ssh-host <CLIENT_IP> --ssh-key valkey/valkey-load-test-key.pem --seed my-001
+  --ssh-host <CLIENT_IP> --ssh-key valkey/valkey-load-test-key.pem --seed vlklt-001
 
 # Cleanup
 AWS_PROFILE=sandbox python3 -m common.client --cleanup --seed my-001 --server-type valkey
@@ -130,7 +133,7 @@ AWS_PROFILE=sandbox python3 -m valkey.setup --seed my-001 --cleanup
 **`python3 -m common.client`** -- Standalone benchmark client provisioner:
 
 - Discovers the server VPC by `--seed` and `--server-type`, provisions an EC2 instance with all benchmark tools (sysbench, mysql client, memtier_benchmark 2.3.0, docker, valkey-cli)
-- Supports `--size small` (c7g.4xlarge) or `--size heavy` (c8g.24xlarge)
+- Supports `--size small` (c8g.4xlarge) or `--size heavy` (c8g.24xlarge)
 - Saves state to `common/client-{seed}-state.json` (auto-discovered by benchmark CLI)
 - `--cleanup` tears down the client instance and security group
 
@@ -143,21 +146,26 @@ python3 -m common.client --cleanup --seed foo --server-type aurora
 
 ### Unified Benchmark CLI
 
-**`python3 -m common`** (or `python3 -m common.benchmark`) -- Single entry point for sysbench-based benchmarks (Aurora + TiDB):
+**`python3 -m common`** (or `python3 -m common.benchmark`) -- Single entry point for all three database types:
 
 ```bash
-# Aurora
+# Aurora (sysbench)
 python3 -m common --server-type aurora --seed my-001 --threads 64 --duration 300
 
-# TiDB
+# TiDB (sysbench)
 python3 -m common --server-type tidb --seed my-001 --profile heavy
+
+# Valkey (memtier_benchmark via remote runner)
+python3 -m common --server-type valkey --seed my-001 --endpoint <NLB_DNS>
 
 # Legacy module entry points still work (thin redirects):
 python3 -m aurora.benchmark --seed my-001    # injects --server-type aurora
 python3 -m tidb.benchmark --seed my-001      # injects --server-type tidb
 ```
 
-Valkey uses a different benchmark tool (memtier_benchmark / valkey-benchmark) and has its own entry point: `python3 -m valkey.benchmark`.
+The default `--action` is `deploy` (fire-and-forget remote execution). Use `--action run` for interactive (continuous SSH) mode. Valkey always uses deploy mode via the remote runner.
+
+Valkey also has its own standalone benchmark CLI for direct memtier/valkey-benchmark control: `python3 -m valkey.benchmark`.
 
 **Key features:**
 - Auto-discovers server endpoints and client VM from seed + state files
@@ -173,11 +181,11 @@ Valkey uses a different benchmark tool (memtier_benchmark / valkey-benchmark) an
 
 ### Remote Runner (Autonomous Benchmarks)
 
-**`python3 -m common --action deploy|status|fetch`** -- Deploys a self-contained bash script to the client VM and runs it inside a tmux session. Expired AWS credentials won't interrupt a running benchmark.
+**`python3 -m common`** -- By default (`--action deploy`), deploys a self-contained bash script to the client VM and runs it inside a tmux session. Expired AWS credentials won't interrupt a running benchmark.
 
 ```bash
-# Deploy (generates script, uploads, starts in tmux on client VM)
-python3 -m common --server-type tidb --seed my-001 --action deploy --profile quick
+# Deploy (default action -- generates script, uploads, starts in tmux on client VM)
+python3 -m common --server-type tidb --seed my-001 --profile quick
 
 # Check progress (reads status.json from client)
 python3 -m common --server-type tidb --seed my-001 --action status
@@ -206,15 +214,16 @@ The remote runner generates scripts for:
 - **report.py** -- Benchmark report generation:
   - `generate_report()` -- Markdown report from JSON results
   - `CostTracker` -- AWS cost estimation during benchmark runs
-  - Instance pricing for Aurora db.r* families and TiDB/Valkey c7g/c8g EC2 families
+  - Instance pricing for Aurora db.r8g families, TiDB/Valkey c8g/m8g EC2 families (Graviton4)
 
 ## Aurora MySQL
 
-Provisions an Aurora MySQL cluster with IO-Optimized storage (aurora-iopt1). Uses dual AWS profiles -- one for EC2/VPC operations and a separate one for RDS operations (required when RDS permissions are in a different IAM role).
+Provisions an Aurora MySQL 3.12.0 cluster with IO-Optimized storage (aurora-iopt1) and 1 read replica by default. Uses dual AWS profiles -- one for EC2/VPC operations and a separate one for RDS operations (required when RDS permissions are in a different IAM role).
 
 ### Features
 
 - **IO-Optimized storage**: aurora-iopt1 for consistent throughput
+- **Read replicas**: 1 replica by default (`--replicas N`), spread across AZs
 - **Dual AWS profile**: `--aws-profile` for EC2/VPC, `--rds-profile` for RDS
 - **Snapshot/restore**: Create cluster snapshots after fill, restore to skip re-filling
 - **Custom workloads**: IUD and mixed Lua scripts matching production ratios
@@ -226,8 +235,11 @@ Provisions an Aurora MySQL cluster with IO-Optimized storage (aurora-iopt1). Use
 ### Quick Start
 
 ```bash
-# 1. Provision (default: db.r8g.xlarge, IO-Optimized)
+# 1. Provision (default: db.r8g.xlarge, IO-Optimized, 1 read replica)
 AWS_PROFILE=sandbox python3 -m aurora.setup --seed auroralt-001 --rds-profile sandbox-storage
+
+# No replicas
+AWS_PROFILE=sandbox python3 -m aurora.setup --seed auroralt-001 --rds-profile sandbox-storage --replicas 0
 
 # 2. Provision client
 AWS_PROFILE=sandbox python3 -m common.client --seed auroralt-001 --server-type aurora --size small
@@ -258,7 +270,7 @@ AWS_PROFILE=sandbox python3 -m aurora.setup --cleanup --seed auroralt-001 --rds-
 
 ## TiDB
 
-Provisions a multi-AZ TiDB cluster on EC2 via k3s and TiDB Operator, with optional TiCDC replication to a downstream cluster.
+Provisions a multi-AZ TiDB cluster on EC2 via k3s and TiDB Operator (Graviton4 c8g/m8g instances, sized per PingCAP production requirements), with optional TiCDC replication to a downstream cluster.
 
 ### Features
 
@@ -309,7 +321,7 @@ When `--ticdc` is passed to the benchmark:
 
 ## Valkey
 
-Provisions Valkey instances with an Envoy sidecar proxy on EC2, supporting standalone and cluster modes. Uses Docker containers for both Valkey and Envoy.
+Provisions Valkey 9.0.3 instances with an Envoy v1.37.1 sidecar proxy on EC2, supporting standalone and cluster modes. Uses Docker containers for both Valkey and Envoy.
 
 ### Features
 
@@ -392,7 +404,7 @@ Different database types may require different IAM permissions:
 All modules are invoked from the repo root using `python3 -m`:
 
 ```bash
-# Unified benchmark CLI (Aurora + TiDB)
+# Unified benchmark CLI (Aurora + TiDB + Valkey)
 python3 -m common --help
 python3 -m common.benchmark --help
 

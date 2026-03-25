@@ -42,9 +42,9 @@ STACK_PREFIXES = {
     "valkey": "valkey-loadtest",
 }
 
-# Size presets for the client EC2 instance
+# Size presets for the client EC2 instance (Graviton4)
 SIZE_PRESETS = {
-    "small": "c7g.4xlarge",    # 16 vCPU, 32 GB
+    "small": "c8g.4xlarge",    # 16 vCPU, 32 GB
     "heavy": "c8g.24xlarge",   # 96 vCPU, 192 GB
 }
 

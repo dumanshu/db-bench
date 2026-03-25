@@ -49,32 +49,34 @@ from common.aws import (
 SEED = "tidblt-001"
 
 # Default instance type for control VM (k3s server / control plane)
-# c7g.4xlarge provides 16 vCPU, 32GB RAM - enough headroom for control plane
-CONTROL_INSTANCE_TYPE = "c7g.4xlarge"
+# c8g.4xlarge provides 16 vCPU, 32GB RAM (Graviton4) - enough for control plane
+CONTROL_INSTANCE_TYPE = "c8g.4xlarge"
 
-# PingCAP recommended production instance types (AWS)
+# PingCAP recommended production instance types (AWS Graviton4)
 # https://docs.pingcap.com/tidb/stable/hardware-and-software-requirements
+# PD: 8+ vCPU, 16+ GB | TiDB: 16+ vCPU, 48+ GB | TiKV: 16+ vCPU, 64+ GB
+# TiCDC: 16+ vCPU, 64+ GB
 PRODUCTION_INSTANCE_TYPES = {
-    "pd": "c7g.xlarge",      # 4 vCPU, 8GB - metadata/scheduling
-    "tidb": "c7g.4xlarge",   # 16 vCPU, 32GB - compute optimized for SQL
-    "tikv": "m7g.4xlarge",   # 16 vCPU, 64GB - memory optimized for storage
-    "ticdc": "c7g.4xlarge",  # 16 vCPU, 32GB - CDC replication (CPU + disk IO bound)
-    "control": "c7g.4xlarge", # 16 vCPU, 32GB - control plane
-    "downstream-pd": "c7g.xlarge",
-    "downstream-tidb": "c7g.4xlarge",
-    "downstream-tikv": "m7g.4xlarge",
+    "pd": "c8g.2xlarge",      # 8 vCPU, 16GB - meets PingCAP 8 core+/16GB+ req
+    "tidb": "m8g.4xlarge",    # 16 vCPU, 64GB - meets PingCAP 16 core+/48GB+ req
+    "tikv": "m8g.4xlarge",    # 16 vCPU, 64GB - meets PingCAP 16 core+/64GB+ req
+    "ticdc": "m8g.4xlarge",   # 16 vCPU, 64GB - meets PingCAP 16 core+/64GB+ req
+    "control": "c8g.4xlarge", # 16 vCPU, 32GB - control plane
+    "downstream-pd": "c8g.2xlarge",
+    "downstream-tidb": "m8g.4xlarge",
+    "downstream-tikv": "m8g.4xlarge",
 }
 
-# Cost-optimized instance types for testing/benchmarking
+# Cost-optimized instance types for testing/benchmarking (Graviton4)
 BENCHMARK_INSTANCE_TYPES = {
-    "pd": "c7g.large",       # 2 vCPU, 4GB
-    "tidb": "c7g.2xlarge",   # 8 vCPU, 16GB
-    "tikv": "m7g.2xlarge",   # 8 vCPU, 32GB
-    "ticdc": "c7g.2xlarge",  # 8 vCPU, 16GB
-    "control": "c7g.2xlarge", # 8 vCPU, 16GB
-    "downstream-pd": "c7g.large",
-    "downstream-tidb": "c7g.2xlarge",
-    "downstream-tikv": "m7g.2xlarge",
+    "pd": "c8g.large",       # 2 vCPU, 4GB
+    "tidb": "c8g.2xlarge",   # 8 vCPU, 16GB
+    "tikv": "m8g.2xlarge",   # 8 vCPU, 32GB
+    "ticdc": "c8g.2xlarge",  # 8 vCPU, 16GB
+    "control": "c8g.2xlarge", # 8 vCPU, 16GB
+    "downstream-pd": "c8g.large",
+    "downstream-tidb": "c8g.2xlarge",
+    "downstream-tikv": "m8g.2xlarge",
 }
 
 # EBS gp3 storage recommendations from PingCAP
@@ -144,8 +146,8 @@ KUBELET_PORT = 10250
 
 TIDB_OPERATOR_VERSION = os.environ.get("TIDB_OPERATOR_VERSION", "v1.6.5")
 TIDB_VERSION = os.environ.get("TIDB_VERSION", "v8.5.5")
-HELM_VERSION = os.environ.get("HELM_VERSION", "v3.16.3")
-KUBECTL_VERSION = os.environ.get("KUBECTL_VERSION", "v1.31.0")
+HELM_VERSION = os.environ.get("HELM_VERSION", "v3.20.1")
+KUBECTL_VERSION = os.environ.get("KUBECTL_VERSION", "v1.35.3")
 
 # All roles that get their own EC2 instances
 COMPONENT_ROLES = ["pd", "tikv", "tidb"]

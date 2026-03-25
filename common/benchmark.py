@@ -1,10 +1,8 @@
-"""Unified sysbench benchmark orchestration for db-bench.
+"""Unified benchmark orchestration for db-bench.
 
-Provides shared sysbench functions usable by both tidb and aurora modules.
-Handles command building, execution, output parsing, and data lifecycle
-(prepare, cleanup, fast-fill).
-
-Valkey uses memtier (not sysbench) and does not use this module.
+Provides shared sysbench functions for TiDB and Aurora, and routes Valkey
+benchmarks to the remote runner (memtier_benchmark).  The CLI entry point
+(``python3 -m common``) supports all three server types via ``--server-type``.
 """
 
 import hashlib
@@ -1280,12 +1278,13 @@ def parse_args():
     )
 
     # Required: server type
-    p.add_argument("--server-type", required=True, choices=["aurora", "tidb"],
+    p.add_argument("--server-type", required=True,
+                   choices=["aurora", "tidb", "valkey"],
                    help="Database server type to benchmark")
 
     p.add_argument("--action", choices=["run", "deploy", "status", "fetch"],
-                   default="run",
-                   help="Action: run (interactive, default), deploy (remote),"
+                   default="deploy",
+                   help="Action: deploy (remote, default), run (interactive),"
                         " status (check), fetch (download)")
 
     # --- Shared arguments ---
@@ -1320,10 +1319,11 @@ def parse_args():
                    help="Clean up tables after benchmark")
     p.add_argument("--verbose", "-v", action="store_true")
 
+    p.add_argument("--endpoint", default=None,
+                   help="Server endpoint (auto-discovered if omitted)")
+
     # --- Aurora-specific arguments ---
     aurora_g = p.add_argument_group("Aurora-specific options")
-    aurora_g.add_argument("--endpoint", default=None,
-                          help="Aurora endpoint (auto-discovered if omitted)")
     aurora_g.add_argument("--password", default=None,
                           help="Aurora master password")
     aurora_g.add_argument("--db", default=None,
@@ -1392,6 +1392,8 @@ def main():
         _main_aurora(args)
     elif args.server_type == "tidb":
         _main_tidb(args)
+    elif args.server_type == "valkey":
+        _main_valkey(args)
     else:
         raise SystemExit(f"Unknown server type: {args.server_type}")
 
@@ -1425,6 +1427,8 @@ def _resolve_host_and_key(args):
         base_dir = Path(__file__).resolve().parent.parent
         if server_type == "aurora":
             key_path = str(base_dir / "aurora" / "aurora-bench-key.pem")
+        elif server_type == "valkey":
+            key_path = str(base_dir / "valkey" / "valkey-load-test-key.pem")
         else:
             key_path = str(base_dir / "tidb" / "tidb-load-test-key.pem")
 
@@ -1503,6 +1507,41 @@ def _build_deploy_params(args):
             "multi_phase": multi_phase,
         }
 
+    elif server_type == "valkey":
+        endpoint = getattr(args, "endpoint", None) or ""
+        if not endpoint:
+            seed = args.seed
+            if seed:
+                try:
+                    endpoint = _discover_valkey_endpoint(
+                        args.region or "us-east-1",
+                        args.aws_profile or "sandbox",
+                        seed)
+                except Exception as exc:
+                    log(f"WARNING: Could not discover Valkey endpoint: {exc}")
+
+        if not endpoint:
+            raise SystemExit(
+                "ERROR: Valkey endpoint required. Use --endpoint or ensure "
+                "stack is discoverable via --seed.")
+
+        port = args.port if args.port is not None else 6379
+        threads = args.threads if args.threads is not None else 4
+        duration = args.duration if args.duration is not None else 120
+
+        return {
+            "server_type": "valkey",
+            "endpoint": endpoint,
+            "port": port,
+            "threads": threads,
+            "clients": 50,
+            "data_size": 256,
+            "key_pattern": "R:R",
+            "ratio": "1:1",
+            "pipeline": 10,
+            "duration": duration,
+        }
+
     else:  # aurora
         password = (args.password
                     or os.environ.get("AURORA_MASTER_PASSWORD", "BenchMark2024!"))
@@ -1554,6 +1593,27 @@ def _build_deploy_params(args):
         }
 
 
+def _discover_valkey_endpoint(region, aws_profile, seed):
+    """Discover Valkey NLB endpoint by seed-based naming convention."""
+    import boto3
+    session = boto3.Session(region_name=region, profile_name=aws_profile)
+    elbv2 = session.client("elbv2")
+    name_pattern = f"valkey-loadtest-{seed}-nlb"
+    resp = elbv2.describe_load_balancers()
+    for lb in resp.get("LoadBalancers", []):
+        if lb["LoadBalancerName"] == name_pattern:
+            return lb["DNSName"]
+    raise RuntimeError(f"No NLB found matching '{name_pattern}'")
+
+
+def _main_valkey(args):
+    """Run Valkey benchmark interactively (action=run)."""
+    raise SystemExit(
+        "Valkey interactive run is not supported via the unified CLI.\n"
+        "Use --action deploy to run autonomously on the client VM, or\n"
+        "run directly: python3 -m valkey.benchmark --seed <seed>")
+
+
 def _action_deploy(args):
     """Deploy a benchmark to run autonomously on the remote host."""
     from common.remote_runner import deploy
@@ -1561,12 +1621,18 @@ def _action_deploy(args):
     host, key_path = _resolve_host_and_key(args)
     params = _build_deploy_params(args)
 
-    needs_lua = params["workload"] in ("custom_iud", "custom_mixed")
+    server_type = params["server_type"]
+    needs_lua = params.get("workload", "") in ("custom_iud", "custom_mixed")
 
-    log(f"Deploying {params['server_type']} benchmark to {host}...")
-    log(f"  Workload : {params['workload']}")
-    log(f"  Tables   : {params['tables']} x {params['table_size']:,} rows")
-    log(f"  Threads  : {params['threads']}, Duration: {params['duration']}s")
+    log(f"Deploying {server_type} benchmark to {host}...")
+    if server_type == "valkey":
+        log(f"  Endpoint : {params['endpoint']}:{params['port']}")
+        log(f"  Threads  : {params['threads']}, Clients: {params['clients']}")
+        log(f"  Duration : {params['duration']}s")
+    else:
+        log(f"  Workload : {params['workload']}")
+        log(f"  Tables   : {params['tables']} x {params['table_size']:,} rows")
+        log(f"  Threads  : {params['threads']}, Duration: {params['duration']}s")
 
     result = deploy(host, key_path, params, lua_files=needs_lua)
     log("")

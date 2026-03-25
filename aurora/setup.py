@@ -67,7 +67,7 @@ SUBNET_B_CIDR = "10.44.2.0/24"
 DEFAULT_AURORA_INSTANCE = "db.r8g.xlarge"
 
 AURORA_ENGINE = "aurora-mysql"
-AURORA_ENGINE_VERSION = "8.0.mysql_aurora.3.10.3"
+AURORA_ENGINE_VERSION = "8.0.mysql_aurora.3.12.0"
 AURORA_MASTER_USER = "admin"
 AURORA_PORT = 3306
 
@@ -400,6 +400,43 @@ def create_aurora_instance(rds, cluster_id: str,
     return instance_id
 
 
+def create_aurora_readers(rds, cluster_id: str, instance_type: str,
+                          azs: list[str], count: int) -> list[str]:
+    """Create Aurora read replicas spread across AZs."""
+    reader_ids = []
+    for i in range(count):
+        reader_id = f"{_cu.STACK}-reader-{i + 1}"
+        az = azs[i % len(azs)]
+        log(f"Creating Aurora reader '{reader_id}' ({instance_type}) in {az}...")
+        try:
+            rds.create_db_instance(
+                DBInstanceIdentifier=reader_id,
+                DBInstanceClass=instance_type,
+                Engine=AURORA_ENGINE,
+                DBClusterIdentifier=cluster_id,
+                AvailabilityZone=az,
+                PubliclyAccessible=False,
+                Tags=rds_tags(f"reader-{i + 1}"),
+            )
+        except ClientError as e:
+            if "already exists" in str(e):
+                log(f"  Reader '{reader_id}' already exists")
+            else:
+                raise
+        reader_ids.append(reader_id)
+
+    for rid in reader_ids:
+        log(f"  Waiting for reader '{rid}'...")
+        waiter = rds.get_waiter("db_instance_available")
+        waiter.wait(
+            DBInstanceIdentifier=rid,
+            WaiterConfig={"Delay": 30, "MaxAttempts": 60},
+        )
+        log(f"  Reader '{rid}' available")
+
+    return reader_ids
+
+
 # ---------------------------------------------------------------------------
 # Snapshots
 # ---------------------------------------------------------------------------
@@ -517,24 +554,32 @@ def cleanup_stack(session: boto3.Session, region: str, stack: str,
     rds = (rds_session or session).client("rds")
 
     cluster_id = f"{stack}-cluster"
-    writer_id = f"{stack}-writer"
     pg_name = f"{stack}-cluster-pg"
     sg_name = f"{stack}-subnet-group"
 
-    # 1. Delete Aurora writer instance
-    log(f"Deleting Aurora instance '{writer_id}'...")
+    # 1. Delete all Aurora DB instances in the cluster (writer + readers)
     try:
-        rds.delete_db_instance(DBInstanceIdentifier=writer_id, SkipFinalSnapshot=True)
-        log("  Waiting for instance deletion...")
-        waiter = rds.get_waiter("db_instance_deleted")
-        waiter.wait(DBInstanceIdentifier=writer_id,
-                    WaiterConfig={"Delay": 30, "MaxAttempts": 60})
-        log("  Instance deleted")
-    except ClientError as e:
-        if "not found" in str(e).lower() or "DBInstanceNotFound" in str(e):
-            log(f"  Instance not found, skipping")
-        else:
-            log(f"  Error: {e}")
+        resp = rds.describe_db_clusters(DBClusterIdentifier=cluster_id)
+        members = resp["DBClusters"][0].get("DBClusterMembers", [])
+        instance_ids_to_delete = [m["DBInstanceIdentifier"] for m in members]
+    except ClientError:
+        instance_ids_to_delete = [f"{stack}-writer"]
+
+    for inst_id in instance_ids_to_delete:
+        log(f"Deleting Aurora instance '{inst_id}'...")
+        try:
+            rds.delete_db_instance(
+                DBInstanceIdentifier=inst_id, SkipFinalSnapshot=True)
+            log("  Waiting for instance deletion...")
+            waiter = rds.get_waiter("db_instance_deleted")
+            waiter.wait(DBInstanceIdentifier=inst_id,
+                        WaiterConfig={"Delay": 30, "MaxAttempts": 60})
+            log(f"  Instance '{inst_id}' deleted")
+        except ClientError as e:
+            if "not found" in str(e).lower() or "DBInstanceNotFound" in str(e):
+                log(f"  Instance not found, skipping")
+            else:
+                log(f"  Error: {e}")
 
     # 2. Delete Aurora cluster
     log(f"Deleting Aurora cluster '{cluster_id}'...")
@@ -715,6 +760,8 @@ def parse_args() -> argparse.Namespace:
                    help="AWS CLI profile for RDS operations (default: same as --aws-profile)")
     p.add_argument("--instance-type", default=DEFAULT_AURORA_INSTANCE,
                    help=f"Aurora instance type (default: {DEFAULT_AURORA_INSTANCE})")
+    p.add_argument("--replicas", type=int, default=1,
+                   help="Number of Aurora read replicas (default: 1)")
     p.add_argument("--password", default=None,
                    help="Aurora master password (default: env AURORA_MASTER_PASSWORD "
                         "or BenchMark2024!)")
@@ -820,6 +867,14 @@ def main() -> None:
                                        args.instance_type, net["az_a"])
     state["writer_id"] = writer_id
     state["aurora_instance_type"] = args.instance_type
+
+    if args.replicas > 0:
+        reader_ids = create_aurora_readers(
+            rds, cluster["cluster_id"], args.instance_type,
+            [net["az_a"], net["az_b"]], args.replicas)
+        state["reader_ids"] = reader_ids
+    state["replicas"] = args.replicas
+
     if args.restore_snapshot:
         state["restored_from_snapshot"] = args.restore_snapshot
 
@@ -833,6 +888,7 @@ def main() -> None:
     print(f"  Stack:            {stack}")
     print(f"  Aurora endpoint:  {state['endpoint']}")
     print(f"  Aurora instance:  {args.instance_type}")
+    print(f"  Replicas:         {args.replicas}")
     print(f"  Aurora storage:   aurora-iopt1 (IO-Optimized)")
     if args.restore_snapshot:
         print(f"  Restored from:    {args.restore_snapshot}")

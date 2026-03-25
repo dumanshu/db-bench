@@ -90,15 +90,15 @@ PRIV_CIDR = "10.42.2.0/24"
 REDIS_PORT = 6379
 SSH_PORT = 22
 
-VALKEY_VERSION = "9.0.0"
+VALKEY_VERSION = "9.0.3"
 VALKEY_SRC_URL = f"https://github.com/valkey-io/valkey/archive/refs/tags/{VALKEY_VERSION}.tar.gz"
 VALKEY_BIN_URL = os.environ.get(
     "VALKEY_BIN_URL",
     f"https://github.com/valkey-io/valkey/releases/download/valkey-{VALKEY_VERSION}/valkey-{VALKEY_VERSION}-linux-arm64.tar.gz",
 )
 VALKEY_DOCKER_IMAGE = os.environ.get("VALKEY_DOCKER_IMAGE", f"valkey/valkey:{VALKEY_VERSION}")
-ENVOY_DOCKER_IMAGE = os.environ.get("ENVOY_DOCKER_IMAGE", "envoyproxy/envoy-debug:v1.31.0")
-MEMTIER_VERSION = os.environ.get("MEMTIER_VERSION", "2.0.0")
+ENVOY_DOCKER_IMAGE = os.environ.get("ENVOY_DOCKER_IMAGE", "envoyproxy/envoy-debug:v1.37.1")
+MEMTIER_VERSION = os.environ.get("MEMTIER_VERSION", "2.3.0")
 MEMTIER_SRC_URL = os.environ.get(
     "MEMTIER_SRC_URL",
     f"https://github.com/RedisLabs/memtier_benchmark/archive/refs/tags/{MEMTIER_VERSION}.tar.gz",

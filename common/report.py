@@ -52,6 +52,17 @@ INSTANCE_PRICING = {
     "c8g.4xlarge":  {"hourly": 0.612,  "vcpu": 16,  "mem_gb": 32,   "arch": "AWS Graviton4 (ARM)"},
     "c8g.8xlarge":  {"hourly": 1.224,  "vcpu": 32,  "mem_gb": 64,   "arch": "AWS Graviton4 (ARM)"},
     "c8g.16xlarge": {"hourly": 2.448,  "vcpu": 64,  "mem_gb": 128,  "arch": "AWS Graviton4 (ARM)"},
+    "c8g.24xlarge": {"hourly": 3.672,  "vcpu": 96,  "mem_gb": 192,  "arch": "AWS Graviton4 (ARM)"},
+    "m7g.xlarge":   {"hourly": 0.163,  "vcpu": 4,   "mem_gb": 16,   "arch": "AWS Graviton3 (ARM)"},
+    "m7g.2xlarge":  {"hourly": 0.326,  "vcpu": 8,   "mem_gb": 32,   "arch": "AWS Graviton3 (ARM)"},
+    "m7g.4xlarge":  {"hourly": 0.652,  "vcpu": 16,  "mem_gb": 64,   "arch": "AWS Graviton3 (ARM)"},
+    "m8g.large":    {"hourly": 0.077,  "vcpu": 2,   "mem_gb": 8,    "arch": "AWS Graviton4 (ARM)"},
+    "m8g.xlarge":   {"hourly": 0.153,  "vcpu": 4,   "mem_gb": 16,   "arch": "AWS Graviton4 (ARM)"},
+    "m8g.2xlarge":  {"hourly": 0.306,  "vcpu": 8,   "mem_gb": 32,   "arch": "AWS Graviton4 (ARM)"},
+    "m8g.4xlarge":  {"hourly": 0.612,  "vcpu": 16,  "mem_gb": 64,   "arch": "AWS Graviton4 (ARM)"},
+    "r8g.2xlarge":  {"hourly": 0.428,  "vcpu": 8,   "mem_gb": 64,   "arch": "AWS Graviton4 (ARM)"},
+    "r8g.4xlarge":  {"hourly": 0.856,  "vcpu": 16,  "mem_gb": 128,  "arch": "AWS Graviton4 (ARM)"},
+    "c8g.large":    {"hourly": 0.077,  "vcpu": 2,   "mem_gb": 4,    "arch": "AWS Graviton4 (ARM)"},
 }
 
 EBS_COSTS = {
