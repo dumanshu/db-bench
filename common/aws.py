@@ -3,9 +3,8 @@
 import time
 import botocore
 
-from common.util import (
-    STACK, REGION, SSH_PORT, ec2, log, tags_common, ensure_tags,
-)
+import common.util as _u
+from common.util import SSH_PORT, ec2, log, tags_common, ensure_tags
 from common.types import InstanceInfo
 
 
@@ -15,7 +14,7 @@ from common.types import InstanceInfo
 
 def get_vpcs():
     resp = ec2().describe_vpcs(
-        Filters=[{"Name": "tag:Project", "Values": [STACK]}]
+        Filters=[{"Name": "tag:Project", "Values": [_u.STACK]}]
     )
     return resp.get("Vpcs", [])
 
@@ -28,7 +27,7 @@ def ensure_vpc(vpc_cidr):
         return vpc_id
     resp = ec2().create_vpc(CidrBlock=vpc_cidr, TagSpecifications=[{
         "ResourceType": "vpc",
-        "Tags": tags_common() + [{"Key": "Name", "Value": f"{STACK}-vpc"}]
+        "Tags": tags_common() + [{"Key": "Name", "Value": f"{_u.STACK}-vpc"}]
     }])
     vpc_id = resp["Vpc"]["VpcId"]
     log(f"CREATED vpc: {vpc_id}")
@@ -55,7 +54,7 @@ def ensure_igw(vpc_id):
         return igw
     resp = ec2().create_internet_gateway(TagSpecifications=[{
         "ResourceType": "internet-gateway",
-        "Tags": tags_common() + [{"Key": "Name", "Value": f"{STACK}-igw"}]
+        "Tags": tags_common() + [{"Key": "Name", "Value": f"{_u.STACK}-igw"}]
     }])
     igw_id = resp["InternetGateway"]["InternetGatewayId"]
     ec2().attach_internet_gateway(InternetGatewayId=igw_id, VpcId=vpc_id)
@@ -79,7 +78,7 @@ def find_subnet(vpc_id, name, cidr):
 
     for sn in subnets:
         tags = tag_dict(sn)
-        if tags.get("Project") == STACK and tags.get("Name") in candidates:
+        if tags.get("Project") == _u.STACK and tags.get("Name") in candidates:
             return sn["SubnetId"], tags
     for sn in subnets:
         tags = tag_dict(sn)
@@ -95,14 +94,14 @@ def ensure_subnet(vpc_id, name, cidr, az=None, public=False):
     sn, tags = find_subnet(vpc_id, name, cidr)
     if sn:
         kv_updates = []
-        project_missing = not tags or tags.get("Project") != STACK
+        project_missing = not tags or tags.get("Project") != _u.STACK
         if not tags or tags.get("Name") not in name_variants(name):
             kv_updates.append({"Key": "Name", "Value": name})
         if kv_updates or project_missing:
             ensure_tags([sn], kv_updates)
         log(f"REUSED  subnet {('public' if public else 'private')}: {sn}")
         return sn
-    availability_zone = az or f"{REGION}a"
+    availability_zone = az or f"{_u.REGION}a"
     resp = ec2().create_subnet(
         VpcId=vpc_id,
         CidrBlock=cidr,
@@ -122,14 +121,14 @@ def ensure_subnet(vpc_id, name, cidr, az=None, public=False):
 def find_rtb_by_name(name):
     resp = ec2().describe_route_tables(
         Filters=[{"Name": "tag:Name", "Values": [name]},
-                 {"Name": "tag:Project", "Values": [STACK]}]
+                 {"Name": "tag:Project", "Values": [_u.STACK]}]
     )
     rtbs = resp.get("RouteTables", [])
     return rtbs[0]["RouteTableId"] if rtbs else None
 
 
 def ensure_public_rtb(vpc_id, igw_id, subnet_ids):
-    name = f"{STACK}-rtb-public"
+    name = f"{_u.STACK}-rtb-public"
     rtb = find_rtb_by_name(name)
     if not rtb:
         resp = ec2().create_route_table(
@@ -249,7 +248,7 @@ def refresh_ssh_rule(sg_id, cidr):
 def find_instance_id_by_name(name):
     resp = ec2().describe_instances(
         Filters=[{"Name": "tag:Name", "Values": [name]},
-                 {"Name": "tag:Project", "Values": [STACK]},
+                 {"Name": "tag:Project", "Values": [_u.STACK]},
                  {"Name": "instance-state-name",
                   "Values": ["pending", "running", "stopping", "stopped"]}]
     )
@@ -261,7 +260,7 @@ def find_instance_id_by_name(name):
 
 def find_all_stack_instances():
     resp = ec2().describe_instances(
-        Filters=[{"Name": "tag:Project", "Values": [STACK]},
+        Filters=[{"Name": "tag:Project", "Values": [_u.STACK]},
                  {"Name": "instance-state-name",
                   "Values": ["pending", "running", "stopping", "stopped"]}]
     )
@@ -455,7 +454,7 @@ def remove_group_references(group_ids):
 
 def delete_stack_security_groups():
     resp = ec2().describe_security_groups(
-        Filters=[{"Name": "tag:Project", "Values": [STACK]}]
+        Filters=[{"Name": "tag:Project", "Values": [_u.STACK]}]
     )
     groups = [sg for sg in resp.get("SecurityGroups", []) if sg.get("GroupName") != "default"]
     if not groups:
@@ -498,7 +497,7 @@ def delete_route_table_by_name(name):
 def delete_stack_subnets(vpc_id):
     resp = ec2().describe_subnets(
         Filters=[{"Name": "vpc-id", "Values": [vpc_id]},
-                 {"Name": "tag:Project", "Values": [STACK]}]
+                 {"Name": "tag:Project", "Values": [_u.STACK]}]
     )
     for subnet in resp.get("Subnets", []):
         subnet_id = subnet["SubnetId"]
@@ -546,14 +545,14 @@ def delete_stack_igw_and_vpc(vpc_id):
 
 
 def cleanup_stack():
-    log(f"Cleanup requested for stack: {STACK} in {REGION}")
+    log(f"Cleanup requested for stack: {_u.STACK} in {_u.REGION}")
     vpcs = get_vpcs()
     if not vpcs:
         log("No tagged VPC found; nothing to clean up.")
         return
     terminate_stack_instances()
     delete_stack_security_groups()
-    delete_route_table_by_name(f"{STACK}-rtb-public")
+    delete_route_table_by_name(f"{_u.STACK}-rtb-public")
     for vpc in vpcs:
         delete_stack_subnets(vpc["VpcId"])
         delete_stack_igw_and_vpc(vpc["VpcId"])

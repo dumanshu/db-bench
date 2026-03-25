@@ -97,7 +97,7 @@ VALKEY_BIN_URL = os.environ.get(
     f"https://github.com/valkey-io/valkey/releases/download/valkey-{VALKEY_VERSION}/valkey-{VALKEY_VERSION}-linux-arm64.tar.gz",
 )
 VALKEY_DOCKER_IMAGE = os.environ.get("VALKEY_DOCKER_IMAGE", f"valkey/valkey:{VALKEY_VERSION}")
-ENVOY_DOCKER_IMAGE = os.environ.get("ENVOY_DOCKER_IMAGE", "envoyproxy/envoy-debug:v1.37.1")
+ENVOY_DOCKER_IMAGE = os.environ.get("ENVOY_DOCKER_IMAGE", "envoyproxy/envoy:v1.37.1")
 MEMTIER_VERSION = os.environ.get("MEMTIER_VERSION", "2.3.0")
 MEMTIER_SRC_URL = os.environ.get(
     "MEMTIER_SRC_URL",
@@ -793,6 +793,12 @@ sudo sysctl -q -p /etc/sysctl.d/99-valkey-perf.conf || true
 def build_valkey_binaries_on_bastion(bastion: InstanceInfo, remote_tar: str, ctx: BootstrapContext):
     log("Building Valkey binaries from source on bastion (fallback)")
     ssh_run(bastion, f"""
+# Ensure build deps are installed on the bastion itself
+if command -v dnf >/dev/null 2>&1; then
+  sudo dnf -y install gcc make jemalloc-devel
+else
+  sudo yum -y install gcc make jemalloc-devel
+fi
 cd /tmp
 rm -rf valkey-{VALKEY_VERSION} valkey-src.tgz
 curl -L -o valkey-src.tgz '{VALKEY_SRC_URL}'

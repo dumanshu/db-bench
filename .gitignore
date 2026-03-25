@@ -1,0 +1,17 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
+# Keys and state files
+*.pem
+*.pem.pub
+*-state.json
+
+# Results and logs
+results/
+*.log
+cleanup.log
+
+# Benchmark result dumps (local only)
+benchmark-results-all.txt
