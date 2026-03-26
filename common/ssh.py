@@ -14,10 +14,10 @@ def host_target_and_jump(host, ctx):
     if not target:
         raise RuntimeError(f"Instance {host.role} has no reachable IP.")
     jump = None
-    if host.role != ctx.client.role and not host.public_ip:
-        if not ctx.client.public_ip:
-            raise RuntimeError("Client instance missing public IP for ProxyJump.")
-        jump = ctx.client.public_ip
+    if host.role != ctx.jump_host.role and not host.public_ip:
+        if not ctx.jump_host.public_ip:
+            raise RuntimeError("Jump-host instance missing public IP for ProxyJump.")
+        jump = ctx.jump_host.public_ip
     return target, jump
 
 
@@ -108,5 +108,94 @@ def wait_for_ssh(node, ctx, max_attempts=30):
                 f"(attempt {attempt + 1}/{max_attempts})...")
             time.sleep(10)
     log(f"  WARNING: {node.role} ({node.private_ip}) did not become reachable "
+        f"after {max_attempts} attempts")
+    return False
+
+
+# ---------------------------------------------------------------------------
+# Simple SSH/SCP helpers (no BootstrapContext / InstanceInfo needed)
+# ---------------------------------------------------------------------------
+
+def _ssh_base_cmd_simple(host_ip, key_path, user="ec2-user"):
+    return [
+        "ssh",
+        "-o", "StrictHostKeyChecking=no",
+        "-o", "UserKnownHostsFile=/dev/null",
+        "-o", "ConnectTimeout=10",
+        "-o", "LogLevel=ERROR",
+        "-o", "BatchMode=yes",
+        "-o", "IdentitiesOnly=yes",
+        "-i", str(key_path),
+        f"{user}@{host_ip}",
+        "bash", "-s",
+    ]
+
+
+def ssh_run_simple(host_ip, key_path, script, timeout=300, user="ec2-user",
+                   strict=False):
+    """Run a shell script over SSH and return CompletedProcess."""
+    cmd = _ssh_base_cmd_simple(host_ip, key_path, user=user)
+    full_script = textwrap.dedent(script).lstrip()
+    if strict:
+        full_script = "set -euo pipefail\n" + full_script
+    result = subprocess.run(cmd, input=full_script, capture_output=True,
+                            text=True, timeout=timeout)
+    if strict:
+        result.check_returncode()
+    return result
+
+
+def ssh_capture_simple(host_ip, key_path, script, timeout=300, user="ec2-user"):
+    """Alias for ssh_run_simple (captures stdout/stderr by default)."""
+    return ssh_run_simple(host_ip, key_path, script, timeout=timeout, user=user)
+
+
+def scp_put_simple(host_ip, key_path, local_path, remote_path,
+                   user="ec2-user", timeout=60):
+    """Copy a local file to a remote host via SCP."""
+    cmd = [
+        "scp",
+        "-o", "StrictHostKeyChecking=no",
+        "-o", "UserKnownHostsFile=/dev/null",
+        "-o", "LogLevel=ERROR",
+        "-o", "BatchMode=yes",
+        "-o", "IdentitiesOnly=yes",
+        "-i", str(key_path),
+        str(local_path),
+        f"{user}@{host_ip}:{remote_path}",
+    ]
+    subprocess.run(cmd, capture_output=True, text=True, timeout=timeout,
+                   check=True)
+
+
+def scp_get_simple(host_ip, key_path, remote_path, local_path,
+                   user="ec2-user", timeout=60):
+    """Copy a remote file to the local host via SCP."""
+    cmd = [
+        "scp",
+        "-o", "StrictHostKeyChecking=no",
+        "-o", "UserKnownHostsFile=/dev/null",
+        "-o", "LogLevel=ERROR",
+        "-o", "BatchMode=yes",
+        "-o", "IdentitiesOnly=yes",
+        "-i", str(key_path),
+        f"{user}@{host_ip}:{remote_path}",
+        str(local_path),
+    ]
+    subprocess.run(cmd, capture_output=True, text=True, timeout=timeout,
+                   check=True)
+
+
+def wait_for_ssh_simple(host_ip, key_path, max_attempts=30, user="ec2-user"):
+    """Wait until SSH to a host succeeds."""
+    for attempt in range(max_attempts):
+        result = ssh_run_simple(host_ip, key_path, "echo ready", user=user)
+        if result.returncode == 0:
+            return True
+        if attempt < max_attempts - 1:
+            log(f"  {host_ip} not ready yet "
+                f"(attempt {attempt + 1}/{max_attempts})...")
+            time.sleep(10)
+    log(f"  WARNING: {host_ip} did not become reachable "
         f"after {max_attempts} attempts")
     return False

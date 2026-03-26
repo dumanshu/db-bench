@@ -33,6 +33,7 @@ from common.aws import (
     revoke_all_permissions, remove_group_references,
     delete_stack_security_groups, delete_route_table_by_name,
     delete_stack_subnets, delete_stack_igw_and_vpc,
+    ensure_instance as _common_ensure_instance,
 )
 from common.ssh import (
     host_target_and_jump, ssh_base_cmd, ssh_run, ssh_capture, scp_put, scp_get,
@@ -50,7 +51,7 @@ CLEANUP_LOG_PATH = Path("cleanup.log")
 LOG_TO_FILE = None
 
 # Instance types (ARM)
-CLIENT_TYPE = "c8g.4xlarge"
+BASTION_TYPE = "c8g.4xlarge"
 ENVOY_TYPE = "c8g.2xlarge"
 VALKEY_TYPE = "c8g.2xlarge"
 def _int_env(var, default):
@@ -89,15 +90,15 @@ PRIV_CIDR = "10.42.2.0/24"
 REDIS_PORT = 6379
 SSH_PORT = 22
 
-VALKEY_VERSION = "9.0.0"
+VALKEY_VERSION = "9.0.3"
 VALKEY_SRC_URL = f"https://github.com/valkey-io/valkey/archive/refs/tags/{VALKEY_VERSION}.tar.gz"
 VALKEY_BIN_URL = os.environ.get(
     "VALKEY_BIN_URL",
     f"https://github.com/valkey-io/valkey/releases/download/valkey-{VALKEY_VERSION}/valkey-{VALKEY_VERSION}-linux-arm64.tar.gz",
 )
 VALKEY_DOCKER_IMAGE = os.environ.get("VALKEY_DOCKER_IMAGE", f"valkey/valkey:{VALKEY_VERSION}")
-ENVOY_DOCKER_IMAGE = os.environ.get("ENVOY_DOCKER_IMAGE", "envoyproxy/envoy-debug:v1.31.0")
-MEMTIER_VERSION = os.environ.get("MEMTIER_VERSION", "2.0.0")
+ENVOY_DOCKER_IMAGE = os.environ.get("ENVOY_DOCKER_IMAGE", "envoyproxy/envoy:v1.37.1")
+MEMTIER_VERSION = os.environ.get("MEMTIER_VERSION", "2.3.0")
 MEMTIER_SRC_URL = os.environ.get(
     "MEMTIER_SRC_URL",
     f"https://github.com/RedisLabs/memtier_benchmark/archive/refs/tags/{MEMTIER_VERSION}.tar.gz",
@@ -189,7 +190,7 @@ def resolved_ami_id():
 class BootstrapContext:
     ssh_key_path: Path
     self_cidr: str
-    client: InstanceInfo
+    jump_host: InstanceInfo
 
 
 def gather_instance_info(role_to_id):
@@ -383,41 +384,15 @@ def instance_public_ip(iid):
     return r["Reservations"][0]["Instances"][0].get("PublicIpAddress")
 
 def ensure_instance(name, role, itype, subnet_id, sg_id, associate_public_ip):
-    iid = find_instance_id_by_name(name)
-    if iid:
-        log(f"REUSED  instance {role}: {iid}")
-        return iid
-    # Verify KeyPair exists (and credentials are still valid)
-    ensure_keypair_accessible()
-    # Launch
-    ni = [{
-        "DeviceIndex": 0,
-        "SubnetId": subnet_id,
-        "AssociatePublicIpAddress": associate_public_ip,
-        "Groups": [sg_id]
-    }]
-    resp = ec2().run_instances(
-        ImageId=resolved_ami_id(),
-        InstanceType=itype,
-        KeyName=KEY_NAME,
-        NetworkInterfaces=ni,
-        TagSpecifications=[{
-            "ResourceType":"instance",
-            "Tags": tags_common() + [
-                {"Key":"Name","Value":name},
-                {"Key":"Role","Value":role}
-            ]
-        }],
-        MinCount=1, MaxCount=1
+    return _common_ensure_instance(
+        name, role, itype, subnet_id, sg_id,
+        resolved_ami_id, KEY_NAME, ensure_keypair_accessible,
+        associate_public_ip=associate_public_ip,
     )
-    iid = resp["Instances"][0]["InstanceId"]
-    log(f"CREATED instance {role}: {iid}")
-    wait_running(iid)
-    return iid
 
 
 def get_stack_instance_ids(roles=None):
-    roles = roles or ["client", "envoy-1", "envoy-2", "valkey-1", "valkey-2", "valkey-3"]
+    roles = roles or ["bastion", "envoy-1", "envoy-2", "valkey-1", "valkey-2", "valkey-3"]
     ids = {}
     for role in roles:
         name = f"{STACK}-{role}"
@@ -580,7 +555,7 @@ def upload_file_to_s3(local_path: Path, bucket: str, key: str):
 # Cleanup helpers
 # -------------
 def terminate_stack_instances():
-    roles = ["client", "envoy-1", "envoy-2", "valkey-1", "valkey-2", "valkey-3"]
+    roles = ["bastion", "envoy-1", "envoy-2", "valkey-1", "valkey-2", "valkey-3"]
     to_terminate = []
     for role in roles:
         name = f"{STACK}-{role}"
@@ -815,15 +790,23 @@ sudo sysctl -q -p /etc/sysctl.d/99-valkey-perf.conf || true
 """, ctx)
 
 
-def build_valkey_binaries_on_client(client: InstanceInfo, remote_tar: str, ctx: BootstrapContext):
-    log("Building Valkey binaries from source on client (fallback)")
-    ssh_run(client, f"""
+def build_valkey_binaries_on_bastion(bastion: InstanceInfo, remote_tar: str, ctx: BootstrapContext):
+    log("Building Valkey binaries from source on bastion (fallback)")
+    ssh_run(bastion, f"""
+# Ensure build deps are installed on the bastion itself
+if command -v dnf >/dev/null 2>&1; then
+  sudo dnf -y install gcc make jemalloc-devel
+else
+  sudo yum -y install gcc make jemalloc-devel
+fi
 cd /tmp
 rm -rf valkey-{VALKEY_VERSION} valkey-src.tgz
 curl -L -o valkey-src.tgz '{VALKEY_SRC_URL}'
 tar -xzf valkey-src.tgz
 cd valkey-{VALKEY_VERSION}
-make -j $(nproc) BUILD_TLS=no
+# Ensure cc symlink exists (AL2 installs gcc but not always cc)
+sudo ln -sf /usr/bin/gcc /usr/bin/cc 2>/dev/null || true
+make -j $(nproc) BUILD_TLS=no CC=gcc
 sudo install -m 0755 src/valkey-server /usr/local/bin/valkey-server
 sudo install -m 0755 src/valkey-cli /usr/local/bin/valkey-cli
 sudo install -m 0755 src/valkey-benchmark /usr/local/bin/valkey-benchmark
@@ -832,12 +815,12 @@ rm -rf /tmp/valkey-{VALKEY_VERSION} /tmp/valkey-src.tgz
 """, ctx)
 
 
-def ensure_valkey_artifact(client: InstanceInfo, ctx: BootstrapContext, local_tar: Path):
+def ensure_valkey_artifact(bastion: InstanceInfo, ctx: BootstrapContext, local_tar: Path):
     remote_tar = f"/tmp/valkey-{VALKEY_VERSION}-binaries.tar.gz"
-    log("Preparing Valkey binaries artifact on client")
+    log("Preparing Valkey binaries artifact on bastion")
     download_script = f"""
 if [ -f {remote_tar} ]; then
-  echo "Valkey artifact already present on client"
+  echo "Valkey artifact already present on bastion"
   exit 0
 fi
 WORK=/tmp/valkey-prebuilt
@@ -862,13 +845,13 @@ if curl -fL -o valkey-prebuilt.tgz '{VALKEY_BIN_URL}'; then
 fi
 exit 1
 """
-    result = ssh_capture(client, download_script, ctx, strict=False)
+    result = ssh_capture(bastion, download_script, ctx, strict=False)
     if result.returncode == 1 or result.returncode == 2:
         log("Prebuilt Valkey download failed, falling back to source build.")
-        build_valkey_binaries_on_client(client, remote_tar, ctx)
+        build_valkey_binaries_on_bastion(bastion, remote_tar, ctx)
     elif result.returncode != 0:
         raise subprocess.CalledProcessError(result.returncode, "ssh download prebuilt", result.stdout, result.stderr)
-    scp_get(client, remote_tar, local_tar, ctx)
+    scp_get(bastion, remote_tar, local_tar, ctx)
 
 
 def install_valkey_cli_from_tar(host: InstanceInfo, ctx: BootstrapContext, tar_path: Path):
@@ -1085,10 +1068,10 @@ sudo docker run -d --name envoy \
     cache_envoy_symbols(host, ctx)
 
 
-def wait_for_valkey_nodes(client: InstanceInfo, valkey_hosts, ctx: BootstrapContext, timeout=300):
+def wait_for_valkey_nodes(bastion: InstanceInfo, valkey_hosts, ctx: BootstrapContext, timeout=300):
     host_list = " ".join(host.private_ip for host in valkey_hosts)
     log(f"Waiting for Valkey nodes to accept connections: {host_list}")
-    ssh_run(client, f"""
+    ssh_run(bastion, f"""
 HOSTS=({host_list})
 DEADLINE=$(( $(date +%s) + {timeout} ))
 while [ ${{#HOSTS[@]}} -gt 0 ]; do
@@ -1113,8 +1096,8 @@ done
 """, ctx)
 
 
-def valkey_cluster_state(client: InstanceInfo, host_ip: str, ctx: BootstrapContext):
-    result = ssh_capture(client, f"""
+def valkey_cluster_state(bastion: InstanceInfo, host_ip: str, ctx: BootstrapContext):
+    result = ssh_capture(bastion, f"""
 state=$(valkey-cli -h {host_ip} cluster info 2>/dev/null | grep '^cluster_state' | awk -F: '{{print $2}}' | tr -d '\\r')
 echo "${{state:-unknown}}"
 """, ctx, strict=False)
@@ -1123,21 +1106,21 @@ echo "${{state:-unknown}}"
     return result.stdout.strip()
 
 
-def form_valkey_cluster(client: InstanceInfo, valkey_hosts, ctx: BootstrapContext):
+def form_valkey_cluster(bastion: InstanceInfo, valkey_hosts, ctx: BootstrapContext):
     if len(valkey_hosts) < 3:
         log("Fewer than 3 Valkey nodes detected; cluster creation skipped.")
         return
     primary = valkey_hosts[0].private_ip
-    state = valkey_cluster_state(client, primary, ctx)
+    state = valkey_cluster_state(bastion, primary, ctx)
     if state == "ok":
         log("Valkey cluster already healthy; skipping cluster creation.")
     else:
         log("Creating Valkey cluster")
         peers = " ".join(f"{host.private_ip}:{REDIS_PORT}" for host in valkey_hosts)
-        ssh_run(client, f"""
+        ssh_run(bastion, f"""
 valkey-cli --cluster create {peers} --cluster-replicas 0 --cluster-yes || true
 """, ctx)
-    ssh_run(client, f"""
+    ssh_run(bastion, f"""
 valkey-cli -h {primary} cluster info | tee ~/valkey-cluster-info.txt
 """, ctx)
 
@@ -1246,7 +1229,7 @@ fi
 """, ctx)
 
 
-def start_envoy_highload(client: InstanceInfo, envoy: InstanceInfo, ctx: BootstrapContext,
+def start_envoy_highload(bastion: InstanceInfo, envoy: InstanceInfo, ctx: BootstrapContext,
                          run_seconds: int = 180, clients: int = 600, threads: int = 12, pipeline: int = 32):
     target = envoy.private_ip or envoy.public_ip
     if not target:
@@ -1258,7 +1241,7 @@ def start_envoy_highload(client: InstanceInfo, envoy: InstanceInfo, ctx: Bootstr
         f"--clients {clients} --threads {threads} --data-size 64 --key-maximum=1000000 "
         f"--key-pattern=P:P --ratio=1:1 --pipeline {pipeline} --hide-histogram --test-time {run_seconds}"
     )
-    ssh_run(client, f"""
+    ssh_run(bastion, f"""
 command -v memtier_benchmark >/dev/null 2>&1
 rm -f ~/memtier-benchmark.log
 cat <<'SCRIPT' >/tmp/run-memtier.sh
@@ -1272,9 +1255,9 @@ echo $! > ~/memtier-benchmark.pid
 """, ctx)
 
 
-def wait_for_envoy_highload(client: InstanceInfo, ctx: BootstrapContext, poll_seconds: int = 5, timeout_seconds: int = 600):
+def wait_for_envoy_highload(bastion: InstanceInfo, ctx: BootstrapContext, poll_seconds: int = 5, timeout_seconds: int = 600):
     max_checks = max(1, timeout_seconds // poll_seconds)
-    ssh_run(client, f"""
+    ssh_run(bastion, f"""
 checks=0
 while pgrep -f memtier_benchmark >/dev/null 2>&1; do
   checks=$((checks+1))
@@ -1288,8 +1271,8 @@ rm -f ~/memtier-benchmark.pid
 """, ctx)
 
 
-def stop_envoy_highload(client: InstanceInfo, ctx: BootstrapContext):
-    ssh_run(client, """
+def stop_envoy_highload(bastion: InstanceInfo, ctx: BootstrapContext):
+    ssh_run(bastion, """
 if pgrep -f memtier_benchmark >/dev/null 2>&1; then
   pkill -f memtier_benchmark >/dev/null 2>&1 || true
 fi
@@ -1308,13 +1291,13 @@ fi
 """, ctx, strict=False)
 
 
-def collect_memtier_log(client: InstanceInfo, ctx: BootstrapContext, bucket: str):
-    log("Collecting memtier benchmark log from client")
+def collect_memtier_log(bastion: InstanceInfo, ctx: BootstrapContext, bucket: str):
+    log("Collecting memtier benchmark log from bastion")
     tmp_dir = Path(tempfile.mkdtemp())
     tmp_log = tmp_dir / f"memtier-benchmark-{int(time.time())}.log"
     url = "Unavailable"
     try:
-        scp_get(client, "~/memtier-benchmark.log", tmp_log, ctx)
+        scp_get(bastion, "~/memtier-benchmark.log", tmp_log, ctx)
         if tmp_log.exists():
             key = f"benchmarks/{tmp_log.name}"
             url = upload_file_to_s3(tmp_log, bucket, key)
@@ -1352,7 +1335,7 @@ def upload_envoy_flamegraph(envoy: InstanceInfo, ctx: BootstrapContext, bucket: 
     return url
 
 
-def create_cloudwatch_dashboard(client_entries, valkey_entries, envoy_entries):
+def create_cloudwatch_dashboard(bastion_entries, valkey_entries, envoy_entries):
     def cpu_widget(title, entries):
         metrics = []
         for role, iid in entries:
@@ -1412,13 +1395,13 @@ def create_cloudwatch_dashboard(client_entries, valkey_entries, envoy_entries):
 
     dash_name = f"{STACK}-ops"
     widgets = []
-    widgets.append(cpu_widget("Client CPU", client_entries))
-    widgets.append(network_widget("Client", client_entries))
+    widgets.append(cpu_widget("Bastion CPU", bastion_entries))
+    widgets.append(network_widget("Bastion", bastion_entries))
     widgets.append(cpu_widget("Valkey CPU", valkey_entries))
     widgets.append(network_widget("Valkey", valkey_entries))
     widgets.append(cpu_widget("Envoy CPU", envoy_entries))
     widgets.append(network_widget("Envoy", envoy_entries))
-    widgets.append(counts_widget(len(valkey_entries), len(envoy_entries), client_entries[0][1]))
+    widgets.append(counts_widget(len(valkey_entries), len(envoy_entries), bastion_entries[0][1]))
     body = {"widgets": widgets}
     cw = aws_session().client("cloudwatch", region_name=REGION, config=BOTO_CONFIG)
     try:
@@ -1443,8 +1426,8 @@ def bootstrap_cluster(args, provisioned):
     log(f"SSH source CIDR: {ssh_cidr}")
 
     role_info = gather_instance_info(provisioned["instances"])
-    client = role_info["client"]
-    ctx = BootstrapContext(ssh_key_path=key_path, self_cidr=ssh_cidr, client=client)
+    bastion = role_info["bastion"]
+    ctx = BootstrapContext(ssh_key_path=key_path, self_cidr=ssh_cidr, jump_host=bastion)
     valkey_roles = sorted(
         [role for role in role_info if role.startswith("valkey-")],
         key=lambda r: int(r.rsplit("-", 1)[1]),
@@ -1468,51 +1451,47 @@ def bootstrap_cluster(args, provisioned):
     )
     if not envoy_roles:
         raise RuntimeError("No Envoy instances discovered; re-run provisioning.")
-    ordered_roles = ["client"] + envoy_roles + valkey_roles
+    ordered_roles = ["bastion"] + envoy_roles + valkey_roles
     for role in ordered_roles:
         host = role_info[role]
         log(f"  {role}: public={host.public_ip or '-'} private={host.private_ip}")
         ensure_ip(host, "private_ip")
 
-    if not client.public_ip:
-        raise RuntimeError("Client instance missing public IP; required for SSH bastion.")
+    if not bastion.public_ip:
+        raise RuntimeError("Bastion instance missing public IP; required for SSH jump host.")
 
     # Refresh SG SSH rules
     log(f"Refreshing SSH rules to {ssh_cidr}")
-    refresh_ssh_rule(provisioned["security_groups"]["client"], ssh_cidr)
+    refresh_ssh_rule(provisioned["security_groups"]["bastion"], ssh_cidr)
     ensure_ingress_all_between(provisioned["security_groups"]["envoy"], provisioned["security_groups"]["valkey"])
-    ensure_ingress_all_between(provisioned["security_groups"]["client"], provisioned["security_groups"]["envoy"])
-    ensure_ingress_all_between(provisioned["security_groups"]["client"], provisioned["security_groups"]["valkey"])
-    ensure_sg_ingress_from_group(provisioned["security_groups"]["envoy"], provisioned["security_groups"]["client"], "tcp", SSH_PORT, SSH_PORT)
-    ensure_sg_ingress_from_group(provisioned["security_groups"]["envoy"], provisioned["security_groups"]["client"], "udp", 5201, 5201)
-    ensure_sg_ingress_from_group(provisioned["security_groups"]["envoy"], provisioned["security_groups"]["client"], "tcp", 5201, 5201)
-    ensure_sg_ingress_from_group(provisioned["security_groups"]["valkey"], provisioned["security_groups"]["client"], "tcp", SSH_PORT, SSH_PORT)
-    ensure_sg_ingress_from_group(provisioned["security_groups"]["valkey"], provisioned["security_groups"]["client"], "tcp", REDIS_PORT, REDIS_PORT)
-    ensure_ingress_tcp_cidr(provisioned["security_groups"]["envoy"], REDIS_PORT, f"{role_info['client'].private_ip}/32")
-
-    hosts_for_base = [role_info["client"]]
-    hosts_for_base.extend(role_info[r] for r in envoy_roles + valkey_roles)
-
-    # Basic SSH + deps
-    for host in hosts_for_base:
-        log(f"Testing SSH to {host.role}")
-        ssh_run(host, "echo ok", ctx)
-        install_base(host, ctx)
+    ensure_ingress_all_between(provisioned["security_groups"]["bastion"], provisioned["security_groups"]["envoy"])
+    ensure_ingress_all_between(provisioned["security_groups"]["bastion"], provisioned["security_groups"]["valkey"])
+    ensure_sg_ingress_from_group(provisioned["security_groups"]["envoy"], provisioned["security_groups"]["bastion"], "tcp", SSH_PORT, SSH_PORT)
+    ensure_sg_ingress_from_group(provisioned["security_groups"]["envoy"], provisioned["security_groups"]["bastion"], "udp", 5201, 5201)
+    ensure_sg_ingress_from_group(provisioned["security_groups"]["envoy"], provisioned["security_groups"]["bastion"], "tcp", 5201, 5201)
+    ensure_sg_ingress_from_group(provisioned["security_groups"]["valkey"], provisioned["security_groups"]["bastion"], "tcp", SSH_PORT, SSH_PORT)
+    ensure_sg_ingress_from_group(provisioned["security_groups"]["valkey"], provisioned["security_groups"]["bastion"], "tcp", REDIS_PORT, REDIS_PORT)
+    ensure_ingress_tcp_cidr(provisioned["security_groups"]["envoy"], REDIS_PORT, VPC_CIDR)
 
     valkey_hosts = [role_info[r] for r in valkey_roles]
     envoy_hosts = [role_info[r] for r in envoy_roles]
-    client_entries = [("client", client.instance_id)]
+    bastion_entries = [("bastion", bastion.instance_id)]
     valkey_entries = [(host.role, host.instance_id) for host in valkey_hosts]
     envoy_entries = [(host.role, host.instance_id) for host in envoy_hosts]
+
+
+    for host in envoy_hosts + valkey_hosts:
+        log(f"Testing SSH to {host.role}")
+        ssh_run(host, "echo ok", ctx)
+        install_base(host, ctx)
 
     for host in valkey_hosts + envoy_hosts:
         ensure_docker(host, ctx)
 
     with tempfile.TemporaryDirectory() as tmpdir:
         local_tar = Path(tmpdir) / f"valkey-{VALKEY_VERSION}-binaries.tar.gz"
-        ensure_valkey_artifact(client, ctx, local_tar)
-        install_valkey_cli_from_tar(client, ctx, local_tar)
-        ensure_memtier_tool(client, ctx)
+        ensure_valkey_artifact(bastion, ctx, local_tar)
+        install_valkey_cli_from_tar(bastion, ctx, local_tar)
 
     for host in valkey_hosts:
         configure_valkey_container(host, ctx, cluster_mode)
@@ -1520,9 +1499,9 @@ def bootstrap_cluster(args, provisioned):
     for host in envoy_hosts:
         prepare_envoy_host(host, ctx)
 
-    wait_for_valkey_nodes(client, valkey_hosts, ctx)
+    wait_for_valkey_nodes(bastion, valkey_hosts, ctx)
     if cluster_mode:
-        form_valkey_cluster(client, valkey_hosts, ctx)
+        form_valkey_cluster(bastion, valkey_hosts, ctx)
     else:
         log("Single-node Valkey deployment requested; skipping cluster create.")
     deploy_envoy_config(envoy_hosts, valkey_hosts, ctx, cluster_mode)
@@ -1535,16 +1514,16 @@ def bootstrap_cluster(args, provisioned):
     log("Artifacts bucket ready (memtier logs + flamegraphs will expire in 7 days).")
     log("Use run_benchmark.py to drive Envoy load and capture new flamegraphs when needed.")
 
-    dash_name, dash_url = create_cloudwatch_dashboard(client_entries, valkey_entries, envoy_entries)
+    dash_name, dash_url = create_cloudwatch_dashboard(bastion_entries, valkey_entries, envoy_entries)
 
     envoy_admin_host = envoy_hosts[0]
     if envoy_admin_host.public_ip:
         envoy_admin_line = f"http://{envoy_admin_host.public_ip}:9901"
     else:
-        envoy_admin_line = f"http://{envoy_admin_host.private_ip}:9901 (reachable from client)"
+        envoy_admin_line = f"http://{envoy_admin_host.private_ip}:9901 (reachable from bastion)"
     valkey_nodes = ", ".join(host.private_ip for host in valkey_hosts)
     log("Bootstrap complete.")
-    log(f"Client SSH: ssh -i {key_path} ec2-user@{client.public_ip}")
+    log(f"Bastion SSH: ssh -i {key_path} ec2-user@{bastion.public_ip}")
     log(f"Valkey nodes (private): {valkey_nodes}")
     log(f"Envoy admin ({envoy_admin_host.role}): {envoy_admin_line}")
     log("Post-deployment validation: run ./valkey_validate.py for benchmarks & health checks.")
@@ -1597,22 +1576,22 @@ def main(args):
     rtb_priv = ensure_private_rtb(vpc_id, nat_id, subnet_private)
 
     # Security groups
-    sg_client = ensure_sg(vpc_id, f"{STACK}-client", "client")
-    sg_envoy  = ensure_sg(vpc_id, f"{STACK}-envoy",  "envoy")
-    sg_valkey = ensure_sg(vpc_id, f"{STACK}-valkey", "valkey")
+    sg_bastion = ensure_sg(vpc_id, f"{STACK}-bastion", "bastion")
+    sg_envoy   = ensure_sg(vpc_id, f"{STACK}-envoy",  "envoy")
+    sg_valkey  = ensure_sg(vpc_id, f"{STACK}-valkey", "valkey")
 
-    # SSH rule for current public IP -> client
+    # SSH rule for current public IP -> bastion
     mycidr = args.ssh_cidr or my_public_cidr()
-    refresh_ssh_rule(sg_client, mycidr)
-    log(f"Client SG SSH restricted to {mycidr}")
+    refresh_ssh_rule(sg_bastion, mycidr)
+    log(f"Bastion SG SSH restricted to {mycidr}")
 
     # Allow all internal traffic between Envoy and Valkey (both directions + within groups)
     ensure_ingress_all_between(sg_envoy, sg_valkey)
 
-    # Allow SSH and Redis from the client SG into Envoy/Valkey nodes (bastion + bootstrap access)
-    ensure_sg_ingress_from_group(sg_envoy, sg_client, "tcp", SSH_PORT, SSH_PORT)
-    ensure_sg_ingress_from_group(sg_valkey, sg_client, "tcp", SSH_PORT, SSH_PORT)
-    ensure_sg_ingress_from_group(sg_valkey, sg_client, "tcp", REDIS_PORT, REDIS_PORT)
+    # Allow SSH and Redis from the bastion SG into Envoy/Valkey nodes (bastion + bootstrap access)
+    ensure_sg_ingress_from_group(sg_envoy, sg_bastion, "tcp", SSH_PORT, SSH_PORT)
+    ensure_sg_ingress_from_group(sg_valkey, sg_bastion, "tcp", SSH_PORT, SSH_PORT)
+    ensure_sg_ingress_from_group(sg_valkey, sg_bastion, "tcp", REDIS_PORT, REDIS_PORT)
 
     if args.valkey_nodes < 1:
         raise SystemExit("ERROR: --valkey-nodes must be at least 1.")
@@ -1623,7 +1602,7 @@ def main(args):
     cluster_mode = args.valkey_nodes >= 3
 
     # Instances
-    client_id = ensure_instance(f"{STACK}-client","client",CLIENT_TYPE,subnet_public,sg_client,True)
+    bastion_id = ensure_instance(f"{STACK}-bastion","bastion",BASTION_TYPE,subnet_public,sg_bastion,True)
     envoy_instances = []
     for idx in range(1, args.envoy_nodes + 1):
         role = f"envoy-{idx}"
@@ -1635,9 +1614,9 @@ def main(args):
         iid = ensure_instance(f"{STACK}-{role}", role, VALKEY_TYPE, subnet_private, sg_valkey, False)
         valkey_instances.append((role, iid))
 
-    client_pub_ip = instance_public_ip(client_id)
-    client_priv_ip = instance_private_ip(client_id)
-    log(f"Client public IP: {client_pub_ip}")
+    bastion_pub_ip = instance_public_ip(bastion_id)
+    bastion_priv_ip = instance_private_ip(bastion_id)
+    log(f"Bastion public IP: {bastion_pub_ip}")
 
     # NLB (internal) for Envoy on 6379
     nlb_name = f"{STACK}-nlb"
@@ -1645,7 +1624,7 @@ def main(args):
     tg_arn = ensure_tg(vpc_id, REDIS_PORT)
     register_targets(tg_arn, [iid for _, iid in envoy_instances], REDIS_PORT)
     ensure_listener(lb_arn, tg_arn, REDIS_PORT)
-    ensure_ingress_tcp_cidr(sg_envoy, REDIS_PORT, f"{client_priv_ip}/32")
+    ensure_ingress_tcp_cidr(sg_envoy, REDIS_PORT, VPC_CIDR)
 
     # Final summary
     log("=== SUMMARY ===")
@@ -1653,25 +1632,25 @@ def main(args):
     log(f"Subnets: public={subnet_public}, private={subnet_private}")
     log(f"IGW: {igw_id}, EIP: {eipalloc}, NAT: {nat_id}")
     log(f"RTBs: public={rtb_pub}, private={rtb_priv}")
-    log(f"SGs: client={sg_client}, envoy={sg_envoy}, valkey={sg_valkey}")
-    instance_log_parts = [f"client={client_id}"] + [f"{role}={iid}" for role, iid in envoy_instances + valkey_instances]
+    log(f"SGs: bastion={sg_bastion}, envoy={sg_envoy}, valkey={sg_valkey}")
+    instance_log_parts = [f"bastion={bastion_id}"] + [f"{role}={iid}" for role, iid in envoy_instances + valkey_instances]
     log(f"Instances: {', '.join(instance_log_parts)}")
     log(f"NLB: {lb_arn} (internal), TG: {tg_arn} (port {REDIS_PORT})")
     log("Created/reused resources are fully tagged for idempotency and future cleanup.")
-    log("Only the client has a public IP. SSH is allowed from your current IP to the client; client can SSH to Envoy/Valkey inside the VPC.")
+    log("Only the bastion has a public IP. SSH is allowed from your current IP to the bastion; bastion can SSH to Envoy/Valkey inside the VPC.")
 
-    instance_map = {"client": client_id}
+    instance_map = {"bastion": bastion_id}
     instance_map.update(envoy_instances)
     instance_map.update(valkey_instances)
 
     resources = {
         "instances": instance_map,
         "security_groups": {
-            "client": sg_client,
+            "bastion": sg_bastion,
             "envoy": sg_envoy,
             "valkey": sg_valkey,
         },
-        "client_id": client_id,
+        "bastion_id": bastion_id,
         "nlb_dns": get_nlb_dns(lb_arn),
         "valkey_count": args.valkey_nodes,
         "envoy_count": args.envoy_nodes,
@@ -1679,6 +1658,11 @@ def main(args):
     }
     bootstrap_cluster(args, resources)
     log("Done.")
+    print(f"\nNext: provision a benchmark client in this VPC:")
+    print(f"  python3 -m common.client --seed {SEED} --server-type valkey --size small")
+    print(f"\nCleanup (server only -- client cleaned separately):")
+    print(f"  python3 valkey/setup.py --cleanup --seed {SEED}")
+    print(f"  python3 -m common.client --cleanup --seed {SEED} --server-type valkey")
 
 
 if __name__ == "__main__":

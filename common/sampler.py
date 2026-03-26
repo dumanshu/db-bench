@@ -1,0 +1,803 @@
+"""Unified metrics sampler and post-processing for db-bench.
+
+Merges aurora/ec2_sampler.py (runs on EC2) and aurora/parse_window.py
+(local post-processing) into a single module parameterized by server type.
+
+Server types: aurora, tidb, valkey
+
+Sampler (EC2-side):
+  Collects /proc/stat CPU jiffies, /proc/meminfo, plus DB-specific counters.
+  Writes CSV until sentinel file is removed.
+
+Post-processing (local-side):
+  Parses sysbench output, metrics CSV, and CloudWatch data into JSON results.
+
+Usage as library:
+  from common.sampler import (
+      generate_sampler_script, start_sampler, stop_sampler,
+      parse_sysbench_summary, parse_interval_lines, build_interval_data,
+      query_cloudwatch_metrics,
+  )
+"""
+
+import csv
+import json
+import re
+import statistics
+import tempfile
+from datetime import datetime, timezone
+from pathlib import Path
+
+from common.ssh import ssh_run_simple, scp_put_simple, scp_get_simple
+from common.util import log, aws_session
+
+SENTINEL_PATH = "/tmp/.metrics_running"
+REMOTE_SAMPLER_PATH = "/tmp/sampler.py"
+REMOTE_CSV_PATH = "/tmp/metrics.csv"
+
+
+# ---------------------------------------------------------------------------
+# Sampler script generation (deployed to EC2)
+# ---------------------------------------------------------------------------
+
+_SAMPLER_HEADER = '''\
+#!/usr/bin/env python3
+"""Auto-generated metrics sampler. Do not edit."""
+import csv
+import os
+import subprocess
+import sys
+import time
+
+SENTINEL = "{sentinel}"
+OUTPUT = "{output_csv}"
+INTERVAL = {interval}
+SERVER_TYPE = "{server_type}"
+'''
+
+_SAMPLER_CPU_FN = '''
+def read_cpu_jiffies():
+    with open("/proc/stat") as f:
+        parts = f.readline().split()
+    return {
+        "user": int(parts[1]),
+        "nice": int(parts[2]),
+        "system": int(parts[3]),
+        "idle": int(parts[4]),
+        "iowait": int(parts[5]),
+        "irq": int(parts[6]),
+        "softirq": int(parts[7]),
+        "steal": int(parts[8]) if len(parts) > 8 else 0,
+    }
+'''
+
+_SAMPLER_MEM_FN = '''
+def read_memory():
+    info = {}
+    with open("/proc/meminfo") as f:
+        for line in f:
+            parts = line.split()
+            key = parts[0].rstrip(":")
+            if key in ("MemTotal", "MemAvailable", "Buffers", "Cached"):
+                info[key] = int(parts[1])
+    return {
+        "mem_total_mb": info.get("MemTotal", 0) // 1024,
+        "mem_avail_mb": info.get("MemAvailable", 0) // 1024,
+        "mem_buffers_mb": info.get("Buffers", 0) // 1024,
+        "mem_cached_mb": info.get("Cached", 0) // 1024,
+    }
+'''
+
+_SAMPLER_MYSQL_FN = '''
+MYSQL_HOST = "{mysql_host}"
+MYSQL_USER = "{mysql_user}"
+MYSQL_PASSWORD = "{mysql_password}"
+MYSQL_PORT = "{mysql_port}"
+
+def read_innodb_counters():
+    try:
+        r = subprocess.run(
+            [
+                "mysql",
+                "-h" + MYSQL_HOST,
+                "-P" + MYSQL_PORT,
+                "-u" + MYSQL_USER,
+                "-p" + MYSQL_PASSWORD,
+                "--batch", "--skip-column-names",
+                "-e",
+                "SHOW GLOBAL STATUS WHERE Variable_name IN "
+                "('Innodb_rows_inserted','Innodb_rows_updated',"
+                "'Innodb_rows_deleted','Innodb_rows_read',"
+                "'Com_commit','Com_rollback')",
+            ],
+            capture_output=True, text=True, timeout=5,
+        )
+        counters = {{}}
+        for line in r.stdout.strip().splitlines():
+            parts = line.split("\\t")
+            if len(parts) >= 2:
+                counters[parts[0]] = int(parts[1])
+        return counters
+    except Exception as e:
+        print(f"WARNING: InnoDB query failed: {{{{e}}}}", file=sys.stderr)
+        return {{}}
+'''
+
+_SAMPLER_VALKEY_FN = '''
+VALKEY_HOST = "{valkey_host}"
+VALKEY_PORT = "{valkey_port}"
+
+def read_valkey_stats():
+    try:
+        r = subprocess.run(
+            ["valkey-cli", "-h", VALKEY_HOST, "-p", VALKEY_PORT, "INFO", "stats"],
+            capture_output=True, text=True, timeout=5,
+        )
+        stats = {{}}
+        for line in r.stdout.strip().splitlines():
+            if ":" in line and not line.startswith("#"):
+                k, v = line.split(":", 1)
+                k = k.strip()
+                v = v.strip()
+                if k in (
+                    "total_commands_processed", "instantaneous_ops_per_sec",
+                    "total_net_input_bytes", "total_net_output_bytes",
+                    "keyspace_hits", "keyspace_misses",
+                    "total_connections_received", "evicted_keys",
+                    "expired_keys",
+                ):
+                    try:
+                        stats[k] = int(v)
+                    except ValueError:
+                        try:
+                            stats[k] = float(v)
+                        except ValueError:
+                            pass
+        return stats
+    except Exception as e:
+        print(f"WARNING: Valkey query failed: {{{{e}}}}", file=sys.stderr)
+        return {{}}
+'''
+
+_SAMPLER_MAIN_COMMON_FIELDS = [
+    "epoch",
+    "cpu_user", "cpu_nice", "cpu_system", "cpu_idle",
+    "cpu_iowait", "cpu_irq", "cpu_softirq", "cpu_steal",
+    "mem_total_mb", "mem_avail_mb", "mem_buffers_mb", "mem_cached_mb",
+]
+
+_SAMPLER_MYSQL_FIELDS = [
+    "innodb_inserted", "innodb_updated", "innodb_deleted", "innodb_read",
+    "com_commit", "com_rollback",
+]
+
+_SAMPLER_VALKEY_FIELDS = [
+    "total_commands_processed", "instantaneous_ops_per_sec",
+    "total_net_input_bytes", "total_net_output_bytes",
+    "keyspace_hits", "keyspace_misses",
+    "total_connections_received", "evicted_keys", "expired_keys",
+]
+
+
+def _sampler_fieldnames(server_type):
+    fields = list(_SAMPLER_MAIN_COMMON_FIELDS)
+    if server_type in ("aurora", "tidb"):
+        fields.extend(_SAMPLER_MYSQL_FIELDS)
+    elif server_type == "valkey":
+        fields.extend(_SAMPLER_VALKEY_FIELDS)
+    return fields
+
+
+def _sampler_main_loop(server_type):
+    fields = _sampler_fieldnames(server_type)
+    fields_str = json.dumps(fields)
+
+    if server_type in ("aurora", "tidb"):
+        collect_extra = '''
+            innodb = read_innodb_counters()
+            row["innodb_inserted"] = innodb.get("Innodb_rows_inserted", "")
+            row["innodb_updated"] = innodb.get("Innodb_rows_updated", "")
+            row["innodb_deleted"] = innodb.get("Innodb_rows_deleted", "")
+            row["innodb_read"] = innodb.get("Innodb_rows_read", "")
+            row["com_commit"] = innodb.get("Com_commit", "")
+            row["com_rollback"] = innodb.get("Com_rollback", "")'''
+    elif server_type == "valkey":
+        collect_extra = '''
+            vs = read_valkey_stats()
+            row["total_commands_processed"] = vs.get("total_commands_processed", "")
+            row["instantaneous_ops_per_sec"] = vs.get("instantaneous_ops_per_sec", "")
+            row["total_net_input_bytes"] = vs.get("total_net_input_bytes", "")
+            row["total_net_output_bytes"] = vs.get("total_net_output_bytes", "")
+            row["keyspace_hits"] = vs.get("keyspace_hits", "")
+            row["keyspace_misses"] = vs.get("keyspace_misses", "")
+            row["total_connections_received"] = vs.get("total_connections_received", "")
+            row["evicted_keys"] = vs.get("evicted_keys", "")
+            row["expired_keys"] = vs.get("expired_keys", "")'''
+    else:
+        collect_extra = ""
+
+    return f'''
+def main():
+    fieldnames = {fields_str}
+    with open(OUTPUT, "w", newline="") as f:
+        w = csv.DictWriter(f, fieldnames=fieldnames)
+        w.writeheader()
+        next_sample = time.time()
+        sample_count = 0
+        while os.path.exists(SENTINEL):
+            epoch = int(time.time())
+            cpu = read_cpu_jiffies()
+            mem = read_memory()
+            row = {{
+                "epoch": epoch,
+                "cpu_user": cpu["user"],
+                "cpu_nice": cpu["nice"],
+                "cpu_system": cpu["system"],
+                "cpu_idle": cpu["idle"],
+                "cpu_iowait": cpu["iowait"],
+                "cpu_irq": cpu["irq"],
+                "cpu_softirq": cpu["softirq"],
+                "cpu_steal": cpu["steal"],
+                "mem_total_mb": mem["mem_total_mb"],
+                "mem_avail_mb": mem["mem_avail_mb"],
+                "mem_buffers_mb": mem["mem_buffers_mb"],
+                "mem_cached_mb": mem["mem_cached_mb"],
+            }}{collect_extra}
+            w.writerow(row)
+            f.flush()
+            sample_count += 1
+            next_sample += INTERVAL
+            sleep_time = next_sample - time.time()
+            if sleep_time > 0:
+                time.sleep(sleep_time)
+    print(f"Sampler stopped after {{sample_count}} samples. Output: {{OUTPUT}}")
+
+if __name__ == "__main__":
+    main()
+'''
+
+
+def generate_sampler_script(server_type, interval=5,
+                            mysql_host="", mysql_user="admin",
+                            mysql_password="", mysql_port="3306",
+                            valkey_host="127.0.0.1", valkey_port="6379"):
+    parts = [
+        _SAMPLER_HEADER.format(
+            sentinel=SENTINEL_PATH,
+            output_csv=REMOTE_CSV_PATH,
+            interval=interval,
+            server_type=server_type,
+        ),
+        _SAMPLER_CPU_FN,
+        _SAMPLER_MEM_FN,
+    ]
+
+    if server_type in ("aurora", "tidb"):
+        parts.append(_SAMPLER_MYSQL_FN.format(
+            mysql_host=mysql_host,
+            mysql_user=mysql_user,
+            mysql_password=mysql_password,
+            mysql_port=mysql_port,
+        ))
+    elif server_type == "valkey":
+        parts.append(_SAMPLER_VALKEY_FN.format(
+            valkey_host=valkey_host,
+            valkey_port=valkey_port,
+        ))
+
+    parts.append(_sampler_main_loop(server_type))
+    return "\n".join(parts)
+
+
+# ---------------------------------------------------------------------------
+# Start / stop API (runs locally, manages remote EC2 sampler)
+# ---------------------------------------------------------------------------
+
+def start_sampler(host_ip, key_path, server_type, interval=5, user="ec2-user",
+                  mysql_host="", mysql_user="admin", mysql_password="",
+                  mysql_port="3306", valkey_host="127.0.0.1", valkey_port="6379"):
+    script = generate_sampler_script(
+        server_type,
+        interval=interval,
+        mysql_host=mysql_host,
+        mysql_user=mysql_user,
+        mysql_password=mysql_password,
+        mysql_port=mysql_port,
+        valkey_host=valkey_host,
+        valkey_port=valkey_port,
+    )
+
+    with tempfile.NamedTemporaryFile(mode="w", suffix=".py", delete=False) as tmp:
+        tmp.write(script)
+        local_script = tmp.name
+
+    try:
+        scp_put_simple(host_ip, key_path, local_script, REMOTE_SAMPLER_PATH,
+                       user=user)
+    finally:
+        Path(local_script).unlink(missing_ok=True)
+
+    ssh_run_simple(host_ip, key_path, f"touch {SENTINEL_PATH}", user=user)
+    ssh_run_simple(
+        host_ip, key_path,
+        f"nohup python3 {REMOTE_SAMPLER_PATH} > /tmp/sampler.log 2>&1 &",
+        user=user,
+    )
+    log(f"Sampler started on {host_ip} (type={server_type}, interval={interval}s)")
+
+
+def stop_sampler(host_ip, key_path, local_csv_path, user="ec2-user",
+                 timeout=15):
+    ssh_run_simple(host_ip, key_path, f"rm -f {SENTINEL_PATH}", user=user)
+
+    import time
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        r = ssh_run_simple(
+            host_ip, key_path,
+            f"pgrep -f '{REMOTE_SAMPLER_PATH}' || echo stopped",
+            user=user,
+        )
+        if "stopped" in r.stdout:
+            break
+        time.sleep(1)
+
+    scp_get_simple(host_ip, key_path, REMOTE_CSV_PATH, local_csv_path,
+                   user=user)
+    log(f"Sampler stopped on {host_ip}, CSV saved to {local_csv_path}")
+    return local_csv_path
+
+
+# ---------------------------------------------------------------------------
+# CSV parsing
+# ---------------------------------------------------------------------------
+
+def parse_metrics_csv(csv_path):
+    rows = []
+    with open(csv_path) as f:
+        reader = csv.DictReader(f)
+        for row in reader:
+            parsed = {}
+            for k, v in row.items():
+                if v == "":
+                    parsed[k] = None
+                    continue
+                try:
+                    parsed[k] = int(v)
+                except ValueError:
+                    try:
+                        parsed[k] = float(v)
+                    except ValueError:
+                        parsed[k] = v
+            rows.append(parsed)
+    return rows
+
+
+# ---------------------------------------------------------------------------
+# Sysbench output parsing
+# ---------------------------------------------------------------------------
+
+def parse_interval_lines(output):
+    intervals = []
+    for line in output.splitlines():
+        m = re.match(
+            r"\[\s*([\d.]+)s\s*\]\s+thds:\s+(\d+)\s+"
+            r"tps:\s+([\d.]+)\s+qps:\s+([\d.]+)\s+"
+            r"\(r/w/o:\s+([\d.]+)/([\d.]+)/([\d.]+)\)\s+"
+            r"lat\s+\(ms,\s*95%\):\s+([\d.]+)\s+"
+            r"err/s:\s+([\d.]+)",
+            line,
+        )
+        if m:
+            intervals.append({
+                "time_s": float(m.group(1)),
+                "threads": int(m.group(2)),
+                "tps": float(m.group(3)),
+                "qps": float(m.group(4)),
+                "read_qps": float(m.group(5)),
+                "write_qps": float(m.group(6)),
+                "other_qps": float(m.group(7)),
+                "p95_ms": float(m.group(8)),
+                "err_s": float(m.group(9)),
+            })
+    return intervals
+
+
+def parse_sysbench_summary(output):
+    result = {}
+    m = re.search(r"transactions:\s+\d+\s+\(([\d.]+)\s+per sec", output)
+    if m:
+        result["tps"] = float(m.group(1))
+    m = re.search(r"queries:\s+\d+\s+\(([\d.]+)\s+per sec", output)
+    if m:
+        result["qps"] = float(m.group(1))
+    m = re.search(r"read:\s+(\d+)", output)
+    if m:
+        result["reads"] = int(m.group(1))
+    m = re.search(r"write:\s+(\d+)", output)
+    if m:
+        result["writes"] = int(m.group(1))
+    m = re.search(r"other:\s+(\d+)", output)
+    if m:
+        result["other"] = int(m.group(1))
+    for pct in ["min", "avg", "max", "95th percentile"]:
+        key = pct.replace(" ", "_").replace("percentile", "pct")
+        m = re.search(rf"{re.escape(pct)}:\s+([\d.]+)", output)
+        if m:
+            result[f"latency_{key}_ms"] = float(m.group(1))
+    return result
+
+
+# ---------------------------------------------------------------------------
+# CPU / counter delta computations
+# ---------------------------------------------------------------------------
+
+_CPU_FIELDS = [
+    "cpu_user", "cpu_nice", "cpu_system", "cpu_idle",
+    "cpu_iowait", "cpu_irq", "cpu_softirq", "cpu_steal",
+]
+
+
+def compute_cpu_pct(prev, curr):
+    try:
+        total_prev = sum(prev[f] for f in _CPU_FIELDS if prev.get(f) is not None)
+        total_curr = sum(curr[f] for f in _CPU_FIELDS if curr.get(f) is not None)
+        idle_prev = (prev.get("cpu_idle") or 0) + (prev.get("cpu_iowait") or 0)
+        idle_curr = (curr.get("cpu_idle") or 0) + (curr.get("cpu_iowait") or 0)
+        total_d = total_curr - total_prev
+        idle_d = idle_curr - idle_prev
+        if total_d > 0:
+            return round((total_d - idle_d) / total_d * 100, 1)
+    except (KeyError, TypeError):
+        pass
+    return None
+
+
+_MYSQL_COUNTER_MAP = [
+    ("innodb_inserted", "insert_per_sec"),
+    ("innodb_updated", "update_per_sec"),
+    ("innodb_deleted", "delete_per_sec"),
+    ("innodb_read", "read_per_sec"),
+    ("com_commit", "commits_per_sec"),
+]
+
+_VALKEY_COUNTER_MAP = [
+    ("total_commands_processed", "commands_per_sec"),
+    ("keyspace_hits", "hits_per_sec"),
+    ("keyspace_misses", "misses_per_sec"),
+    ("total_net_input_bytes", "net_input_bytes_per_sec"),
+    ("total_net_output_bytes", "net_output_bytes_per_sec"),
+    ("evicted_keys", "evictions_per_sec"),
+    ("expired_keys", "expirations_per_sec"),
+]
+
+
+def compute_iud_rates(prev, curr):
+    dt = (curr.get("epoch") or 0) - (prev.get("epoch") or 0)
+    if dt <= 0:
+        dt = 5
+    rates = {}
+    for counter, rate_key in _MYSQL_COUNTER_MAP:
+        p = prev.get(counter)
+        c = curr.get(counter)
+        if p is not None and c is not None:
+            rates[rate_key] = round((c - p) / dt, 1)
+    iud = (
+        rates.get("insert_per_sec", 0)
+        + rates.get("update_per_sec", 0)
+        + rates.get("delete_per_sec", 0)
+    )
+    rates["total_iud_per_sec"] = round(iud, 1)
+    return rates
+
+
+def compute_valkey_rates(prev, curr):
+    dt = (curr.get("epoch") or 0) - (prev.get("epoch") or 0)
+    if dt <= 0:
+        dt = 5
+    rates = {}
+    for counter, rate_key in _VALKEY_COUNTER_MAP:
+        p = prev.get(counter)
+        c = curr.get(counter)
+        if p is not None and c is not None:
+            rates[rate_key] = round((c - p) / dt, 1)
+    rates["instantaneous_ops_per_sec"] = curr.get("instantaneous_ops_per_sec")
+    hit = rates.get("hits_per_sec", 0)
+    miss = rates.get("misses_per_sec", 0)
+    total = hit + miss
+    rates["hit_rate_pct"] = round(hit / total * 100, 1) if total > 0 else None
+    return rates
+
+
+# ---------------------------------------------------------------------------
+# Statistics helper
+# ---------------------------------------------------------------------------
+
+def safe_stats(values):
+    clean = [v for v in values if v is not None and isinstance(v, (int, float))]
+    if not clean:
+        return {}
+    result = {
+        "min": round(min(clean), 2),
+        "avg": round(statistics.mean(clean), 2),
+        "max": round(max(clean), 2),
+        "count": len(clean),
+    }
+    if len(clean) >= 2:
+        result["median"] = round(statistics.median(clean), 2)
+        result["stdev"] = round(statistics.stdev(clean), 2)
+    if len(clean) >= 5:
+        s = sorted(clean)
+        p50_idx = min(int(len(s) * 0.50), len(s) - 1)
+        p95_idx = min(int(len(s) * 0.95), len(s) - 1)
+        p99_idx = min(int(len(s) * 0.99), len(s) - 1)
+        result["p50"] = round(s[p50_idx], 2)
+        result["p95"] = round(s[p95_idx], 2)
+        result["p99"] = round(s[p99_idx], 2)
+    return result
+
+
+# ---------------------------------------------------------------------------
+# Windowed interval derivation
+# ---------------------------------------------------------------------------
+
+def _find_closest(samples, target_epoch, max_delta=6):
+    if not samples:
+        return None
+    best = min(samples, key=lambda r: abs(r["epoch"] - target_epoch))
+    if abs(best["epoch"] - target_epoch) <= max_delta:
+        return best
+    return None
+
+
+def derive_interval_metrics(metrics_rows, window_epoch_start, window_epoch_end,
+                            server_type="aurora"):
+    cpu_samples = []
+    db_samples = []
+    for i in range(1, len(metrics_rows)):
+        prev = metrics_rows[i - 1]
+        curr = metrics_rows[i]
+        epoch = curr.get("epoch")
+        if epoch is None:
+            continue
+        if epoch < window_epoch_start or epoch > window_epoch_end + 3:
+            continue
+
+        cpu_pct = compute_cpu_pct(prev, curr)
+        mem_used = None
+        total = curr.get("mem_total_mb")
+        avail = curr.get("mem_avail_mb")
+        if total is not None and avail is not None:
+            mem_used = total - avail
+
+        cpu_samples.append({
+            "epoch": epoch,
+            "client_cpu_pct": cpu_pct,
+            "client_mem_used_mb": mem_used,
+            "client_mem_total_mb": total,
+        })
+
+        if server_type in ("aurora", "tidb"):
+            rates = compute_iud_rates(prev, curr)
+        elif server_type == "valkey":
+            rates = compute_valkey_rates(prev, curr)
+        else:
+            rates = {}
+        rates["epoch"] = epoch
+        db_samples.append(rates)
+
+    return cpu_samples, db_samples
+
+
+def build_interval_data(window_intervals, cpu_samples, db_samples,
+                        run_start_epoch, server_type="aurora"):
+    rows = []
+    for iv in window_intervals:
+        iv_epoch = run_start_epoch + iv["time_s"]
+        entry = {
+            "time_s": iv["time_s"],
+            "tps": iv["tps"],
+            "qps": iv["qps"],
+            "p95_latency_ms": iv["p95_ms"],
+            "err_s": iv["err_s"],
+        }
+
+        closest_db = _find_closest(db_samples, iv_epoch)
+        if closest_db:
+            for k, v in closest_db.items():
+                if k != "epoch":
+                    entry[k] = v
+
+        closest_cpu = _find_closest(cpu_samples, iv_epoch)
+        if closest_cpu:
+            entry["client_cpu_pct"] = closest_cpu.get("client_cpu_pct")
+            entry["client_mem_used_mb"] = closest_cpu.get("client_mem_used_mb")
+
+        rows.append(entry)
+    return rows
+
+
+# ---------------------------------------------------------------------------
+# CloudWatch queries
+# ---------------------------------------------------------------------------
+
+_CW_AURORA_QUERIES = [
+    ("aurora_cpu_avg_pct", "AWS/RDS", "CPUUtilization", "Average"),
+    ("aurora_cpu_max_pct", "AWS/RDS", "CPUUtilization", "Maximum"),
+    ("aurora_freeable_memory_mb", "AWS/RDS", "FreeableMemory", "Average"),
+    ("aurora_db_connections", "AWS/RDS", "DatabaseConnections", "Average"),
+    ("aurora_write_iops", "AWS/RDS", "WriteIOPS", "Average"),
+    ("aurora_read_iops", "AWS/RDS", "ReadIOPS", "Average"),
+    ("aurora_write_throughput", "AWS/RDS", "WriteThroughput", "Average"),
+    ("aurora_read_throughput", "AWS/RDS", "ReadThroughput", "Average"),
+    ("aurora_write_latency_ms", "AWS/RDS", "WriteLatency", "Average"),
+    ("aurora_commit_latency_ms", "AWS/RDS", "CommitLatency", "Average"),
+    ("aurora_dml_latency_ms", "AWS/RDS", "DMLLatency", "Average"),
+    ("aurora_insert_latency_ms", "AWS/RDS", "InsertLatency", "Average"),
+    ("aurora_update_latency_ms", "AWS/RDS", "UpdateLatency", "Average"),
+    ("aurora_delete_latency_ms", "AWS/RDS", "DeleteLatency", "Average"),
+    ("aurora_select_latency_ms", "AWS/RDS", "SelectLatency", "Average"),
+    ("aurora_ddl_latency_ms", "AWS/RDS", "DDLLatency", "Average"),
+    ("aurora_queries", "AWS/RDS", "Queries", "Average"),
+    ("aurora_active_transactions", "AWS/RDS", "ActiveTransactions", "Average"),
+    ("aurora_engine_uptime", "AWS/RDS", "EngineUptime", "Average"),
+    ("aurora_network_receive_tp", "AWS/RDS", "NetworkReceiveThroughput", "Average"),
+    ("aurora_network_transmit_tp", "AWS/RDS", "NetworkTransmitThroughput", "Average"),
+]
+
+_CW_EC2_QUERIES = [
+    ("ec2_cpu_avg_pct", "AWS/EC2", "CPUUtilization", "Average"),
+    ("ec2_network_in", "AWS/EC2", "NetworkIn", "Average"),
+    ("ec2_network_out", "AWS/EC2", "NetworkOut", "Average"),
+]
+
+_CW_ELASTICACHE_QUERIES = [
+    ("cache_cpu_avg_pct", "AWS/ElastiCache", "CPUUtilization", "Average"),
+    ("cache_curr_connections", "AWS/ElastiCache", "CurrConnections", "Average"),
+    ("cache_bytes_used", "AWS/ElastiCache", "BytesUsedForCache", "Average"),
+    ("cache_evictions", "AWS/ElastiCache", "Evictions", "Sum"),
+    ("cache_cache_hits", "AWS/ElastiCache", "CacheHits", "Sum"),
+    ("cache_cache_misses", "AWS/ElastiCache", "CacheMisses", "Sum"),
+    ("cache_curr_items", "AWS/ElastiCache", "CurrItems", "Average"),
+    ("cache_network_bytes_in", "AWS/ElastiCache", "NetworkBytesIn", "Sum"),
+    ("cache_network_bytes_out", "AWS/ElastiCache", "NetworkBytesOut", "Sum"),
+    ("cache_replication_lag", "AWS/ElastiCache", "ReplicationLag", "Average"),
+]
+
+
+def _cw_queries_for_server_type(server_type):
+    if server_type == "aurora":
+        return _CW_AURORA_QUERIES
+    elif server_type == "tidb":
+        return _CW_EC2_QUERIES
+    elif server_type == "valkey":
+        return _CW_ELASTICACHE_QUERIES
+    return []
+
+
+def _cw_dimension_for_server_type(server_type, resource_id):
+    if server_type == "aurora":
+        return [{"Name": "DBInstanceIdentifier", "Value": resource_id}]
+    elif server_type == "tidb":
+        return [{"Name": "InstanceId", "Value": resource_id}]
+    elif server_type == "valkey":
+        return [{"Name": "CacheClusterId", "Value": resource_id}]
+    return []
+
+
+def _cw_transform_value(key, value):
+    if "memory" in key or "bytes_used" in key:
+        return round(value / (1024 * 1024), 0)
+    if "latency" in key:
+        return round(value * 1000, 4)
+    if "iops" in key:
+        return round(value, 0)
+    return round(value, 2)
+
+
+def query_cloudwatch_metrics(server_type, resource_id, start_epoch, end_epoch,
+                             region=None, profile=None):
+    queries = _cw_queries_for_server_type(server_type)
+    if not queries:
+        return {}
+
+    dimensions = _cw_dimension_for_server_type(server_type, resource_id)
+    start_dt = datetime.fromtimestamp(start_epoch, tz=timezone.utc)
+    end_dt = datetime.fromtimestamp(end_epoch, tz=timezone.utc)
+
+    session = aws_session()
+    cw = session.client("cloudwatch", region_name=region or session.region_name)
+
+    metrics = {}
+    for key, namespace, metric_name, stat in queries:
+        try:
+            resp = cw.get_metric_statistics(
+                Namespace=namespace,
+                MetricName=metric_name,
+                Dimensions=dimensions,
+                StartTime=start_dt,
+                EndTime=end_dt,
+                Period=60,
+                Statistics=[stat],
+            )
+            points = resp.get("Datapoints", [])
+            if points:
+                val = sum(p[stat] for p in points) / len(points)
+                metrics[key] = _cw_transform_value(key, val)
+            else:
+                metrics[key] = None
+        except Exception:
+            metrics[key] = None
+    return metrics
+
+
+# ---------------------------------------------------------------------------
+# Full windowed analysis (combines everything)
+# ---------------------------------------------------------------------------
+
+def analyze_window(sysbench_text, csv_path, run_start_epoch,
+                   window_start=30, window_end=90, server_type="aurora",
+                   resource_id=None, region=None, profile=None):
+    all_intervals = parse_interval_lines(sysbench_text)
+    summary = parse_sysbench_summary(sysbench_text)
+
+    window_intervals = [
+        iv for iv in all_intervals
+        if window_start <= iv["time_s"] <= window_end
+    ]
+
+    metrics_rows = parse_metrics_csv(csv_path)
+    window_epoch_start = run_start_epoch + window_start
+    window_epoch_end = run_start_epoch + window_end
+    cpu_samples, db_samples = derive_interval_metrics(
+        metrics_rows, window_epoch_start, window_epoch_end,
+        server_type=server_type,
+    )
+
+    interval_data = build_interval_data(
+        window_intervals, cpu_samples, db_samples, run_start_epoch,
+        server_type=server_type,
+    )
+
+    ws = {
+        "tps": safe_stats([iv["tps"] for iv in window_intervals]),
+        "qps": safe_stats([iv["qps"] for iv in window_intervals]),
+        "p95_latency_ms": safe_stats([iv["p95_ms"] for iv in window_intervals]),
+        "client_cpu_pct": safe_stats(
+            [r.get("client_cpu_pct") for r in cpu_samples]
+        ),
+        "client_mem_used_mb": safe_stats(
+            [r.get("client_mem_used_mb") for r in cpu_samples]
+        ),
+    }
+
+    if server_type in ("aurora", "tidb"):
+        for rate_key in ("total_iud_per_sec", "insert_per_sec", "update_per_sec",
+                         "delete_per_sec", "read_per_sec", "commits_per_sec"):
+            ws[rate_key] = safe_stats([r.get(rate_key) for r in db_samples])
+    elif server_type == "valkey":
+        for rate_key in ("commands_per_sec", "hits_per_sec", "misses_per_sec",
+                         "hit_rate_pct", "instantaneous_ops_per_sec"):
+            ws[rate_key] = safe_stats([r.get(rate_key) for r in db_samples])
+
+    cloudwatch = {}
+    if resource_id:
+        cw_start = run_start_epoch + window_start - 60
+        cw_end = run_start_epoch + window_end + 60
+        cloudwatch = query_cloudwatch_metrics(
+            server_type, resource_id, cw_start, cw_end,
+            region=region, profile=profile,
+        )
+
+    return {
+        "summary": summary,
+        "window_stats": ws,
+        "cloudwatch": cloudwatch,
+        "interval_data": interval_data,
+        "capture_window": {
+            "start_s": window_start,
+            "end_s": window_end,
+            "duration_s": window_end - window_start,
+        },
+        "timestamp": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+    }

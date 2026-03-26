@@ -8,7 +8,7 @@ Provisions AWS infrastructure and bootstraps a TiDB cluster using TiDB Operator
 on a multi-node k3s cluster across dedicated EC2 instances.
 
 Architecture:
-- 1 client EC2 (k3s server / control plane + sysbench)
+- 1 control EC2 (k3s server / control plane)
 - 3 PD EC2 instances (k3s agents, labeled for PD pods)
 - 3 TiKV EC2 instances (k3s agents, labeled for TiKV pods)
 - 2 TiDB EC2 instances (k3s agents, labeled for TiDB pods)
@@ -48,33 +48,35 @@ from common.aws import (
 
 SEED = "tidblt-001"
 
-# Default instance type for client VM (sysbench runner)
-# c7g.4xlarge provides 16 vCPU, 32GB RAM - enough headroom for sysbench client
-CLIENT_INSTANCE_TYPE = "c7g.4xlarge"
+# Default instance type for control VM (k3s server / control plane)
+# c8g.4xlarge provides 16 vCPU, 32GB RAM (Graviton4) - enough for control plane
+CONTROL_INSTANCE_TYPE = "c8g.4xlarge"
 
-# PingCAP recommended production instance types (AWS)
+# PingCAP recommended production instance types (AWS Graviton4)
 # https://docs.pingcap.com/tidb/stable/hardware-and-software-requirements
+# PD: 8+ vCPU, 16+ GB | TiDB: 16+ vCPU, 48+ GB | TiKV: 16+ vCPU, 64+ GB
+# TiCDC: 16+ vCPU, 64+ GB
 PRODUCTION_INSTANCE_TYPES = {
-    "pd": "c7g.xlarge",      # 4 vCPU, 8GB - metadata/scheduling
-    "tidb": "c7g.4xlarge",   # 16 vCPU, 32GB - compute optimized for SQL
-    "tikv": "m7g.4xlarge",   # 16 vCPU, 64GB - memory optimized for storage
-    "ticdc": "c7g.4xlarge",  # 16 vCPU, 32GB - CDC replication (CPU + disk IO bound)
-    "client": "c7g.4xlarge", # 16 vCPU, 32GB - benchmark client
-    "downstream-pd": "c7g.xlarge",
-    "downstream-tidb": "c7g.4xlarge",
-    "downstream-tikv": "m7g.4xlarge",
+    "pd": "c8g.2xlarge",      # 8 vCPU, 16GB - meets PingCAP 8 core+/16GB+ req
+    "tidb": "m8g.4xlarge",    # 16 vCPU, 64GB - meets PingCAP 16 core+/48GB+ req
+    "tikv": "m8g.4xlarge",    # 16 vCPU, 64GB - meets PingCAP 16 core+/64GB+ req
+    "ticdc": "m8g.4xlarge",   # 16 vCPU, 64GB - meets PingCAP 16 core+/64GB+ req
+    "control": "c8g.4xlarge", # 16 vCPU, 32GB - control plane
+    "downstream-pd": "c8g.2xlarge",
+    "downstream-tidb": "m8g.4xlarge",
+    "downstream-tikv": "m8g.4xlarge",
 }
 
-# Cost-optimized instance types for testing/benchmarking
+# Cost-optimized instance types for testing/benchmarking (Graviton4)
 BENCHMARK_INSTANCE_TYPES = {
-    "pd": "c7g.large",       # 2 vCPU, 4GB
-    "tidb": "c7g.2xlarge",   # 8 vCPU, 16GB
-    "tikv": "m7g.2xlarge",   # 8 vCPU, 32GB
-    "ticdc": "c7g.2xlarge",  # 8 vCPU, 16GB
-    "client": "c7g.2xlarge", # 8 vCPU, 16GB
-    "downstream-pd": "c7g.large",
-    "downstream-tidb": "c7g.2xlarge",
-    "downstream-tikv": "m7g.2xlarge",
+    "pd": "c8g.large",       # 2 vCPU, 4GB
+    "tidb": "c8g.2xlarge",   # 8 vCPU, 16GB
+    "tikv": "m8g.2xlarge",   # 8 vCPU, 32GB
+    "ticdc": "c8g.2xlarge",  # 8 vCPU, 16GB
+    "control": "c8g.2xlarge", # 8 vCPU, 16GB
+    "downstream-pd": "c8g.large",
+    "downstream-tidb": "c8g.2xlarge",
+    "downstream-tikv": "m8g.2xlarge",
 }
 
 # EBS gp3 storage recommendations from PingCAP
@@ -102,7 +104,7 @@ EBS_CONFIG = {
 
 # Root volume sizes per role (GB)
 ROOT_VOLUME_SIZES = {
-    "client": 100,
+    "control": 100,
     "pd": 50,
     "tikv": 500,
     "tidb": 50,
@@ -144,8 +146,8 @@ KUBELET_PORT = 10250
 
 TIDB_OPERATOR_VERSION = os.environ.get("TIDB_OPERATOR_VERSION", "v1.6.5")
 TIDB_VERSION = os.environ.get("TIDB_VERSION", "v8.5.5")
-HELM_VERSION = os.environ.get("HELM_VERSION", "v3.16.3")
-KUBECTL_VERSION = os.environ.get("KUBECTL_VERSION", "v1.31.0")
+HELM_VERSION = os.environ.get("HELM_VERSION", "v3.20.1")
+KUBECTL_VERSION = os.environ.get("KUBECTL_VERSION", "v1.35.3")
 
 # All roles that get their own EC2 instances
 COMPONENT_ROLES = ["pd", "tikv", "tidb"]
@@ -216,7 +218,7 @@ def parse_args():
     parser.add_argument(
         "--client-zone",
         default="us-east-1a",
-        help="AZ for client VM; leaders prefer this zone (default: us-east-1a).",
+        help="AZ for control VM; leaders prefer this zone (default: us-east-1a).",
     )
     parser.add_argument(
         "--ticdc",
@@ -298,7 +300,7 @@ def ensure_keypair_accessible():
 class BootstrapContext:
     ssh_key_path: Path
     self_cidr: str
-    client: InstanceInfo
+    jump_host: InstanceInfo
     pd_nodes: List[InstanceInfo] = field(default_factory=list)
     tikv_nodes: List[InstanceInfo] = field(default_factory=list)
     tidb_nodes: List[InstanceInfo] = field(default_factory=list)
@@ -321,7 +323,7 @@ class BootstrapContext:
 
     @property
     def host(self) -> InstanceInfo:
-        return self.client
+        return self.jump_host
 
     @property
     def all_agent_nodes(self) -> List[InstanceInfo]:
@@ -331,7 +333,7 @@ class BootstrapContext:
 
     @property
     def all_nodes(self) -> List[InstanceInfo]:
-        return [self.client] + self.all_agent_nodes
+        return [self.jump_host] + self.all_agent_nodes
 
 
 # ---------------------------------------------------------------------------
@@ -341,14 +343,14 @@ class BootstrapContext:
 def ssh_base_cmd(host: InstanceInfo, ctx: BootstrapContext):
     """Build SSH command for a node.
     
-    For the client node: direct SSH via public IP.
-    For agent nodes: SSH via ProxyJump through client (private IP), since
+    For the control node: direct SSH via public IP.
+    For agent nodes: SSH via ProxyJump through control (private IP), since
     some AWS public IPs may not be routable from corporate VPNs.
     """
-    is_agent = host.role != "client"
-    if is_agent and ctx.client and ctx.client.public_ip:
-        # Use ProxyJump through client to reach agent via private IP
-        proxy = f"ec2-user@{ctx.client.public_ip}"
+    is_agent = host.role != "control"
+    if is_agent and ctx.jump_host and ctx.jump_host.public_ip:
+        # Use ProxyJump through control to reach agent via private IP
+        proxy = f"ec2-user@{ctx.jump_host.public_ip}"
         target_ip = host.private_ip
         cmd = [
             "ssh",
@@ -444,7 +446,7 @@ def provision_role_instances(role, count, instance_types, subnet_ids, sg_id, pro
     if isinstance(subnet_ids, str):
         subnet_ids = [subnet_ids]
     types = PRODUCTION_INSTANCE_TYPES if production else BENCHMARK_INSTANCE_TYPES
-    itype = types.get(role, instance_types.get(role, CLIENT_INSTANCE_TYPE))
+    itype = types.get(role, instance_types.get(role, CONTROL_INSTANCE_TYPE))
     vol_size = ROOT_VOLUME_SIZES.get(role, 100)
     ids = []
     for i in range(1, count + 1):
@@ -465,6 +467,13 @@ def install_base_packages(host: InstanceInfo, ctx: BootstrapContext):
     ssh_run(host, """
 sudo dnf -y update || true
 sudo dnf -y install jq htop sysstat mtr || true
+
+# mysql client needed on control node for create_sysbench_database()
+if ! command -v mysql &>/dev/null; then
+    sudo dnf -y install mariadb105 2>/dev/null || \
+    sudo dnf -y install mariadb 2>/dev/null || \
+    echo "WARNING: mysql client not installed"
+fi
 
 sudo tee /etc/sysctl.d/99-k8s.conf >/dev/null <<'EOF'
 net.bridge.bridge-nf-call-iptables = 1
@@ -513,14 +522,14 @@ sudo sysctl --system || true
 # k3s Installation (replaces kind + Docker)
 # ---------------------------------------------------------------------------
 
-def install_k3s_server(client: InstanceInfo, ctx: BootstrapContext):
-    """Install k3s in server (control-plane) mode on the client node.
+def install_k3s_server(control: InstanceInfo, ctx: BootstrapContext):
+    """Install k3s in server (control-plane) mode on the control node.
 
     Disables traefik, servicelb, and local-storage (not needed for TiDB).
     Taints the control-plane node so TiDB pods don't schedule on it.
     """
-    log(f"Installing k3s server on client ({client.public_ip})")
-    ssh_run(client, f"""
+    log(f"Installing k3s server on control ({control.public_ip})")
+    ssh_run(control, f"""
 # Check if k3s is already running
 if sudo systemctl is-active k3s >/dev/null 2>&1; then
     echo "k3s server already running"
@@ -530,8 +539,8 @@ fi
 
 curl -sfL https://get.k3s.io | INSTALL_K3S_EXEC="server \
   --disable=traefik,servicelb,local-storage \
-  --tls-san={client.private_ip} \
-  --tls-san={client.public_ip} \
+  --tls-san={control.private_ip} \
+  --tls-san={control.public_ip} \
   --node-taint=node-role.kubernetes.io/control-plane:NoSchedule \
   --write-kubeconfig-mode=644" sh -
 
@@ -557,9 +566,9 @@ echo "k3s server installed successfully"
 """, ctx)
 
 
-def get_k3s_token(client: InstanceInfo, ctx: BootstrapContext) -> str:
+def get_k3s_token(control: InstanceInfo, ctx: BootstrapContext) -> str:
     """Retrieve the k3s node-token from the server node."""
-    result = ssh_capture(client, """
+    result = ssh_capture(control, """
 sudo cat /var/lib/rancher/k3s/server/node-token
 """, ctx)
     return result.stdout.strip()
@@ -599,7 +608,7 @@ def label_and_taint_nodes(ctx: BootstrapContext):
 
     # Wait for all agents to register
     total_agents = len(ctx.all_agent_nodes)
-    ssh_run(ctx.client, f"""
+    ssh_run(ctx.jump_host, f"""
 echo "Waiting for {total_agents} agent nodes to register..."
 for i in $(seq 1 60); do
     COUNT=$(kubectl get nodes --no-headers 2>/dev/null | wc -l)
@@ -633,7 +642,7 @@ kubectl get nodes -o wide
 
 def _label_taint_node(ctx: BootstrapContext, node_ip: str, component: str):
     """Label and taint a single k3s node by its IP address."""
-    ssh_run(ctx.client, f"""
+    ssh_run(ctx.jump_host, f"""
 # Find the node name by IP
 NODE_NAME=$(kubectl get nodes -o jsonpath='{{.items[?(@.status.addresses[?(@.type=="InternalIP")].address=="{node_ip}")].metadata.name}}')
 if [ -z "$NODE_NAME" ]; then
@@ -1190,64 +1199,8 @@ kubectl exec -n tidb-cluster $TICDC_POD -- /cdc cli changefeed list \
 
 
 # ---------------------------------------------------------------------------
-# Client Tools (only on client node)
+# Sysbench Database Setup
 # ---------------------------------------------------------------------------
-
-def install_mysql_client(host: InstanceInfo, ctx: BootstrapContext):
-    log(f"Installing MySQL client on {host.role}")
-    ssh_run(host, """
-if command -v mysql >/dev/null 2>&1; then
-    echo "MySQL client already installed"
-    exit 0
-fi
-sudo dnf -y install mariadb105 || sudo dnf -y install mysql || true
-""", ctx)
-
-
-def install_sysbench(host: InstanceInfo, ctx: BootstrapContext):
-    log(f"Installing sysbench on {host.role}")
-    ssh_run(host, """
-if command -v sysbench >/dev/null 2>&1; then
-    echo "sysbench already installed"
-    exit 0
-fi
-
-# Try package manager first
-if sudo dnf -y install sysbench 2>/dev/null; then
-    exit 0
-fi
-
-# Build from source - need to handle Amazon Linux 2023 which uses MariaDB
-sudo dnf -y install git mariadb-connector-c-devel libaio-devel automake libtool make gcc gcc-c++ || true
-
-# Create symlinks for MySQL compatibility (AL2023 uses mariadb paths)
-if [ -d /usr/include/mariadb ] && [ ! -f /usr/include/mysql.h ]; then
-    sudo ln -sf /usr/include/mariadb/mysql.h /usr/include/mysql.h
-    sudo ln -sf /usr/include/mariadb/mysqld_error.h /usr/include/mysqld_error.h 2>/dev/null || true
-    sudo ln -sf /usr/include/mariadb/errmsg.h /usr/include/errmsg.h 2>/dev/null || true
-fi
-
-cd /tmp
-rm -rf sysbench
-git clone https://github.com/akopytov/sysbench.git
-cd sysbench
-./autogen.sh
-
-# Configure with explicit MariaDB paths for Amazon Linux 2023
-if [ -d /usr/include/mariadb ]; then
-    export CPPFLAGS="-I/usr/include/mariadb"
-    ./configure --with-mysql-includes=/usr/include/mariadb --with-mysql-libs=/usr/lib64/mariadb
-else
-    ./configure --with-mysql
-fi
-
-make -j $(nproc)
-sudo make install
-cd /tmp && rm -rf sysbench
-
-# Verify installation
-sysbench --version
-""", ctx)
 
 
 def create_sysbench_database(host: InstanceInfo, ctx: BootstrapContext):
@@ -1340,7 +1293,7 @@ def main():
         log(f"Multi-AZ mode: PD={pd_replicas}, TiKV={tikv_replicas}, TiDB={tidb_replicas}")
 
     types = PRODUCTION_INSTANCE_TYPES if production else BENCHMARK_INSTANCE_TYPES
-    log(f"Instance types: PD={types['pd']}, TiKV={types['tikv']}, TiDB={types['tidb']}, Client={types['client']}")
+    log(f"Instance types: PD={types['pd']}, TiKV={types['tikv']}, TiDB={types['tidb']}, Control={types['control']}")
 
     # -----------------------------------------------------------------------
     # Network
@@ -1374,9 +1327,9 @@ def main():
     # EC2 Instances
     # -----------------------------------------------------------------------
     log("=== Provisioning EC2 Instances ===")
-    client_type = types["client"]
-    client_vol = ROOT_VOLUME_SIZES["client"]
-    client_id = ensure_instance(f"{_cu.STACK}-client", "client", client_type, public_subnet, sg, client_vol)
+    control_type = types["control"]
+    control_vol = ROOT_VOLUME_SIZES["control"]
+    control_id = ensure_instance(f"{_cu.STACK}-control", "control", control_type, public_subnet, sg, control_vol)
 
     pd_ids = provision_role_instances("pd", pd_replicas, types, subnet_ids, sg, production)
     tikv_ids = provision_role_instances("tikv", tikv_replicas, types, subnet_ids, sg, production)
@@ -1402,7 +1355,7 @@ def main():
     log("=== Gathering Instance Information ===")
     time.sleep(10)
 
-    client = instance_info_from_id(client_id, "client")
+    control = instance_info_from_id(control_id, "control")
     pd_nodes = [instance_info_from_id(iid, f"pd-{i+1}") for i, iid in enumerate(pd_ids)]
     tikv_nodes = [instance_info_from_id(iid, f"tikv-{i+1}") for i, iid in enumerate(tikv_ids)]
     tidb_nodes = [instance_info_from_id(iid, f"tidb-{i+1}") for i, iid in enumerate(tidb_ids)]
@@ -1411,7 +1364,7 @@ def main():
     ds_tikv_nodes = [instance_info_from_id(iid, f"downstream-tikv-{i+1}") for i, iid in enumerate(ds_tikv_ids)]
     ds_tidb_nodes = [instance_info_from_id(iid, f"downstream-tidb-{i+1}") for i, iid in enumerate(ds_tidb_ids)]
 
-    log(f"  client:  public={client.public_ip} private={client.private_ip}")
+    log(f"  control: public={control.public_ip} private={control.private_ip}")
     for n in pd_nodes + tikv_nodes + tidb_nodes + ticdc_nodes:
         log(f"  {n.role}: public={n.public_ip} private={n.private_ip}")
     for n in ds_pd_nodes + ds_tikv_nodes + ds_tidb_nodes:
@@ -1423,7 +1376,7 @@ def main():
 
     if args.skip_bootstrap:
         log("Skipping bootstrap (--skip-bootstrap). Infrastructure ready.")
-        log(f"SSH to client: ssh -i {key_path} ec2-user@{client.public_ip}")
+        log(f"SSH to control: ssh -i {key_path} ec2-user@{control.public_ip}")
         return
 
     # -----------------------------------------------------------------------
@@ -1432,7 +1385,7 @@ def main():
     ctx = BootstrapContext(
         ssh_key_path=key_path,
         self_cidr=self_cidr,
-        client=client,
+        jump_host=control,
         pd_nodes=pd_nodes,
         tikv_nodes=tikv_nodes,
         tidb_nodes=tidb_nodes,
@@ -1472,69 +1425,65 @@ def main():
     # k3s Cluster Setup
     # -----------------------------------------------------------------------
     log("=== Setting up k3s Cluster ===")
-    install_k3s_server(client, ctx)
-    k3s_token = get_k3s_token(client, ctx)
+    install_k3s_server(control, ctx)
+    k3s_token = get_k3s_token(control, ctx)
     log(f"k3s token retrieved (length={len(k3s_token)})")
 
     log("=== Joining k3s Agent Nodes ===")
     for node in ctx.all_agent_nodes:
-        install_k3s_agent(node, client.private_ip, k3s_token, ctx)
+        install_k3s_agent(node, control.private_ip, k3s_token, ctx)
 
     log("=== Labeling and Tainting Nodes ===")
     label_and_taint_nodes(ctx)
 
     log("=== Installing Storage Provisioner ===")
-    install_local_path_provisioner(client, ctx)
+    install_local_path_provisioner(control, ctx)
 
     if ctx.multi_az:
-        label_control_plane_zone(client, ctx)
+        label_control_plane_zone(control, ctx)
 
     # -----------------------------------------------------------------------
     # TiDB Operator + Cluster
     # -----------------------------------------------------------------------
     log("=== Installing Helm ===")
-    install_helm(client, ctx)
+    install_helm(control, ctx)
 
     log("=== Installing TiDB Operator ===")
-    install_tidb_operator(client, ctx)
+    install_tidb_operator(control, ctx)
 
     log("=== Deploying TiDB Cluster ===")
-    deploy_tidb_cluster(client, ctx)
-    wait_for_tidb_ready(client, ctx)
+    deploy_tidb_cluster(control, ctx)
+    wait_for_tidb_ready(control, ctx)
 
     # -----------------------------------------------------------------------
-    # Client Tools
+    # Sysbench Database
     # -----------------------------------------------------------------------
-    log("=== Installing Client Tools ===")
-    install_mysql_client(client, ctx)
-    install_sysbench(client, ctx)
-    create_sysbench_database(client, ctx)
+    create_sysbench_database(control, ctx)
 
     if ctx.multi_az:
         log("=== Configuring Leader Zone Affinity ===")
-        configure_leader_zone_affinity(client, ctx)
+        configure_leader_zone_affinity(control, ctx)
 
     if ctx.enable_ticdc:
         log("=== Deploying Downstream TiDB Cluster ===")
-        deploy_downstream_cluster(client, ctx)
-        wait_for_downstream_ready(client, ctx)
+        deploy_downstream_cluster(control, ctx)
+        wait_for_downstream_ready(control, ctx)
 
         log("=== Creating TiCDC Changefeed ===")
-        create_ticdc_changefeed(client, ctx)
+        create_ticdc_changefeed(control, ctx)
 
     # -----------------------------------------------------------------------
     # Done
     # -----------------------------------------------------------------------
     log("=== Deployment Complete ===")
     log("")
-    log(f"SSH to client: ssh -i {key_path} ec2-user@{client.public_ip}")
+    log(f"SSH to control: ssh -i {key_path} ec2-user@{control.public_ip}")
     log("")
 
-    # Determine TiDB endpoint for the user
-    tidb_node_ip = tidb_nodes[0].public_ip if tidb_nodes else client.public_ip
+    tidb_node_ip = tidb_nodes[0].public_ip if tidb_nodes else control.public_ip
     log(f"TiDB accessible via NodePort: {tidb_node_ip}:30400")
     log("")
-    log("From the client host, connect to TiDB:")
+    log("From the control host, connect to TiDB:")
     log(f"  TIDB_HOST=$(kubectl get svc basic-tidb -n tidb-cluster -o jsonpath='{{.spec.clusterIP}}')")
     log(f"  mysql -h $TIDB_HOST -P 4000 -u root")
     log("")
@@ -1542,9 +1491,12 @@ def main():
     log("  kubectl get nodes -o wide")
     log("  kubectl get pods -n tidb-cluster -o wide")
     log("  kubectl get tc -n tidb-cluster")
+    log("")
+    log("Next: provision a benchmark client in this VPC:")
+    log(f"  python3 -m common.client --seed {args.seed} --server-type tidb --size small")
 
     if ctx.enable_ticdc:
-        ds_tidb_ip = ds_tidb_nodes[0].public_ip if ds_tidb_nodes else client.public_ip
+        ds_tidb_ip = ds_tidb_nodes[0].public_ip if ds_tidb_nodes else control.public_ip
         log("")
         log(f"Downstream TiDB via NodePort: {ds_tidb_ip}:{DOWNSTREAM_NODEPORT}")
         log(f"  kubectl get pods -n {DOWNSTREAM_NAMESPACE} -o wide")
