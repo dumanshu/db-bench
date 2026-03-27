@@ -141,8 +141,8 @@ def _section_all_runs(lines, runs):
 
     lines.append("## All Runs")
     lines.append("")
-    lines.append("| Workload | Instance | Threads | Duration (s) | TPS | QPS | P95 (ms) | P99 (ms) |")
-    lines.append("|----------|----------|--------:|-------------:|----:|----:|---------:|---------:|")
+    lines.append("| Workload | Instance | Threads | Duration (s) | TPS | QPS | Client P95 (ms) | Client P99 (ms) |")
+    lines.append("|----------|----------|--------:|-------------:|----:|----:|----------------:|----------------:|")
 
     for r in runs:
         workload = r.get("workload", "unknown")
@@ -155,8 +155,8 @@ def _section_all_runs(lines, runs):
         qps = tp.get("qps", r.get("qps", None))
 
         lat = r.get("latency", {})
-        p95 = lat.get("p95_ms", r.get("latency_p95_ms", None))
-        p99 = lat.get("p99_ms", r.get("latency_p99_ms", None))
+        p95 = lat.get("p95_ms", lat.get("p95", r.get("latency_p95_ms", None)))
+        p99 = lat.get("p99_ms", lat.get("p99", r.get("latency_p99_ms", None)))
 
         lines.append(
             f"| {workload} | {instance} | {threads} | {duration} "
@@ -187,6 +187,147 @@ def _section_iud_breakdown(lines, runs):
             f"| {_fmti(iud.get('read_per_sec'))} "
             f"| {_fmti(iud.get('total_iud_per_sec'))} "
             f"| {_fmti(iud.get('commits_per_sec'))} |"
+        )
+    lines.append("")
+
+
+def _section_server_latency(lines, runs):
+    cw_runs = [r for r in runs if r.get("cloudwatch")]
+    if not cw_runs:
+        return
+
+    latency_keys_avg = [
+        ("Commit", "aurora_commit_latency_ms"),
+        ("DML", "aurora_dml_latency_ms"),
+        ("Select", "aurora_select_latency_ms"),
+        ("Write", "aurora_write_latency_ms"),
+        ("Insert", "aurora_insert_latency_ms"),
+        ("Update", "aurora_update_latency_ms"),
+        ("Delete", "aurora_delete_latency_ms"),
+    ]
+    latency_keys_p99 = [
+        ("Commit", "aurora_commit_latency_p99_ms"),
+        ("DML", "aurora_dml_latency_p99_ms"),
+        ("Select", "aurora_select_latency_p99_ms"),
+        ("Write", "aurora_write_latency_p99_ms"),
+        ("Insert", "aurora_insert_latency_p99_ms"),
+        ("Update", "aurora_update_latency_p99_ms"),
+        ("Delete", "aurora_delete_latency_p99_ms"),
+    ]
+
+    header_parts = ["| Instance | Threads"]
+    for label, _ in latency_keys_avg:
+        header_parts.append(f"{label} Avg (ms)")
+    for label, _ in latency_keys_p99:
+        header_parts.append(f"{label} P99 (ms)")
+    header = " | ".join(header_parts) + " |"
+
+    sep_parts = ["|----------|--------:"]
+    for _ in latency_keys_avg + latency_keys_p99:
+        sep_parts.append("-----------:")
+    sep = "|".join(sep_parts) + "|"
+
+    has_data = False
+    data_lines = []
+    for r in cw_runs:
+        cw = r.get("cloudwatch", {})
+        vals_avg = [cw.get(k) for _, k in latency_keys_avg]
+        vals_p99 = [cw.get(k) for _, k in latency_keys_p99]
+        if any(v is not None for v in vals_avg + vals_p99):
+            has_data = True
+            instance = r.get("instance_type", "")
+            threads = r.get("threads", "")
+            cells = [f"| {instance} | {threads}"]
+            for v in vals_avg + vals_p99:
+                cells.append(_fmt(v, 3))
+            data_lines.append(" | ".join(cells) + " |")
+
+    if not has_data:
+        return
+
+    lines.append("## Server-Side Latency (CloudWatch)")
+    lines.append("")
+    lines.append(header)
+    lines.append(sep)
+    lines.extend(data_lines)
+    lines.append("")
+
+
+def _section_node_resources(lines, runs):
+    """Per-node resource utilization summary (CPU, memory, network)."""
+    if not runs:
+        return
+
+    # Collect per-node data across all runs
+    nodes = {}  # role -> {instance, cpu_vals, mem_vals, net_rx_vals, net_tx_vals}
+
+    for r in runs:
+        cw = r.get("cloudwatch", {})
+
+        # DB Server node
+        db_inst = r.get("aurora_instance_type", r.get("instance_type", ""))
+        if db_inst:
+            node = nodes.setdefault("DB Server", {
+                "instance": db_inst, "cpu": [], "mem": [], "net_rx": [], "net_tx": [],
+            })
+            cpu = r.get("aurora_cpu_avg_pct") or cw.get("aurora_cpu_avg_pct")
+            if cpu is not None:
+                node["cpu"].append(cpu)
+            mem_free = cw.get("aurora_freeable_memory_mb")
+            if mem_free is not None:
+                node["mem"].append(mem_free)
+            rx = r.get("aurora_net_recv_mbps") or cw.get("aurora_network_receive_tp")
+            if rx is not None:
+                node["net_rx"].append(rx)
+            tx = r.get("aurora_net_xmit_mbps") or cw.get("aurora_network_transmit_tp")
+            if tx is not None:
+                node["net_tx"].append(tx)
+
+        # Client node
+        client_inst = r.get("ec2_instance_type", "")
+        if client_inst:
+            node = nodes.setdefault("Client", {
+                "instance": client_inst, "cpu": [], "mem": [], "net_rx": [], "net_tx": [],
+            })
+            cpu = r.get("client_cpu_avg_pct") or cw.get("ec2_cpu_avg_pct")
+            if cpu is not None:
+                node["cpu"].append(cpu)
+            rx = cw.get("ec2_network_in_mbps")
+            if rx is not None:
+                node["net_rx"].append(rx)
+            tx = cw.get("ec2_network_out_mbps")
+            if tx is not None:
+                node["net_tx"].append(tx)
+
+    if not nodes:
+        return
+
+    lines.append("## Node Resource Utilization")
+    lines.append("")
+    lines.append("| Node | Instance | CPU Avg (%) | Memory | Net Rx (Mbps) | Net Tx (Mbps) |")
+    lines.append("|------|----------|------------:|-------:|--------------:|--------------:|")
+
+    for role in ("DB Server", "Client"):
+        n = nodes.get(role)
+        if not n:
+            continue
+        inst = n["instance"]
+        cpu_avg = sum(n["cpu"]) / len(n["cpu"]) if n["cpu"] else None
+        rx_avg = sum(n["net_rx"]) / len(n["net_rx"]) if n["net_rx"] else None
+        tx_avg = sum(n["net_tx"]) / len(n["net_tx"]) if n["net_tx"] else None
+
+        # Memory: DB shows freeable (GB), client shows used from INSTANCE_PRICING
+        if role == "DB Server" and n["mem"]:
+            mem_avg_mb = sum(n["mem"]) / len(n["mem"])
+            mem_str = f"{mem_avg_mb / 1024:.1f} GB free"
+        elif inst in INSTANCE_PRICING:
+            mem_str = f"{INSTANCE_PRICING[inst]['mem_gb']} GB"
+        else:
+            mem_str = "N/A"
+
+        lines.append(
+            f"| {role} | {inst} | {_fmt(cpu_avg, 1)} "
+            f"| {mem_str} | {_fmt(rx_avg, 1)} | {_fmt(tx_avg, 1)} |"
         )
     lines.append("")
 
@@ -272,6 +413,8 @@ def generate_report(results_dir, server_type, output_path=None) -> str:
     lines.append("---")
     lines.append("")
     _section_iud_breakdown(lines, runs)
+    _section_server_latency(lines, runs)
+    _section_node_resources(lines, runs)
     _section_instance_specs(lines, runs)
     lines.append("---")
     lines.append("")
@@ -425,7 +568,7 @@ def print_summary(results, server_type) -> None:
     log("=" * 100)
     log(f"BENCHMARK SUMMARY ({server_type.upper()})")
     log("=" * 100)
-    log(f"{'Workload':<22} {'Inst':<22} {'Thr':>5} {'Dur':>5} {'TPS':>10} {'QPS':>10} {'P95':>8} {'P99':>8}")
+    log(f"{'Workload':<22} {'Inst':<22} {'Thr':>5} {'Dur':>5} {'TPS':>10} {'QPS':>10} {'Cl P95':>8} {'Cl P99':>8}")
     log("-" * 100)
 
     for r in results:
@@ -439,8 +582,8 @@ def print_summary(results, server_type) -> None:
         qps = tp.get("qps", r.get("qps", 0))
 
         lat = r.get("latency", {})
-        p95 = lat.get("p95_ms", r.get("latency_p95_ms", 0))
-        p99 = lat.get("p99_ms", r.get("latency_p99_ms", 0))
+        p95 = lat.get("p95_ms", lat.get("p95", r.get("latency_p95_ms", 0)))
+        p99 = lat.get("p99_ms", lat.get("p99", r.get("latency_p99_ms", 0)))
 
         p95_s = f"{p95:.1f}" if isinstance(p95, (int, float)) and p95 > 0 else "N/A"
         p99_s = f"{p99:.1f}" if isinstance(p99, (int, float)) and p99 > 0 else "N/A"
@@ -461,6 +604,63 @@ def print_summary(results, server_type) -> None:
     )
     log(f"Duration: {total_dur}s | Avg TPS: {avg_tps:,.1f} | Peak TPS: {peak_tps:,.1f}")
     log("=" * 100)
+
+    cw_runs = [r for r in results if r.get("cloudwatch")]
+    if cw_runs:
+        sv_keys = [
+            ("Commit Avg", "aurora_commit_latency_ms"),
+            ("Commit P99", "aurora_commit_latency_p99_ms"),
+            ("DML Avg", "aurora_dml_latency_ms"),
+            ("DML P99", "aurora_dml_latency_p99_ms"),
+        ]
+        has_any = any(
+            r.get("cloudwatch", {}).get(k) is not None
+            for r in cw_runs for _, k in sv_keys
+        )
+        if has_any:
+            log("")
+            log("SERVER-SIDE LATENCY (CloudWatch):")
+            log("-" * 100)
+            hdr = f"{'Workload':<22} {'Inst':<22}"
+            for label, _ in sv_keys:
+                hdr += f" {label:>12}"
+            log(hdr)
+            log("-" * 100)
+            for r in cw_runs:
+                cw = r.get("cloudwatch", {})
+                row = f"{r.get('workload', 'unknown'):<22} {r.get('instance_type', ''):<22}"
+                for _, k in sv_keys:
+                    v = cw.get(k)
+                    row += f" {_fmt(v, 3):>12}" if v is not None else f" {'N/A':>12}"
+                log(row)
+            log("=" * 100)
+
+    last = results[-1]
+    db_inst = last.get("aurora_instance_type", last.get("instance_type", ""))
+    client_inst = last.get("ec2_instance_type", "")
+    if db_inst or client_inst:
+        log("")
+        log("NODE RESOURCES:")
+        log("-" * 100)
+        log(f"{'Node':<12} {'Instance':<22} {'CPU %':>8} {'Memory':>14} {'Net Rx Mbps':>14} {'Net Tx Mbps':>14}")
+        log("-" * 100)
+        if db_inst:
+            cpu_vals = [v for v in (r.get("aurora_cpu_avg_pct") for r in results) if isinstance(v, (int, float))]
+            cpu_s = f"{sum(cpu_vals) / len(cpu_vals):.1f}" if cpu_vals else "N/A"
+            mem_vals = [v for v in (r.get("cloudwatch", {}).get("aurora_freeable_memory_mb") for r in results) if isinstance(v, (int, float))]
+            mem_s = f"{sum(mem_vals) / len(mem_vals) / 1024:.1f}GB free" if mem_vals else "N/A"
+            rx_vals = [v for v in (r.get("aurora_net_recv_mbps") for r in results) if isinstance(v, (int, float))]
+            rx_s = f"{sum(rx_vals) / len(rx_vals):.1f}" if rx_vals else "N/A"
+            tx_vals = [v for v in (r.get("aurora_net_xmit_mbps") for r in results) if isinstance(v, (int, float))]
+            tx_s = f"{sum(tx_vals) / len(tx_vals):.1f}" if tx_vals else "N/A"
+            log(f"{'DB Server':<12} {db_inst:<22} {cpu_s:>8} {mem_s:>14} {rx_s:>14} {tx_s:>14}")
+        if client_inst:
+            cpu_vals = [v for v in (r.get("client_cpu_avg_pct") for r in results) if isinstance(v, (int, float))]
+            cpu_s = f"{sum(cpu_vals) / len(cpu_vals):.1f}" if cpu_vals else "N/A"
+            spec = INSTANCE_PRICING.get(client_inst, {})
+            mem_s = f"{spec['mem_gb']}GB" if spec else "N/A"
+            log(f"{'Client':<12} {client_inst:<22} {cpu_s:>8} {mem_s:>14} {'N/A':>14} {'N/A':>14}")
+        log("=" * 100)
 
 
 def save_results(results, output_dir, label) -> Path:

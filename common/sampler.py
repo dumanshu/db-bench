@@ -88,6 +88,25 @@ def read_memory():
     }
 '''
 
+_SAMPLER_NET_FN = '''
+def read_net_bytes():
+    """Read total rx/tx bytes across all non-lo interfaces from /proc/net/dev."""
+    rx_total = 0
+    tx_total = 0
+    with open("/proc/net/dev") as f:
+        for line in f:
+            if ":" not in line:
+                continue
+            iface, data = line.split(":", 1)
+            iface = iface.strip()
+            if iface == "lo":
+                continue
+            cols = data.split()
+            rx_total += int(cols[0])   # bytes received
+            tx_total += int(cols[8])   # bytes transmitted
+    return {"net_rx_bytes": rx_total, "net_tx_bytes": tx_total}
+'''
+
 _SAMPLER_MYSQL_FN = '''
 MYSQL_HOST = "{mysql_host}"
 MYSQL_USER = "{mysql_user}"
@@ -164,6 +183,7 @@ _SAMPLER_MAIN_COMMON_FIELDS = [
     "cpu_user", "cpu_nice", "cpu_system", "cpu_idle",
     "cpu_iowait", "cpu_irq", "cpu_softirq", "cpu_steal",
     "mem_total_mb", "mem_avail_mb", "mem_buffers_mb", "mem_cached_mb",
+    "net_rx_bytes", "net_tx_bytes",
 ]
 
 _SAMPLER_MYSQL_FIELDS = [
@@ -228,6 +248,7 @@ def main():
             epoch = int(time.time())
             cpu = read_cpu_jiffies()
             mem = read_memory()
+            net = read_net_bytes()
             row = {{
                 "epoch": epoch,
                 "cpu_user": cpu["user"],
@@ -242,6 +263,8 @@ def main():
                 "mem_avail_mb": mem["mem_avail_mb"],
                 "mem_buffers_mb": mem["mem_buffers_mb"],
                 "mem_cached_mb": mem["mem_cached_mb"],
+                "net_rx_bytes": net["net_rx_bytes"],
+                "net_tx_bytes": net["net_tx_bytes"],
             }}{collect_extra}
             w.writerow(row)
             f.flush()
@@ -270,6 +293,7 @@ def generate_sampler_script(server_type, interval=5,
         ),
         _SAMPLER_CPU_FN,
         _SAMPLER_MEM_FN,
+        _SAMPLER_NET_FN,
     ]
 
     if server_type in ("aurora", "tidb"):
@@ -378,17 +402,24 @@ def parse_metrics_csv(csv_path):
 # ---------------------------------------------------------------------------
 
 def parse_interval_lines(output):
+    """Parse sysbench interval report lines.
+
+    The regex captures whichever percentile sysbench was configured to
+    report (``--percentile=99`` produces ``lat (ms,99%)``).
+    """
     intervals = []
     for line in output.splitlines():
         m = re.match(
             r"\[\s*([\d.]+)s\s*\]\s+thds:\s+(\d+)\s+"
             r"tps:\s+([\d.]+)\s+qps:\s+([\d.]+)\s+"
             r"\(r/w/o:\s+([\d.]+)/([\d.]+)/([\d.]+)\)\s+"
-            r"lat\s+\(ms,\s*95%\):\s+([\d.]+)\s+"
+            r"lat\s+\(ms,\s*(\d+)%\):\s+([\d.]+)\s+"
             r"err/s:\s+([\d.]+)",
             line,
         )
         if m:
+            pct = int(m.group(8))
+            val = float(m.group(9))
             intervals.append({
                 "time_s": float(m.group(1)),
                 "threads": int(m.group(2)),
@@ -397,8 +428,9 @@ def parse_interval_lines(output):
                 "read_qps": float(m.group(5)),
                 "write_qps": float(m.group(6)),
                 "other_qps": float(m.group(7)),
-                "p95_ms": float(m.group(8)),
-                "err_s": float(m.group(9)),
+                "latency_pct": pct,
+                "latency_pct_ms": val,
+                "err_s": float(m.group(10)),
             })
     return intervals
 
@@ -570,11 +602,28 @@ def derive_interval_metrics(metrics_rows, window_epoch_start, window_epoch_end,
         if total is not None and avail is not None:
             mem_used = total - avail
 
+        # Network throughput (bytes/sec) from cumulative counters
+        dt = (epoch or 0) - (prev.get("epoch") or 0)
+        if dt <= 0:
+            dt = 5
+        net_rx_bps = None
+        net_tx_bps = None
+        rx_curr = curr.get("net_rx_bytes")
+        rx_prev = prev.get("net_rx_bytes")
+        tx_curr = curr.get("net_tx_bytes")
+        tx_prev = prev.get("net_tx_bytes")
+        if rx_curr is not None and rx_prev is not None:
+            net_rx_bps = (rx_curr - rx_prev) / dt
+        if tx_curr is not None and tx_prev is not None:
+            net_tx_bps = (tx_curr - tx_prev) / dt
+
         cpu_samples.append({
             "epoch": epoch,
             "client_cpu_pct": cpu_pct,
             "client_mem_used_mb": mem_used,
             "client_mem_total_mb": total,
+            "client_net_rx_mbps": round(net_rx_bps / 1_000_000, 2) if net_rx_bps is not None else None,
+            "client_net_tx_mbps": round(net_tx_bps / 1_000_000, 2) if net_tx_bps is not None else None,
         })
 
         if server_type in ("aurora", "tidb"):
@@ -594,11 +643,13 @@ def build_interval_data(window_intervals, cpu_samples, db_samples,
     rows = []
     for iv in window_intervals:
         iv_epoch = run_start_epoch + iv["time_s"]
+        pct = iv.get("latency_pct", 95)
         entry = {
             "time_s": iv["time_s"],
             "tps": iv["tps"],
             "qps": iv["qps"],
-            "p95_latency_ms": iv["p95_ms"],
+            "client_latency_pct": pct,
+            "client_latency_pct_ms": iv["latency_pct_ms"],
             "err_s": iv["err_s"],
         }
 
@@ -612,6 +663,8 @@ def build_interval_data(window_intervals, cpu_samples, db_samples,
         if closest_cpu:
             entry["client_cpu_pct"] = closest_cpu.get("client_cpu_pct")
             entry["client_mem_used_mb"] = closest_cpu.get("client_mem_used_mb")
+            entry["client_net_rx_mbps"] = closest_cpu.get("client_net_rx_mbps")
+            entry["client_net_tx_mbps"] = closest_cpu.get("client_net_tx_mbps")
 
         rows.append(entry)
     return rows
@@ -638,6 +691,15 @@ _CW_AURORA_QUERIES = [
     ("aurora_delete_latency_ms", "AWS/RDS", "DeleteLatency", "Average"),
     ("aurora_select_latency_ms", "AWS/RDS", "SelectLatency", "Average"),
     ("aurora_ddl_latency_ms", "AWS/RDS", "DDLLatency", "Average"),
+    # Server-side p99 latencies via CloudWatch ExtendedStatistics
+    ("aurora_write_latency_p99_ms", "AWS/RDS", "WriteLatency", "p99"),
+    ("aurora_commit_latency_p99_ms", "AWS/RDS", "CommitLatency", "p99"),
+    ("aurora_dml_latency_p99_ms", "AWS/RDS", "DMLLatency", "p99"),
+    ("aurora_insert_latency_p99_ms", "AWS/RDS", "InsertLatency", "p99"),
+    ("aurora_update_latency_p99_ms", "AWS/RDS", "UpdateLatency", "p99"),
+    ("aurora_delete_latency_p99_ms", "AWS/RDS", "DeleteLatency", "p99"),
+    ("aurora_select_latency_p99_ms", "AWS/RDS", "SelectLatency", "p99"),
+    ("aurora_ddl_latency_p99_ms", "AWS/RDS", "DDLLatency", "p99"),
     ("aurora_queries", "AWS/RDS", "Queries", "Average"),
     ("aurora_active_transactions", "AWS/RDS", "ActiveTransactions", "Average"),
     ("aurora_engine_uptime", "AWS/RDS", "EngineUptime", "Average"),
@@ -695,6 +757,10 @@ def _cw_transform_value(key, value):
     return round(value, 2)
 
 
+def _is_extended_stat(stat):
+    return stat.startswith("p") and stat[1:].replace(".", "").isdigit()
+
+
 def query_cloudwatch_metrics(server_type, resource_id, start_epoch, end_epoch,
                              region=None, profile=None):
     queries = _cw_queries_for_server_type(server_type)
@@ -711,19 +777,30 @@ def query_cloudwatch_metrics(server_type, resource_id, start_epoch, end_epoch,
     metrics = {}
     for key, namespace, metric_name, stat in queries:
         try:
-            resp = cw.get_metric_statistics(
+            extended = _is_extended_stat(stat)
+            kwargs = dict(
                 Namespace=namespace,
                 MetricName=metric_name,
                 Dimensions=dimensions,
                 StartTime=start_dt,
                 EndTime=end_dt,
                 Period=60,
-                Statistics=[stat],
             )
+            if extended:
+                kwargs["ExtendedStatistics"] = [stat]
+            else:
+                kwargs["Statistics"] = [stat]
+
+            resp = cw.get_metric_statistics(**kwargs)
             points = resp.get("Datapoints", [])
             if points:
-                val = sum(p[stat] for p in points) / len(points)
-                metrics[key] = _cw_transform_value(key, val)
+                if extended:
+                    vals = [p["ExtendedStatistics"][stat] for p in points
+                            if stat in p.get("ExtendedStatistics", {})]
+                    val = sum(vals) / len(vals) if vals else None
+                else:
+                    val = sum(p[stat] for p in points) / len(points)
+                metrics[key] = _cw_transform_value(key, val) if val is not None else None
             else:
                 metrics[key] = None
         except Exception:
@@ -759,15 +836,25 @@ def analyze_window(sysbench_text, csv_path, run_start_epoch,
         server_type=server_type,
     )
 
+    latency_vals = [iv["latency_pct_ms"] for iv in window_intervals]
+    latency_pct = window_intervals[0]["latency_pct"] if window_intervals else 99
+
     ws = {
         "tps": safe_stats([iv["tps"] for iv in window_intervals]),
         "qps": safe_stats([iv["qps"] for iv in window_intervals]),
-        "p95_latency_ms": safe_stats([iv["p95_ms"] for iv in window_intervals]),
+        "client_latency_pct": latency_pct,
+        "client_latency_pct_ms": safe_stats(latency_vals),
         "client_cpu_pct": safe_stats(
             [r.get("client_cpu_pct") for r in cpu_samples]
         ),
         "client_mem_used_mb": safe_stats(
             [r.get("client_mem_used_mb") for r in cpu_samples]
+        ),
+        "client_net_rx_mbps": safe_stats(
+            [r.get("client_net_rx_mbps") for r in cpu_samples]
+        ),
+        "client_net_tx_mbps": safe_stats(
+            [r.get("client_net_tx_mbps") for r in cpu_samples]
         ),
     }
 
@@ -788,6 +875,23 @@ def analyze_window(sysbench_text, csv_path, run_start_epoch,
             server_type, resource_id, cw_start, cw_end,
             region=region, profile=profile,
         )
+
+    server_latency = {}
+    server_resources = {}
+    for cw_key, cw_val in cloudwatch.items():
+        if cw_val is None:
+            continue
+        if "latency" in cw_key:
+            label = cw_key.replace("aurora_", "server_").replace("cache_", "server_")
+            server_latency[label] = cw_val
+        elif "cpu" in cw_key or "memory" in cw_key or "freeable" in cw_key:
+            server_resources[cw_key] = cw_val
+        elif "network" in cw_key:
+            server_resources[cw_key] = cw_val
+    if server_latency:
+        ws["server_latency"] = server_latency
+    if server_resources:
+        ws["server_resources"] = server_resources
 
     return {
         "summary": summary,
