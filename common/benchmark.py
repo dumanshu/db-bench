@@ -37,7 +37,7 @@ def _load_bench_client(seed):
 # Constants
 # ---------------------------------------------------------------------------
 
-MYSQL_IGNORE_ERRORS = "1062,8002,8028,8249"
+MYSQL_IGNORE_ERRORS = "1062,1213,8002,8028,8249"
 BYTES_PER_ROW = 250
 DATA_TO_RAM_RATIO = 5
 

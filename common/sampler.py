@@ -550,11 +550,15 @@ def parse_sysbench_summary(output):
     m = re.search(r"other:\s+(\d+)", output)
     if m:
         result["other"] = int(m.group(1))
-    for pct in ["min", "avg", "max", "95th percentile"]:
-        key = pct.replace(" ", "_").replace("percentile", "pct")
-        m = re.search(rf"{re.escape(pct)}:\s+([\d.]+)", output)
+    for label in ["min", "avg", "max"]:
+        m = re.search(rf"{re.escape(label)}:\s+([\d.]+)", output)
         if m:
-            result[f"latency_{key}_ms"] = float(m.group(1))
+            result[f"latency_{label}_ms"] = float(m.group(1))
+    # Capture whichever percentile sysbench was configured to report
+    m = re.search(r"(\d+)th percentile:\s+([\d.]+)", output)
+    if m:
+        pct_num = int(m.group(1))
+        result[f"latency_{pct_num}th_pct_ms"] = float(m.group(2))
     return result
 
 

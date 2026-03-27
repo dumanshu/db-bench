@@ -243,8 +243,8 @@ def generate_memtier_script(params: dict) -> tuple[str, str]:
     ts = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
     results_dir = f"{_RESULTS_BASE}/{ts}"
 
-    target_host = params["target_host"]
-    target_port = params["target_port"]
+    target_host = params.get("target_host") or params["endpoint"]
+    target_port = params.get("target_port") or params.get("port", 6379)
     tests = params.get("tests", 3)
     operations = params.get("operations", 100000)
     clients = params.get("clients", 50)
