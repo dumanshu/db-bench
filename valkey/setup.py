@@ -765,30 +765,15 @@ if command -v mtr >/dev/null 2>&1; then
 else
   sudo $PKG -y install mtr || true
 fi
-sudo tee /etc/security/limits.d/99-valkey-nofile.conf >/dev/null <<'EOF'
-* soft nofile 65535
-* hard nofile 65535
-root soft nofile 65535
-root hard nofile 65535
-EOF
-sudo bash -c 'set -euo pipefail
-CURRENT=$(cat /proc/sys/fs/file-max)
-TARGET=65535
-if [ "$CURRENT" -lt "$TARGET" ]; then
-  VALUE=$TARGET
-else
-  VALUE=$CURRENT
-fi
-cat >/etc/sysctl.d/99-valkey-fd.conf <<EOF
-fs.file-max = $VALUE
-EOF
-sysctl -q -p /etc/sysctl.d/99-valkey-fd.conf || true'
-sudo tee /etc/sysctl.d/99-valkey-perf.conf >/dev/null <<'EOF'
-kernel.perf_event_paranoid = -1
-kernel.kptr_restrict = 0
-EOF
-sudo sysctl -q -p /etc/sysctl.d/99-valkey-perf.conf || true
 """, ctx)
+
+    from common.client import system_tuning_script
+    extra = """\
+kernel.perf_event_paranoid = -1
+kernel.kptr_restrict = 0"""
+    ssh_run(host, system_tuning_script(
+        extra_sysctl=extra, conf_name="valkey-bench",
+    ), ctx)
 
 
 def build_valkey_binaries_on_bastion(bastion: InstanceInfo, remote_tar: str, ctx: BootstrapContext):

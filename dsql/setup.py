@@ -311,44 +311,17 @@ def load_state():
 # ---------------------------------------------------------------------------
 
 def bootstrap_client(ctx: BootstrapContext):
-    """Install pgbench, psql, and sysctl tuning on the client VM."""
     log("Bootstrapping client VM...")
 
-    # Install PostgreSQL 16 client tools (includes pgbench and psql)
     ssh_run(ctx.client, """
 sudo dnf -y update || true
 sudo dnf -y install postgresql16 postgresql16-contrib jq htop sysstat || true
-
-# Verify pgbench is available
 pgbench --version
 psql --version
-
-# Sysctl tuning for high-throughput benchmarks
-sudo tee /etc/sysctl.d/99-dsql-bench.conf >/dev/null <<'SYSEOF'
-# File descriptor limits
-fs.file-max = 1048576
-fs.nr_open = 1048576
-
-# Network tuning for high-throughput benchmarks
-net.core.somaxconn = 65535
-net.core.netdev_max_backlog = 65535
-net.core.rmem_max = 16777216
-net.core.wmem_max = 16777216
-net.ipv4.tcp_rmem = 4096 87380 16777216
-net.ipv4.tcp_wmem = 4096 65536 16777216
-net.ipv4.tcp_max_syn_backlog = 65535
-net.ipv4.tcp_fin_timeout = 15
-net.ipv4.tcp_tw_reuse = 1
-net.ipv4.ip_local_port_range = 1024 65535
-SYSEOF
-sudo sysctl --system >/dev/null 2>&1 || true
-
-# Raise open file limits for ec2-user
-sudo tee /etc/security/limits.d/99-bench.conf >/dev/null <<'LIMEOF'
-ec2-user  soft  nofile  1048576
-ec2-user  hard  nofile  1048576
-LIMEOF
 """, ctx)
+
+    from common.client import system_tuning_script
+    ssh_run(ctx.client, system_tuning_script(conf_name="dsql-bench"), ctx)
 
     # Verify connectivity to DSQL endpoint
     if ctx.dsql_endpoint:

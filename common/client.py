@@ -30,6 +30,57 @@ from common.util import log, ts
 from common.ssh import ssh_run_simple, wait_for_ssh_simple
 
 # ---------------------------------------------------------------------------
+# System tuning (sysctl + file limits) -- shared across all benchmarks
+# ---------------------------------------------------------------------------
+
+def system_tuning_script(extra_sysctl="", conf_name="db-bench"):
+    """Return a shell script that applies sysctl and file-limit tuning.
+
+    Parameters
+    ----------
+    extra_sysctl : str
+        Additional sysctl key=value lines to append (e.g. k8s bridge-nf
+        settings, perf_event_paranoid).  Blank lines / comments are fine.
+    conf_name : str
+        Base name used for the config files written under
+        ``/etc/sysctl.d/99-{conf_name}.conf`` and
+        ``/etc/security/limits.d/99-{conf_name}.conf``.
+    """
+    extra = extra_sysctl.rstrip()
+    extra_block = f"\n{extra}\n" if extra else ""
+    return f"""\
+# --- db-bench system tuning ({conf_name}) ---
+sudo tee /etc/sysctl.d/99-{conf_name}.conf >/dev/null <<'SYSEOF'
+# File descriptor limits
+fs.file-max = 1048576
+fs.nr_open = 1048576
+
+# Network tuning for high-throughput benchmarks
+net.core.somaxconn = 65535
+net.core.netdev_max_backlog = 65535
+net.core.rmem_max = 16777216
+net.core.wmem_max = 16777216
+net.ipv4.tcp_rmem = 4096 87380 16777216
+net.ipv4.tcp_wmem = 4096 65536 16777216
+net.ipv4.tcp_max_syn_backlog = 65535
+net.ipv4.tcp_fin_timeout = 15
+net.ipv4.tcp_tw_reuse = 1
+net.ipv4.ip_local_port_range = 1024 65535{extra_block}SYSEOF
+sudo sysctl --system >/dev/null 2>&1 || true
+
+# Raise open file / process limits
+sudo tee /etc/security/limits.d/99-{conf_name}.conf >/dev/null <<'LIMEOF'
+* soft nofile 1000000
+* hard nofile 1000000
+* soft nproc  65535
+* hard nproc  65535
+root soft nofile 1000000
+root hard nofile 1000000
+LIMEOF
+"""
+
+
+# ---------------------------------------------------------------------------
 # Constants
 # ---------------------------------------------------------------------------
 
@@ -402,38 +453,14 @@ def _install_base_packages(host_ip, key_path, timeout=300):
 
 def _tune_sysctl(host_ip, key_path):
     log(f"  Tuning sysctl on {host_ip}")
-    ssh_run_simple(host_ip, key_path, """
-        sudo tee /etc/sysctl.d/99-db-bench.conf >/dev/null <<'SYSCTL'
-        fs.file-max = 1048576
-        fs.nr_open = 1048576
+    extra = """\
+net.ipv4.ip_forward = 1
 
-        net.core.somaxconn = 65535
-        net.core.netdev_max_backlog = 65535
-        net.core.rmem_max = 16777216
-        net.core.wmem_max = 16777216
-        net.ipv4.ip_forward = 1
-        net.ipv4.tcp_rmem = 4096 87380 16777216
-        net.ipv4.tcp_wmem = 4096 65536 16777216
-        net.ipv4.tcp_max_syn_backlog = 65535
-        net.ipv4.tcp_fin_timeout = 15
-        net.ipv4.tcp_tw_reuse = 1
-        net.ipv4.ip_local_port_range = 1024 65535
-
-        kernel.perf_event_paranoid = -1
-        kernel.kptr_restrict = 0
-SYSCTL
-
-        sudo tee /etc/security/limits.d/99-db-bench.conf >/dev/null <<'LIMITS'
-        * soft nofile 1000000
-        * hard nofile 1000000
-        * soft nproc 65535
-        * hard nproc 65535
-        root soft nofile 1000000
-        root hard nofile 1000000
-LIMITS
-
-        sudo sysctl --system || true
-    """)
+kernel.perf_event_paranoid = -1
+kernel.kptr_restrict = 0"""
+    ssh_run_simple(host_ip, key_path, system_tuning_script(
+        extra_sysctl=extra, conf_name="db-bench",
+    ))
 
 
 def _install_mysql_client(host_ip, key_path, timeout=300):
