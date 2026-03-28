@@ -26,7 +26,8 @@ from pathlib import Path
 import common.util as _cu
 import common.aws as _caws
 from common.util import (
-    ts, log, need_cmd, my_public_cidr, aws_session, ec2, ssm, tags_common,
+    ts, log, need_cmd, my_public_cidr, aws_session, db_session, ec2, ssm,
+    tags_common,
     configure_from_args as _common_configure_from_args,
     BOTO_CONFIG,
 )
@@ -36,6 +37,7 @@ from common.aws import (
     ensure_igw, ensure_subnet, ensure_public_rtb,
     ensure_sg, ensure_ingress_tcp_cidr, refresh_ssh_rule,
     ensure_instance as _common_ensure_instance,
+    ensure_keypair as _common_ensure_keypair,
     instance_info_from_id,
     cleanup_stack as _common_cleanup_stack,
 )
@@ -60,9 +62,9 @@ AMI_SSM_PARAM = os.environ.get(
 )
 _RESOLVED_AMI_ID = None
 
-# Key pair
-KEY_NAME = "dsql-bench-key"
-DEFAULT_SSH_KEY_PATH = Path(__file__).resolve().with_name("dsql-bench-key.pem")
+# Key pair -- reuse tidb key pair (already exists in most benchmark accounts)
+KEY_NAME = "tidb-load-test-key"
+DEFAULT_SSH_KEY_PATH = Path(__file__).resolve().parent.parent / "tidb" / "tidb-load-test-key.pem"
 
 # State file -- persists cluster info between setup / benchmark / validate
 STATE_FILE = Path(__file__).resolve().with_name("dsql-state.json")
@@ -86,7 +88,8 @@ def parse_args():
         help=f"Path to SSH private key (.pem) (default: {DEFAULT_SSH_KEY_PATH}).",
     )
     parser.add_argument("--ssh-cidr", help="CIDR allowed for SSH (default: detected public IP /32).")
-    parser.add_argument("--aws-profile", help="AWS named profile (default: sandbox or $AWS_PROFILE).")
+    parser.add_argument("--aws-profile", help="AWS profile for infrastructure (EC2/VPC).")
+    parser.add_argument("--db-profile", help="AWS profile for database service APIs (default: sandbox-storage).")
     parser.add_argument("--skip-bootstrap", action="store_true", help="Provision infrastructure only.")
     parser.add_argument("--cleanup", action="store_true", help="Tear down stack resources.")
     parser.add_argument(
@@ -138,16 +141,7 @@ def resolved_ami_id():
 
 
 def ensure_keypair_accessible():
-    try:
-        ec2().describe_key_pairs(KeyNames=[KEY_NAME])
-    except botocore.exceptions.ClientError as e:
-        if e.response["Error"]["Code"] == "InvalidKeyPair.NotFound":
-            raise SystemExit(
-                f"ERROR: KeyPair '{KEY_NAME}' not found in EC2. "
-                f"Create it with: aws ec2 import-key-pair --key-name {KEY_NAME} "
-                f"--public-key-material fileb://{KEY_NAME}.pub --profile sandbox"
-            )
-        raise
+    _common_ensure_keypair(KEY_NAME, DEFAULT_SSH_KEY_PATH)
 
 
 # ---------------------------------------------------------------------------
@@ -159,8 +153,13 @@ class BootstrapContext:
     ssh_key_path: Path
     self_cidr: str
     client: InstanceInfo
+    jump_host: InstanceInfo = None  # No jump host for DSQL; set to client
     dsql_cluster_id: str = ""
     dsql_endpoint: str = ""
+
+    def __post_init__(self):
+        if self.jump_host is None:
+            self.jump_host = self.client
 
 
 # ---------------------------------------------------------------------------
@@ -185,7 +184,7 @@ def ensure_instance(name, role, itype, subnet_id, sg_id, root_volume_size=100):
 # ---------------------------------------------------------------------------
 
 def dsql_client():
-    return aws_session().client("dsql", region_name=_cu.REGION, config=BOTO_CONFIG)
+    return db_session().client("dsql", region_name=_cu.REGION, config=BOTO_CONFIG)
 
 
 def create_dsql_cluster(deletion_protection=False):
@@ -318,7 +317,7 @@ def bootstrap_client(ctx: BootstrapContext):
     # Install PostgreSQL 16 client tools (includes pgbench and psql)
     ssh_run(ctx.client, """
 sudo dnf -y update || true
-sudo dnf -y install postgresql16 jq htop sysstat || true
+sudo dnf -y install postgresql16 postgresql16-contrib jq htop sysstat || true
 
 # Verify pgbench is available
 pgbench --version
@@ -411,6 +410,7 @@ def main():
         return
 
     ssh_key_path = Path(args.ssh_key_path).expanduser().resolve()
+    ensure_keypair_accessible()
     if not ssh_key_path.exists():
         raise SystemExit(f"ERROR: SSH key not found: {ssh_key_path}")
 

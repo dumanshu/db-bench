@@ -39,6 +39,7 @@ from common.aws import (
     ensure_sg, ensure_ingress_tcp_cidr, refresh_ssh_rule,
     find_instance_id_by_name, find_all_stack_instances, wait_running,
     ensure_instance as _common_ensure_instance,
+    ensure_keypair as _common_ensure_keypair,
     instance_info_from_id,
     terminate_stack_instances, delete_stack_security_groups,
     delete_route_table_by_name, delete_stack_subnets,
@@ -280,16 +281,7 @@ def resolved_ami_id():
 
 
 def ensure_keypair_accessible():
-    try:
-        ec2().describe_key_pairs(KeyNames=[KEY_NAME])
-    except botocore.exceptions.ClientError as e:
-        if e.response["Error"]["Code"] == "InvalidKeyPair.NotFound":
-            raise SystemExit(
-                f"ERROR: KeyPair '{KEY_NAME}' not found in EC2. "
-                "Create it with: aws ec2 import-key-pair --key-name tidb-load-test-key "
-                "--public-key-material fileb://tidb-load-test-key.pub --profile sandbox"
-            )
-        raise
+    _common_ensure_keypair(KEY_NAME, DEFAULT_SSH_KEY_PATH)
 
 
 # ---------------------------------------------------------------------------

@@ -15,6 +15,7 @@ from pathlib import Path
 
 REGION = "us-east-1"
 AWS_PROFILE = os.environ.get("AWS_PROFILE", "sandbox")
+DB_PROFILE = os.environ.get("DB_PROFILE", "sandbox-storage")
 SEED = ""
 STACK = ""
 OWNER = os.environ.get("OWNER", "")
@@ -30,8 +31,8 @@ SSH_PORT = 22
 
 
 def configure_runtime(*, region=None, seed=None, owner=None, aws_profile=None,
-                       stack_prefix="loadtest"):
-    global REGION, SEED, STACK, AWS_PROFILE, OWNER
+                       db_profile=None, stack_prefix="loadtest"):
+    global REGION, SEED, STACK, AWS_PROFILE, DB_PROFILE, OWNER
     if region:
         REGION = region
     if seed:
@@ -40,6 +41,8 @@ def configure_runtime(*, region=None, seed=None, owner=None, aws_profile=None,
         OWNER = owner
     if aws_profile:
         AWS_PROFILE = aws_profile
+    if db_profile:
+        DB_PROFILE = db_profile
     STACK = f"{stack_prefix}-{SEED}"
 
 
@@ -49,6 +52,7 @@ def configure_from_args(args, stack_prefix="loadtest"):
         seed=args.seed,
         owner=args.owner if args.owner != "" else OWNER,
         aws_profile=args.aws_profile,
+        db_profile=getattr(args, "db_profile", None),
         stack_prefix=stack_prefix,
     )
 
@@ -58,7 +62,11 @@ def add_common_args(parser):
     parser.add_argument("--seed", default=SEED, help="Unique seed used in stack name.")
     parser.add_argument("--owner", default=os.environ.get("OWNER", ""), help="Owner tag value.")
     parser.add_argument("--ssh-cidr", help="CIDR allowed for SSH (default: detected public IP /32).")
-    parser.add_argument("--aws-profile", help="AWS named profile (default: sandbox or $AWS_PROFILE).")
+    parser.add_argument("--aws-profile", help="AWS named profile for infrastructure (EC2/VPC).")
+    parser.add_argument(
+        "--db-profile",
+        help="AWS named profile for database service APIs (default: same as --aws-profile).",
+    )
     parser.add_argument("--skip-bootstrap", action="store_true", help="Provision infrastructure only.")
     parser.add_argument("--cleanup", action="store_true", help="Tear down stack resources.")
 
@@ -98,6 +106,17 @@ def aws_session():
     except botocore.exceptions.ProfileNotFound:
         raise SystemExit(
             f"ERROR: AWS profile '{AWS_PROFILE}' not found. "
+            "Configure it with aws configure or export AWS_PROFILE."
+        )
+
+
+def db_session():
+    profile = DB_PROFILE or AWS_PROFILE
+    try:
+        return boto3.session.Session(profile_name=profile, region_name=REGION)
+    except botocore.exceptions.ProfileNotFound:
+        raise SystemExit(
+            f"ERROR: AWS profile '{profile}' not found. "
             "Configure it with aws configure or export AWS_PROFILE."
         )
 

@@ -31,12 +31,13 @@ import botocore
 DEFAULT_REGION = os.environ.get("AWS_DEFAULT_REGION", "us-east-1")
 DEFAULT_SEED = "dsqllt-001"
 DEFAULT_PROFILE = os.environ.get("AWS_PROFILE", "sandbox")
+DEFAULT_DB_PROFILE = os.environ.get("DB_PROFILE", "sandbox-storage")
 DSQL_PORT = 5432
 
 BOTO_CONFIG = botocore.config.Config(retries={"max_attempts": 6, "mode": "adaptive"})
 
 STATE_FILE = Path(__file__).resolve().with_name("dsql-state.json")
-SSH_KEY_PATH = Path(__file__).resolve().with_name("dsql-bench-key.pem")
+SSH_KEY_PATH = Path(__file__).resolve().parent.parent / "tidb" / "tidb-load-test-key.pem"
 
 
 # ---------------------------------------------------------------------------
@@ -235,12 +236,29 @@ def check_quick_benchmark(client_ip, key_path, endpoint, region, profile):
         c.fail(f"Auth token generation failed: {e}")
         return c
 
-    script = f"""\
+    # DSQL rejects fillfactor, TRUNCATE, and caps writes at ~3500 rows/txn
+    init_script = f"""\
 export PGPASSWORD='{token}'
-pgbench -i -I dtGp -s 1 --no-vacuum -h {endpoint} -p {DSQL_PORT} -U admin -d postgres 2>&1
-echo "INIT_EXIT:$?"
+PSQL="psql -h {endpoint} -p {DSQL_PORT} -U admin -d postgres -v ON_ERROR_STOP=1"
+$PSQL <<'EOSQL'
+DROP TABLE IF EXISTS pgbench_history, pgbench_tellers, pgbench_accounts, pgbench_branches;
+CREATE TABLE pgbench_branches (bid int NOT NULL PRIMARY KEY, bbalance int, filler char(88));
+CREATE TABLE pgbench_tellers  (tid int NOT NULL PRIMARY KEY, bid int, tbalance int, filler char(84));
+CREATE TABLE pgbench_accounts (aid int NOT NULL PRIMARY KEY, bid int, abalance int, filler char(84));
+CREATE TABLE pgbench_history  (tid int, bid int, aid int, delta int, mtime timestamp, filler char(22));
+INSERT INTO pgbench_branches SELECT g, 0, '' FROM generate_series(1, 1) g;
+INSERT INTO pgbench_tellers  SELECT g, (g-1)/10+1, 0, '' FROM generate_series(1, 10) g;
+EOSQL
+if [ $? -ne 0 ]; then echo "INIT_EXIT:1"; exit 0; fi
+BATCH=2000; TOTAL=100000
+for i in $(seq 0 $(( (TOTAL + BATCH - 1) / BATCH - 1 )) ); do
+    s=$(($i * BATCH + 1)); e=$((($i + 1) * BATCH))
+    [ $e -gt $TOTAL ] && e=$TOTAL
+    echo "INSERT INTO pgbench_accounts SELECT g, (g-1)/100000+1, 0, '' FROM generate_series($s, $e) g;"
+done | $PSQL 2>&1
+echo "INIT_EXIT:${{PIPESTATUS[1]:-$?}}"
 """
-    init_output, init_rc = ssh_capture(client_ip, script, key_path, timeout=120)
+    init_output, init_rc = ssh_capture(client_ip, init_script, key_path, timeout=180)
     if "INIT_EXIT:0" not in init_output:
         c.fail(f"pgbench init failed: {init_output[-300:]}")
         return c
@@ -270,7 +288,10 @@ def parse_args():
     parser = argparse.ArgumentParser(description="Validate DSQL load test stack.")
     parser.add_argument("--seed", default=DEFAULT_SEED)
     parser.add_argument("--region", default=DEFAULT_REGION)
-    parser.add_argument("--aws-profile", default=DEFAULT_PROFILE)
+    parser.add_argument("--aws-profile", default=DEFAULT_PROFILE,
+                        help="AWS profile for infrastructure (EC2/VPC).")
+    parser.add_argument("--db-profile", default=DEFAULT_DB_PROFILE,
+                        help="AWS profile for database service APIs (default: sandbox-storage).")
     parser.add_argument(
         "--ssh-key", default=str(SSH_KEY_PATH),
         help=f"SSH private key path (default: {SSH_KEY_PATH}).",
@@ -290,6 +311,7 @@ def main():
     args = parse_args()
     region = args.region
     profile = args.aws_profile
+    db_prof = args.db_profile or args.aws_profile
     key_path = Path(args.ssh_key).expanduser().resolve()
 
     log("=" * 70)
@@ -307,7 +329,7 @@ def main():
     cluster_id = state.get("cluster_id", "")
     endpoint = state.get("endpoint", "")
 
-    checks.append(check_dsql_cluster(state, region, profile))
+    checks.append(check_dsql_cluster(state, region, db_prof))
 
     ec2c = ec2_client(region, profile)
     client_ip = discover_client_ip(state, ec2c)
@@ -327,11 +349,11 @@ def main():
             checks.append(check_psql(client_ip, key_path))
 
             if endpoint:
-                checks.append(check_dsql_connectivity(client_ip, key_path, endpoint, region, profile))
+                checks.append(check_dsql_connectivity(client_ip, key_path, endpoint, region, db_prof))
 
                 if args.quick_bench:
                     checks.append(check_quick_benchmark(
-                        client_ip, key_path, endpoint, region, profile,
+                        client_ip, key_path, endpoint, region, db_prof,
                     ))
 
     log("")

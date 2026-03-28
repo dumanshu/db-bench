@@ -34,6 +34,7 @@ from common.aws import (
     delete_stack_security_groups, delete_route_table_by_name,
     delete_stack_subnets, delete_stack_igw_and_vpc,
     ensure_instance as _common_ensure_instance,
+    ensure_keypair as _common_ensure_keypair,
 )
 from common.ssh import (
     host_target_and_jump, ssh_base_cmd, ssh_run, ssh_capture, scp_put, scp_get,
@@ -1533,25 +1534,7 @@ def bootstrap_cluster(args, provisioned):
 # Main flow
 # -------------
 def ensure_keypair_accessible():
-    attempts = 0
-    while True:
-        try:
-            ec2().describe_key_pairs(KeyNames=[KEY_NAME])
-            return
-        except botocore.exceptions.NoCredentialsError:
-            raise SystemExit("ERROR: AWS credentials not found. Export AWS credentials or run setup-aws-creds.sh before re-running.")
-        except botocore.exceptions.ClientError as e:
-            code = e.response["Error"]["Code"]
-            if code == "RequestExpired" and attempts < 3:
-                attempts += 1
-                log("AWS request expired while checking KeyPair; retrying...")
-                time.sleep(3)
-                continue
-            if code == "InvalidKeyPair.NotFound":
-                raise SystemExit(f"ERROR: KeyPair '{KEY_NAME}' missing in {REGION}. Create/import it and re-run.")
-            if code in {"AuthFailure", "UnauthorizedOperation", "UnrecognizedClientException"}:
-                raise SystemExit(f"ERROR: AWS credentials are invalid or expired ({code}). Refresh credentials and try again.")
-            raise
+    _common_ensure_keypair(KEY_NAME, DEFAULT_SSH_KEY_PATH)
 
 
 def main(args):

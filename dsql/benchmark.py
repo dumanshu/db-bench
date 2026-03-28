@@ -32,12 +32,13 @@ import botocore
 DEFAULT_REGION = os.environ.get("AWS_DEFAULT_REGION", "us-east-1")
 DEFAULT_SEED = "dsqllt-001"
 DEFAULT_PROFILE = os.environ.get("AWS_PROFILE", "sandbox")
+DEFAULT_DB_PROFILE = os.environ.get("DB_PROFILE", "sandbox-storage")
 DSQL_PORT = 5432
 
 BOTO_CONFIG = botocore.config.Config(retries={"max_attempts": 6, "mode": "adaptive"})
 
 STATE_FILE = Path(__file__).resolve().with_name("dsql-state.json")
-SSH_KEY_PATH = Path(__file__).resolve().with_name("dsql-bench-key.pem")
+SSH_KEY_PATH = Path(__file__).resolve().parent.parent / "tidb" / "tidb-load-test-key.pem"
 
 TOKEN_LIFETIME_SECONDS = 900
 TOKEN_REFRESH_MARGIN = 120  # refresh 2min before expiry
@@ -226,11 +227,38 @@ class TokenManager:
 
 def pgbench_init(host_ip, key_path, endpoint, token, scale_factor):
     log(f"Initializing pgbench data (scale factor: {scale_factor})...")
+
+    # DSQL rejects fillfactor, TRUNCATE, and caps writes at ~3500 rows/txn
     script = textwrap.dedent(f"""\
         export PGPASSWORD='{token}'
-        pgbench -i -I dtGp -s {scale_factor} --no-vacuum \\
-            -h {endpoint} -p {DSQL_PORT} -U admin -d postgres 2>&1
-        echo "PGBENCH_INIT_EXIT:$?"
+        PSQL="psql -h {endpoint} -p {DSQL_PORT} -U admin -d postgres -v ON_ERROR_STOP=1"
+        BATCH=2000
+        TOTAL={scale_factor * 100000}
+
+        $PSQL <<'EOSQL'
+DROP TABLE IF EXISTS pgbench_history, pgbench_tellers, pgbench_accounts, pgbench_branches;
+CREATE TABLE pgbench_branches (bid int NOT NULL PRIMARY KEY, bbalance int, filler char(88));
+CREATE TABLE pgbench_tellers  (tid int NOT NULL PRIMARY KEY, bid int, tbalance int, filler char(84));
+CREATE TABLE pgbench_accounts (aid int NOT NULL PRIMARY KEY, bid int, abalance int, filler char(84));
+CREATE TABLE pgbench_history  (tid int, bid int, aid int, delta int, mtime timestamp, filler char(22));
+EOSQL
+        if [ $? -ne 0 ]; then echo "PGBENCH_INIT_EXIT:1"; exit 0; fi
+        $PSQL -c "INSERT INTO pgbench_branches SELECT g, 0, '' FROM generate_series(1, {scale_factor}) g"
+        $PSQL -c "INSERT INTO pgbench_tellers  SELECT g, (g-1)/10+1, 0, '' FROM generate_series(1, {scale_factor * 10}) g"
+        if [ $? -ne 0 ]; then echo "PGBENCH_INIT_EXIT:1"; exit 0; fi
+
+        CHUNKS=$(( ($TOTAL + $BATCH - 1) / $BATCH ))
+        echo "Loading $TOTAL accounts in $CHUNKS batches of $BATCH..."
+        for i in $(seq 0 $(($CHUNKS - 1))); do
+            s=$(($i * $BATCH + 1))
+            e=$((($i + 1) * $BATCH))
+            if [ $e -gt $TOTAL ]; then e=$TOTAL; fi
+            echo "INSERT INTO pgbench_accounts SELECT g, (g-1)/100000+1, 0, '' FROM generate_series($s, $e) g;"
+        done | $PSQL 2>&1
+        RC=${{PIPESTATUS[1]:-$?}}
+
+        if [ $RC -ne 0 ]; then echo "PGBENCH_INIT_EXIT:1"; exit 0; fi
+        echo "PGBENCH_INIT_EXIT:0"
     """)
     proc = ssh_run(host_ip, script, key_path, strict=False)
     output = proc.stdout + proc.stderr
@@ -455,7 +483,10 @@ def parse_args():
     )
     parser.add_argument("--seed", default=DEFAULT_SEED)
     parser.add_argument("--region", default=DEFAULT_REGION)
-    parser.add_argument("--aws-profile", default=DEFAULT_PROFILE)
+    parser.add_argument("--aws-profile", default=DEFAULT_PROFILE,
+                        help="AWS profile for infrastructure (EC2/VPC).")
+    parser.add_argument("--db-profile", default=DEFAULT_DB_PROFILE,
+                        help="AWS profile for database service APIs (default: sandbox-storage).")
     parser.add_argument(
         "--profile", default="standard", choices=WORKLOAD_PROFILES.keys(),
         help="Workload profile (default: standard).",
@@ -518,7 +549,8 @@ def main():
     log(f"  Duration:  {profile_cfg['duration']}s")
     log("")
 
-    token_mgr = TokenManager(endpoint=endpoint, region=region, profile=args.aws_profile)
+    db_prof = args.db_profile or args.aws_profile
+    token_mgr = TokenManager(endpoint=endpoint, region=region, profile=db_prof)
 
     # ── pgbench init ─────────────────────────────────────────────────────
     if not args.skip_init:
@@ -595,7 +627,7 @@ def main():
         log("Collecting CloudWatch metrics...")
         cw_end = bench_end + datetime.timedelta(minutes=2)
         cw_metrics = collect_cloudwatch_metrics(
-            cluster_id, bench_start, cw_end, region, args.aws_profile,
+            cluster_id, bench_start, cw_end, region, db_prof,
         )
         if cw_metrics:
             for k, v in sorted(cw_metrics.items()):

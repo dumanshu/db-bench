@@ -1,11 +1,58 @@
 """Shared AWS infrastructure functions: VPC, subnet, SG, EC2, cleanup."""
 
+import os
 import time
+from pathlib import Path
+
 import botocore
 
 import common.util as _u
 from common.util import SSH_PORT, ec2, log, tags_common, ensure_tags
 from common.types import InstanceInfo
+
+
+# ---------------------------------------------------------------------------
+# Key Pair
+# ---------------------------------------------------------------------------
+
+def ensure_keypair(key_name, pem_path):
+    """Ensure an EC2 key pair exists. Create it and save the PEM if missing.
+
+    If the key pair already exists in EC2 *and* the PEM file is on disk,
+    this is a no-op.  If the key pair exists in EC2 but the PEM is missing
+    locally we cannot recover the private key, so we delete + recreate.
+    """
+    pem_path = Path(pem_path)
+    try:
+        ec2().describe_key_pairs(KeyNames=[key_name])
+        if pem_path.exists():
+            log(f"REUSED  keypair: {key_name}")
+            return
+        # Key exists remotely but PEM lost -- recreate so we have the PEM.
+        log(f"KeyPair '{key_name}' exists in EC2 but PEM missing locally -- recreating")
+        ec2().delete_key_pair(KeyName=key_name)
+    except botocore.exceptions.NoCredentialsError:
+        raise SystemExit(
+            "ERROR: AWS credentials not found. "
+            "Export AWS credentials or configure a profile before re-running."
+        )
+    except botocore.exceptions.ClientError as e:
+        code = e.response["Error"]["Code"]
+        if code in {"AuthFailure", "UnauthorizedOperation", "UnrecognizedClientException"}:
+            raise SystemExit(
+                f"ERROR: AWS credentials are invalid or expired ({code}). "
+                "Refresh credentials and try again."
+            )
+        if code != "InvalidKeyPair.NotFound":
+            raise
+
+    # Create the key pair and persist the private key.
+    log(f"Creating EC2 key pair: {key_name}")
+    resp = ec2().create_key_pair(KeyName=key_name, KeyType="ed25519")
+    pem_path.parent.mkdir(parents=True, exist_ok=True)
+    pem_path.write_text(resp["KeyMaterial"])
+    os.chmod(pem_path, 0o400)
+    log(f"Saved private key to {pem_path}")
 
 
 # ---------------------------------------------------------------------------
