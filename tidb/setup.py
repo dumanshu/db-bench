@@ -39,6 +39,7 @@ from common.aws import (
     ensure_sg, ensure_ingress_tcp_cidr, refresh_ssh_rule,
     find_instance_id_by_name, find_all_stack_instances, wait_running,
     ensure_instance as _common_ensure_instance,
+    ensure_keypair as _common_ensure_keypair,
     instance_info_from_id,
     terminate_stack_instances, delete_stack_security_groups,
     delete_route_table_by_name, delete_stack_subnets,
@@ -280,16 +281,7 @@ def resolved_ami_id():
 
 
 def ensure_keypair_accessible():
-    try:
-        ec2().describe_key_pairs(KeyNames=[KEY_NAME])
-    except botocore.exceptions.ClientError as e:
-        if e.response["Error"]["Code"] == "InvalidKeyPair.NotFound":
-            raise SystemExit(
-                f"ERROR: KeyPair '{KEY_NAME}' not found in EC2. "
-                "Create it with: aws ec2 import-key-pair --key-name tidb-load-test-key "
-                "--public-key-material fileb://tidb-load-test-key.pub --profile sandbox"
-            )
-        raise
+    _common_ensure_keypair(KEY_NAME, DEFAULT_SSH_KEY_PATH)
 
 
 # ---------------------------------------------------------------------------
@@ -462,13 +454,11 @@ def provision_role_instances(role, count, instance_types, subnet_ids, sg_id, pro
 # ---------------------------------------------------------------------------
 
 def install_base_packages(host: InstanceInfo, ctx: BootstrapContext):
-    """Install base OS packages and tune sysctl on any node."""
     log(f"Installing base packages on {host.role} ({host.public_ip})")
     ssh_run(host, """
 sudo dnf -y update || true
 sudo dnf -y install jq htop sysstat mtr || true
 
-# mysql client needed on control node for create_sysbench_database()
 if ! command -v mysql &>/dev/null; then
     sudo dnf -y install mariadb105 2>/dev/null || \
     sudo dnf -y install mariadb 2>/dev/null || \
@@ -482,40 +472,15 @@ net.ipv4.ip_forward = 1
 fs.inotify.max_user_watches = 524288
 fs.inotify.max_user_instances = 512
 EOF
-
-sudo tee /etc/sysctl.d/99-tidb-bench.conf >/dev/null <<'EOF'
-# File descriptor limits (nr_open must be >= k3s LimitNOFILE=1048576)
-fs.file-max = 1048576
-fs.nr_open = 1048576
-
-# Network tuning for high-throughput benchmarks
-net.core.somaxconn = 65535
-net.core.netdev_max_backlog = 65535
-net.core.rmem_max = 16777216
-net.core.wmem_max = 16777216
-net.ipv4.tcp_rmem = 4096 87380 16777216
-net.ipv4.tcp_wmem = 4096 65536 16777216
-net.ipv4.tcp_max_syn_backlog = 65535
-net.ipv4.tcp_fin_timeout = 15
-net.ipv4.tcp_tw_reuse = 1
-net.ipv4.ip_local_port_range = 1024 65535
-
-# Perf profiling (for flamegraphs)
-kernel.perf_event_paranoid = -1
-kernel.kptr_restrict = 0
-EOF
-
-sudo tee /etc/security/limits.d/99-tidb-bench.conf >/dev/null <<'EOF'
-* soft nofile 1000000
-* hard nofile 1000000
-* soft nproc 65535
-* hard nproc 65535
-root soft nofile 1000000
-root hard nofile 1000000
-EOF
-
-sudo sysctl --system || true
 """, ctx)
+
+    from common.client import system_tuning_script
+    extra = """\
+kernel.perf_event_paranoid = -1
+kernel.kptr_restrict = 0"""
+    ssh_run(host, system_tuning_script(
+        extra_sysctl=extra, conf_name="tidb-bench",
+    ), ctx)
 
 
 # ---------------------------------------------------------------------------

@@ -34,6 +34,7 @@ from common.aws import (
     delete_stack_security_groups, delete_route_table_by_name,
     delete_stack_subnets, delete_stack_igw_and_vpc,
     ensure_instance as _common_ensure_instance,
+    ensure_keypair as _common_ensure_keypair,
 )
 from common.ssh import (
     host_target_and_jump, ssh_base_cmd, ssh_run, ssh_capture, scp_put, scp_get,
@@ -764,30 +765,15 @@ if command -v mtr >/dev/null 2>&1; then
 else
   sudo $PKG -y install mtr || true
 fi
-sudo tee /etc/security/limits.d/99-valkey-nofile.conf >/dev/null <<'EOF'
-* soft nofile 65535
-* hard nofile 65535
-root soft nofile 65535
-root hard nofile 65535
-EOF
-sudo bash -c 'set -euo pipefail
-CURRENT=$(cat /proc/sys/fs/file-max)
-TARGET=65535
-if [ "$CURRENT" -lt "$TARGET" ]; then
-  VALUE=$TARGET
-else
-  VALUE=$CURRENT
-fi
-cat >/etc/sysctl.d/99-valkey-fd.conf <<EOF
-fs.file-max = $VALUE
-EOF
-sysctl -q -p /etc/sysctl.d/99-valkey-fd.conf || true'
-sudo tee /etc/sysctl.d/99-valkey-perf.conf >/dev/null <<'EOF'
-kernel.perf_event_paranoid = -1
-kernel.kptr_restrict = 0
-EOF
-sudo sysctl -q -p /etc/sysctl.d/99-valkey-perf.conf || true
 """, ctx)
+
+    from common.client import system_tuning_script
+    extra = """\
+kernel.perf_event_paranoid = -1
+kernel.kptr_restrict = 0"""
+    ssh_run(host, system_tuning_script(
+        extra_sysctl=extra, conf_name="valkey-bench",
+    ), ctx)
 
 
 def build_valkey_binaries_on_bastion(bastion: InstanceInfo, remote_tar: str, ctx: BootstrapContext):
@@ -1533,25 +1519,7 @@ def bootstrap_cluster(args, provisioned):
 # Main flow
 # -------------
 def ensure_keypair_accessible():
-    attempts = 0
-    while True:
-        try:
-            ec2().describe_key_pairs(KeyNames=[KEY_NAME])
-            return
-        except botocore.exceptions.NoCredentialsError:
-            raise SystemExit("ERROR: AWS credentials not found. Export AWS credentials or run setup-aws-creds.sh before re-running.")
-        except botocore.exceptions.ClientError as e:
-            code = e.response["Error"]["Code"]
-            if code == "RequestExpired" and attempts < 3:
-                attempts += 1
-                log("AWS request expired while checking KeyPair; retrying...")
-                time.sleep(3)
-                continue
-            if code == "InvalidKeyPair.NotFound":
-                raise SystemExit(f"ERROR: KeyPair '{KEY_NAME}' missing in {REGION}. Create/import it and re-run.")
-            if code in {"AuthFailure", "UnauthorizedOperation", "UnrecognizedClientException"}:
-                raise SystemExit(f"ERROR: AWS credentials are invalid or expired ({code}). Refresh credentials and try again.")
-            raise
+    _common_ensure_keypair(KEY_NAME, DEFAULT_SSH_KEY_PATH)
 
 
 def main(args):
