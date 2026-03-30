@@ -10,7 +10,7 @@ DEFAULT_SSH_KEY_PATH = Path(__file__).resolve().parent / "dbbench-key.pem"
 import botocore
 
 import common.util as _u
-from common.util import SSH_PORT, ec2, log, tags_common, ensure_tags
+from common.util import SSH_PORT, ec2, ec2_client, log, tags_common, ensure_tags
 from common.types import InstanceInfo
 
 
@@ -607,3 +607,29 @@ def cleanup_stack():
         delete_stack_subnets(vpc["VpcId"])
         delete_stack_igw_and_vpc(vpc["VpcId"])
     log("Cleanup complete.")
+
+
+# ---------------------------------------------------------------------------
+# EBS helpers
+# ---------------------------------------------------------------------------
+
+def get_ebs_volumes(region, profile, instance_id):
+    client = ec2_client(profile=profile, region=region)
+    resp = client.describe_volumes(
+        Filters=[{"Name": "attachment.instance-id", "Values": [instance_id]}]
+    )
+    volumes = []
+    for vol in resp.get("Volumes", []):
+        vol_info = {
+            "volume_id": vol["VolumeId"],
+            "size_gb": vol["Size"],
+            "volume_type": vol["VolumeType"],
+            "iops": vol.get("Iops"),
+            "throughput": vol.get("Throughput"),
+            "state": vol["State"],
+        }
+        for attach in vol.get("Attachments", []):
+            if attach.get("InstanceId") == instance_id:
+                vol_info["device"] = attach.get("Device")
+        volumes.append(vol_info)
+    return volumes

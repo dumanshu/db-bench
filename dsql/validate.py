@@ -25,7 +25,8 @@ import sys
 from pathlib import Path
 
 import boto3
-import botocore
+
+from common.util import BOTO_CONFIG, ec2_client
 
 # ---------------------------------------------------------------------------
 DEFAULT_REGION = os.environ.get("AWS_DEFAULT_REGION", "us-east-1")
@@ -33,8 +34,6 @@ DEFAULT_SEED = "dsqllt-001"
 DEFAULT_PROFILE = os.environ.get("AWS_PROFILE", "sandbox")
 DEFAULT_DB_PROFILE = os.environ.get("DB_PROFILE", "sandbox-storage")
 DSQL_PORT = 5432
-
-BOTO_CONFIG = botocore.config.Config(retries={"max_attempts": 6, "mode": "adaptive"})
 
 STATE_FILE = Path(__file__).resolve().with_name("dsql-state.json")
 from common.aws import DEFAULT_SSH_KEY_PATH as SSH_KEY_PATH
@@ -50,14 +49,6 @@ def ts():
 
 def log(msg=""):
     print(f"[{ts()}] {msg}", flush=True)
-
-
-def ec2_client(region=None, profile=None):
-    session = boto3.Session(
-        region_name=region or DEFAULT_REGION,
-        profile_name=profile,
-    )
-    return session.client("ec2", config=BOTO_CONFIG)
 
 
 def dsql_client(region=None, profile=None):
@@ -331,7 +322,7 @@ def main():
 
     checks.append(check_dsql_cluster(state, region, db_prof))
 
-    ec2c = ec2_client(region, profile)
+    ec2c = ec2_client(region=region, profile=profile)
     client_ip = discover_client_ip(state, ec2c)
     if not client_ip:
         c = Check("Client VM discovery")

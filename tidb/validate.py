@@ -7,16 +7,13 @@ Validate TiDB load-test stack deployment and run health checks.
 
 import argparse
 import os
-import subprocess
 import sys
-import textwrap
 from pathlib import Path
 from typing import Optional
 
-import boto3
-
-from common.util import BOTO_CONFIG, log, ts
-from common.aws import DEFAULT_SSH_KEY_PATH
+from common.util import ts, log, ec2_client
+from common.aws import DEFAULT_SSH_KEY_PATH, get_ebs_volumes
+from common.ssh import ssh_capture_simple
 
 DEFAULT_REGION = "us-east-1"
 DEFAULT_SEED = "tidblt-001"
@@ -24,13 +21,9 @@ DEFAULT_PROFILE = os.environ.get("AWS_PROFILE", "sandbox")
 DEFAULT_PORT = 30400
 
 
-def ec2_client(profile: Optional[str], region: str):
-    session = boto3.session.Session(profile_name=profile, region_name=region)
-    return session.client("ec2", region_name=region, config=BOTO_CONFIG)
-
 
 def discover_tidb_host(region: str, profile: Optional[str], seed: str) -> dict:
-    client = ec2_client(profile, region)
+    client = ec2_client(profile=profile, region=region)
     stack = f"tidb-loadtest-{seed}"
     filters = [
         {"Name": "tag:Project", "Values": [stack]},
@@ -53,115 +46,77 @@ def discover_tidb_host(region: str, profile: Optional[str], seed: str) -> dict:
     return None
 
 
-def get_ebs_volumes(region: str, profile: Optional[str], instance_id: str) -> list:
-    """Get EBS volume details for an EC2 instance."""
-    client = ec2_client(profile, region)
-    resp = client.describe_volumes(
-        Filters=[{"Name": "attachment.instance-id", "Values": [instance_id]}]
-    )
-    volumes = []
-    for vol in resp.get("Volumes", []):
-        vol_info = {
-            "volume_id": vol["VolumeId"],
-            "size_gb": vol["Size"],
-            "volume_type": vol["VolumeType"],
-            "iops": vol.get("Iops"),
-            "throughput": vol.get("Throughput"),
-            "state": vol["State"],
-        }
-        for attach in vol.get("Attachments", []):
-            if attach.get("InstanceId") == instance_id:
-                vol_info["device"] = attach.get("Device")
-        volumes.append(vol_info)
-    return volumes
-
-
-def ssh_capture(host: str, script: str, key_path: Path) -> subprocess.CompletedProcess:
-    full = textwrap.dedent(script).lstrip()
-    cmd = [
-        "ssh",
-        "-o", "BatchMode=yes",
-        "-o", "StrictHostKeyChecking=no",
-        "-o", "IdentitiesOnly=yes",
-        "-o", "ConnectTimeout=30",
-        "-i", str(key_path),
-        f"ec2-user@{host}",
-        "bash", "-s"
-    ]
-    return subprocess.run(cmd, input=full, text=True, capture_output=True)
-
-
 def check_ssh_connectivity(host: str, key_path: Path) -> bool:
-    result = ssh_capture(host, "echo ok", key_path)
+    result = ssh_capture_simple(host, key_path, "echo ok")
     return result.returncode == 0 and "ok" in result.stdout
 
 
 def check_k3s(host: str, key_path: Path) -> bool:
     """Check if k3s is running (replaces Docker check)."""
-    result = ssh_capture(host, "sudo systemctl is-active k3s >/dev/null 2>&1 && echo ok", key_path)
+    result = ssh_capture_simple(host, key_path, "sudo systemctl is-active k3s >/dev/null 2>&1 && echo ok")
     return result.returncode == 0 and "ok" in result.stdout
 
 
 def check_k3s_cluster(host: str, key_path: Path) -> bool:
     """Check if k3s cluster has nodes (replaces kind check)."""
-    result = ssh_capture(host, "kubectl get nodes --no-headers 2>/dev/null | wc -l | xargs test 0 -lt && echo ok", key_path)
+    result = ssh_capture_simple(host, key_path, "kubectl get nodes --no-headers 2>/dev/null | wc -l | xargs test 0 -lt && echo ok")
     return result.returncode == 0 and "ok" in result.stdout
 
 def check_kubectl(host: str, key_path: Path) -> bool:
-    result = ssh_capture(host, "kubectl cluster-info >/dev/null 2>&1 && echo ok", key_path)
+    result = ssh_capture_simple(host, key_path, "kubectl cluster-info >/dev/null 2>&1 && echo ok")
     return result.returncode == 0 and "ok" in result.stdout
 
 
 def get_tidb_pods(host: str, key_path: Path) -> str:
-    result = ssh_capture(host, "kubectl get pods -n tidb-cluster -o wide 2>/dev/null", key_path)
+    result = ssh_capture_simple(host, key_path, "kubectl get pods -n tidb-cluster -o wide 2>/dev/null")
     return result.stdout if result.returncode == 0 else ""
 
 
 def get_tidb_cluster_status(host: str, key_path: Path) -> str:
-    result = ssh_capture(host, "kubectl get tc -n tidb-cluster 2>/dev/null", key_path)
+    result = ssh_capture_simple(host, key_path, "kubectl get tc -n tidb-cluster 2>/dev/null")
     return result.stdout if result.returncode == 0 else ""
 
 
 def check_pd_ready(host: str, key_path: Path) -> bool:
-    result = ssh_capture(host, """
+    result = ssh_capture_simple(host, key_path, """
 kubectl get pods -n tidb-cluster -l app.kubernetes.io/component=pd -o jsonpath='{.items[0].status.containerStatuses[0].ready}' 2>/dev/null
-""", key_path)
+""")
     return result.stdout.strip() == "true"
 
 
 def check_tikv_ready(host: str, key_path: Path) -> bool:
-    result = ssh_capture(host, """
+    result = ssh_capture_simple(host, key_path, """
 kubectl get pods -n tidb-cluster -l app.kubernetes.io/component=tikv -o jsonpath='{.items[0].status.containerStatuses[0].ready}' 2>/dev/null
-""", key_path)
+""")
     return result.stdout.strip() == "true"
 
 
 def check_tidb_ready(host: str, key_path: Path) -> bool:
-    result = ssh_capture(host, """
+    result = ssh_capture_simple(host, key_path, """
 kubectl get pods -n tidb-cluster -l app.kubernetes.io/component=tidb -o jsonpath='{.items[0].status.containerStatuses[0].ready}' 2>/dev/null
-""", key_path)
+""")
     return result.stdout.strip() == "true"
 
 
 def check_tidb_connection(host: str, key_path: Path, port: int) -> bool:
-    result = ssh_capture(host, f"mysql -h 127.0.0.1 -P {port} -u root -e 'SELECT 1' 2>/dev/null", key_path)
+    result = ssh_capture_simple(host, key_path, f"mysql -h 127.0.0.1 -P {port} -u root -e 'SELECT 1' 2>/dev/null")
     return result.returncode == 0
 
 
 def get_tidb_version(host: str, key_path: Path, port: int) -> str:
-    result = ssh_capture(host, f"mysql -h 127.0.0.1 -P {port} -u root -N -e 'SELECT version()' 2>/dev/null", key_path)
+    result = ssh_capture_simple(host, key_path, f"mysql -h 127.0.0.1 -P {port} -u root -N -e 'SELECT version()' 2>/dev/null")
     return result.stdout.strip() if result.returncode == 0 else "unknown"
 
 
 def check_sysbench_installed(host: str, key_path: Path) -> bool:
-    result = ssh_capture(host, "command -v sysbench >/dev/null 2>&1 && echo ok", key_path)
+    result = ssh_capture_simple(host, key_path, "command -v sysbench >/dev/null 2>&1 && echo ok")
     return result.returncode == 0 and "ok" in result.stdout
 
 
 def check_ticdc_ready(host: str, key_path: Path) -> bool:
-    result = ssh_capture(host, """
+    result = ssh_capture_simple(host, key_path, """
 kubectl get pods -n tidb-cluster -l app.kubernetes.io/component=ticdc --no-headers 2>/dev/null | grep -c Running
-""", key_path)
+""")
     try:
         return int(result.stdout.strip()) > 0
     except (ValueError, AttributeError):
@@ -169,26 +124,26 @@ kubectl get pods -n tidb-cluster -l app.kubernetes.io/component=ticdc --no-heade
 
 
 def check_changefeed_status(host: str, key_path: Path) -> bool:
-    result = ssh_capture(host, """
+    result = ssh_capture_simple(host, key_path, """
 TICDC_POD=$(kubectl get pods -n tidb-cluster -l app.kubernetes.io/component=ticdc -o jsonpath='{.items[0].metadata.name}' 2>/dev/null)
 kubectl exec -n tidb-cluster "$TICDC_POD" -- /cdc cli changefeed list --server=http://127.0.0.1:8301 2>/dev/null
-""", key_path)
+""")
     return result.returncode == 0 and "normal" in result.stdout
 
 
 def check_downstream_cluster(host: str, key_path: Path) -> bool:
-    result = ssh_capture(host, """
+    result = ssh_capture_simple(host, key_path, """
 PODS=$(kubectl get pods -n tidb-downstream --no-headers 2>/dev/null | grep -c Running)
 SVC=$(kubectl get svc downstream-tidb -n tidb-downstream -o jsonpath='{.spec.clusterIP}' 2>/dev/null)
 [ "$PODS" -gt 0 ] && [ -n "$SVC" ] && echo ok
-""", key_path)
+""")
     return result.returncode == 0 and "ok" in result.stdout
 
 
 def run_quick_benchmark(host: str, key_path: Path, port: int) -> dict:
     log("Running quick validation benchmark (10s)...")
     
-    result = ssh_capture(host, f"""
+    result = ssh_capture_simple(host, key_path, f"""
 mysql -h 127.0.0.1 -P {port} -u root -e "CREATE DATABASE IF NOT EXISTS sbtest_validate;"
 mysql -h 127.0.0.1 -P {port} -u root -e "DROP TABLE IF EXISTS sbtest_validate.sbtest1;"
 
@@ -221,7 +176,7 @@ sysbench oltp_read_write \\
     cleanup 2>&1
 
 mysql -h 127.0.0.1 -P {port} -u root -e "DROP DATABASE IF EXISTS sbtest_validate;"
-""", key_path)
+""")
     
     output = result.stdout
     metrics = {}
