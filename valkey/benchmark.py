@@ -372,6 +372,56 @@ def main():
             flamegraph_proc.join()
 
     print("Benchmark complete.")
+
+    # -- Client resource sparklines from sampler CSV --
+    try:
+        from common.sampler import (
+            parse_metrics_csv, derive_interval_metrics,
+            render_history_chart, render_history_chart_raw,
+        )
+        rows = parse_metrics_csv(sampler_csv)
+        if rows:
+            s_epoch = rows[0].get("epoch", 0)
+            e_epoch = rows[-1].get("epoch", 0)
+            cpu_samples, _ = derive_interval_metrics(rows, s_epoch, e_epoch, "valkey")
+            all_cpu = [s.get("client_cpu_pct") for s in cpu_samples
+                       if s.get("client_cpu_pct") is not None]
+            all_mem = []
+            for s in cpu_samples:
+                mb = s.get("client_mem_used_mb")
+                tmb = s.get("client_mem_total_mb")
+                if mb is not None and tmb and tmb > 0:
+                    all_mem.append(mb / tmb * 100.0)
+            all_rx = [s.get("client_net_rx_mbps") for s in cpu_samples
+                      if s.get("client_net_rx_mbps") is not None]
+            all_tx = [s.get("client_net_tx_mbps") for s in cpu_samples
+                      if s.get("client_net_tx_mbps") is not None]
+            print("")
+            print("-- CLIENT RESOURCE HISTORY " + "-" * 34)
+            if all_cpu:
+                print(f"  {render_history_chart(all_cpu, width=50, label='Client CPU%')}")
+            if all_mem:
+                print(f"  {render_history_chart(all_mem, width=50, label='Client Mem%')}")
+            if all_rx:
+                print(f"  {render_history_chart_raw(all_rx, width=50, label='Client Net RX MB/s')}")
+            if all_tx:
+                print(f"  {render_history_chart_raw(all_tx, width=50, label='Client Net TX MB/s')}")
+            print("")
+    except Exception as e:
+        print(f"Warning: Could not render client resource history: {e}")
+
+    # -- EC2 fleet sparklines from CloudWatch --
+    try:
+        from common.aws import discover_stack_instances
+        from common.report import print_ec2_fleet_sparklines
+        stack = f"valkey-loadtest-{args.seed}"
+        instances = discover_stack_instances(stack, region=args.region, profile=args.aws_profile)
+        if instances:
+            end_ts = time.time()
+            print_ec2_fleet_sparklines(instances, int(start_ts), int(end_ts), region=args.region)
+    except Exception as e:
+        print(f"Warning: Could not render EC2 fleet sparklines: {e}")
+
     if not args.skip_flamegraph:
         if args.flamegraph_output.exists():
             print(f"Flamegraph saved to {args.flamegraph_output.resolve()}")
