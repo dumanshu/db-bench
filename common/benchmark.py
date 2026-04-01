@@ -1369,11 +1369,12 @@ def parse_args():
     aurora_g.add_argument("--fill-db", default=None,
                           help="Database name for fill data")
 
+    p.add_argument("--profile", choices=list(WORKLOAD_PROFILES.keys()),
+                   default=None,
+                   help="Workload profile (quick/light/medium/heavy/stress/scaling)")
+
     # --- TiDB-specific arguments ---
     tidb_g = p.add_argument_group("TiDB-specific options")
-    tidb_g.add_argument("--profile", choices=list(WORKLOAD_PROFILES.keys()),
-                        default=None,
-                        help="Workload profile (TiDB: quick/light/medium/heavy/stress/scaling)")
     tidb_g.add_argument("--prepare-only", action="store_true",
                         help="Only prepare tables (TiDB)")
     tidb_g.add_argument("--cleanup-only", action="store_true",
@@ -1743,6 +1744,18 @@ def _main_aurora(args):
                     else DEFAULT_FILL_THREADS)
     fill_db = args.fill_db or DEFAULT_FILL_DB
 
+    # Apply workload profile overrides (if --profile given and args not explicit)
+    if getattr(args, "profile", None) and args.profile in WORKLOAD_PROFILES:
+        wp = WORKLOAD_PROFILES[args.profile]
+        if args.tables is None:
+            tables = wp["tables"]
+        if args.table_size is None:
+            table_size = wp.get("table_size", table_size)
+        if args.threads is None:
+            threads = wp["threads"]
+        if args.duration is None:
+            duration = wp["duration"]
+
     if workload not in AURORA_WORKLOADS:
         raise SystemExit(
             f"Invalid workload '{workload}' for Aurora. "
@@ -1760,7 +1773,8 @@ def _main_aurora(args):
     elif client_state.get("key_path"):
         key_path = client_state["key_path"]
     else:
-        key_path = str(script_dir / f"{KEY_NAME}.pem")
+        common_dir = Path(__file__).resolve().parent
+        key_path = str(common_dir / f"{KEY_NAME}.pem")
 
     if not os.path.isfile(key_path):
         log(f"WARNING: SSH key not found at {key_path}")
