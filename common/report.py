@@ -627,7 +627,7 @@ def _print_client_extended_metrics(results):
         log(f"  Client ext:  {' | '.join(extras)}")
 
 
-def _print_resource_history(results):
+def _print_resource_history(results, server_nodes=None):
     all_cpu = []
     all_mem_pct = []
     for r in results:
@@ -644,7 +644,8 @@ def _print_resource_history(results):
                 if total_mb and total_mb > 0:
                     all_mem_pct.append(mem_mb / total_mb * 100.0)
 
-    if not all_cpu and not all_mem_pct:
+    has_server = bool(server_nodes)
+    if not all_cpu and not all_mem_pct and not has_server:
         return
 
     log("")
@@ -653,6 +654,23 @@ def _print_resource_history(results):
         log(f"  {render_history_chart(all_cpu, width=50, label='Client CPU%')}")
     if all_mem_pct:
         log(f"  {render_history_chart(all_mem_pct, width=50, label='Client Mem%')}")
+
+    if server_nodes:
+        for node in server_nodes:
+            label = node.get("label", "Server")
+            idata = node.get("interval_data", [])
+            ncpu = [iv.get("client_cpu_pct") for iv in idata
+                    if iv.get("client_cpu_pct") is not None]
+            nmem = []
+            for iv in idata:
+                mb = iv.get("client_mem_used_mb")
+                tmb = iv.get("client_mem_total_mb")
+                if mb is not None and tmb and tmb > 0:
+                    nmem.append(mb / tmb * 100.0)
+            if ncpu:
+                log(f"  {render_history_chart(ncpu, width=50, label=f'{label} CPU%')}")
+            if nmem:
+                log(f"  {render_history_chart(nmem, width=50, label=f'{label} Mem%')}")
     log("")
 
 

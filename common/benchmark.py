@@ -2040,7 +2040,7 @@ def _run_tidb_benchmark(
         DEFAULT_EBS_SIZE_GB, TIDB_MYSQL_IGNORE_ERRORS, AWS_COSTS,
         ssh_run, ssh_capture, ssh_stream,
         discover_tidb_host, discover_tidb_endpoint,
-        get_instance_info, get_cluster_info,
+        get_instance_info, get_cluster_info, discover_all_nodes,
         print_cluster_summary, fetch_resource_snapshot_compact,
         fetch_final_resource_snapshot, get_disk_utilization,
         run_bulk_data_load, run_sysbench_prepare, run_sysbench_cleanup,
@@ -2160,7 +2160,6 @@ mysql -h {db_host} -P {port} -u root -e \
 
     benchmark_start_time = time.time()
 
-    # Start client resource sampler
     sampler_csv_path = f"/tmp/tidb_sampler_{int(time.time())}.csv"
     sampler_started = False
     try:
@@ -2168,7 +2167,31 @@ mysql -h {db_host} -P {port} -u root -e \
                       user='ec2-user')
         sampler_started = True
     except Exception as e:
-        log(f"Warning: could not start sampler: {e}")
+        log(f"Warning: could not start client sampler: {e}")
+
+    server_samplers = []
+    try:
+        all_nodes = discover_all_nodes(region, aws_profile, seed)
+    except Exception as e:
+        log(f"Warning: could not discover cluster nodes: {e}")
+        all_nodes = []
+    for node in all_nodes:
+        if node["public_ip"] == bench_host:
+            continue
+        label = node["role"].upper()
+        csv_path = f"/tmp/tidb_{label}_{int(time.time())}.csv"
+        try:
+            start_sampler(node["public_ip"], key_path, 'generic', interval=1,
+                          user='ec2-user')
+            server_samplers.append({
+                "label": label,
+                "ip": node["public_ip"],
+                "csv_path": csv_path,
+                "instance_type": node["instance_type"],
+            })
+            log(f"  Sampler started on {label} ({node['public_ip']})")
+        except Exception as e:
+            log(f"Warning: could not start sampler on {label} ({node['public_ip']}): {e}")
 
     cdc_tracker = None
     if args.ticdc:
@@ -2345,7 +2368,24 @@ mysql -h {db_host} -P {port} -u root -e \
                         [s.get('client_cpufreq_avg_mhz') for s in cpu_samples]),
                 }
         except Exception as e:
-            log(f"Warning: could not collect sampler metrics: {e}")
+            log(f"Warning: could not collect client sampler metrics: {e}")
+
+    server_node_data = []
+    for ss in server_samplers:
+        try:
+            stop_sampler(ss["ip"], key_path, ss["csv_path"], user='ec2-user')
+            rows = parse_metrics_csv(ss["csv_path"])
+            if rows:
+                s_epoch = rows[0].get('epoch', 0)
+                e_epoch = rows[-1].get('epoch', 0)
+                cpu_s, _ = derive_interval_metrics(rows, s_epoch, e_epoch, 'generic')
+                server_node_data.append({
+                    "label": ss["label"],
+                    "interval_data": cpu_s,
+                    "instance_type": ss["instance_type"],
+                })
+        except Exception as e:
+            log(f"Warning: could not collect sampler from {ss['label']}: {e}")
 
     if sampler_ws or interval_data:
         fake_result = {
@@ -2354,7 +2394,8 @@ mysql -h {db_host} -P {port} -u root -e \
             'ec2_instance_type': cluster_info.get('tidb_instance', ''),
         }
         _print_client_extended_metrics([fake_result])
-        _print_resource_history([fake_result])
+        _print_resource_history([fake_result],
+                                server_nodes=server_node_data)
 
     if cdc_tracker:
         cdc_tracker.stop()
