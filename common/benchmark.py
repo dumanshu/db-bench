@@ -51,6 +51,7 @@ WORKLOADS = [
     "oltp_update_non_index",
     "custom_iud",
     "custom_mixed",
+    "custom_kv_sql",
 ]
 
 # TiDB session variables for benchmarking (safe for all workloads)
@@ -164,6 +165,16 @@ WORKLOAD_PROFILES = {
     "scaling": {
         "tables": 16, "table_size": 100000, "threads": 64,
         "duration": 120, "multi_phase": "scaling", "disk_fill_pct": 30,
+    },
+    "kv_sql_ml": {
+        "tables": 16, "table_size": 100000, "threads": 64,
+        "duration": 120, "workload": "custom_kv_sql",
+        "extra_sysbench_args": ["--kv-profile=ml"],
+    },
+    "kv_sql_legacy": {
+        "tables": 16, "table_size": 100000, "threads": 64,
+        "duration": 120, "workload": "custom_kv_sql",
+        "extra_sysbench_args": ["--kv-profile=legacy"],
     },
 }
 
@@ -537,7 +548,7 @@ def build_sysbench_cmd(
     used by this function.
     """
     # Resolve workload argument
-    if workload in ("custom_iud", "custom_mixed"):
+    if workload in ("custom_iud", "custom_mixed", "custom_kv_sql"):
         remote_lua_dir = lua_dir or "/tmp/lua"
         workload_arg = f"{remote_lua_dir}/{workload}.lua"
     else:
@@ -748,7 +759,9 @@ def run_sysbench_parallel(host_ip: str, key_path: str, base_cmd_str: str,
 
 def sysbench_prepare(host_ip: str, key_path: str, endpoint: str, port: int,
                      user: str, password: str, db: str, tables: int,
-                     table_size: int, threads: int = 1) -> None:
+                     table_size: int, threads: int = 1,
+                     workload: str = "oltp_read_write",
+                     lua_dir: str = "/tmp/lua") -> None:
     """Prepare sysbench tables (CREATE DATABASE + ``sysbench ... prepare``).
 
     Creates the database if it does not exist, then runs the sysbench
@@ -783,7 +796,11 @@ def sysbench_prepare(host_ip: str, key_path: str, endpoint: str, port: int,
         f"--mysql-db={db} --tables={tables} --table-size={table_size} "
         f"--threads={threads}"
     )
-    prepare_cmd = f"sysbench oltp_read_write {common} prepare 2>&1"
+    if workload in ("custom_iud", "custom_mixed", "custom_kv_sql"):
+        workload_path = f"{lua_dir}/{workload}.lua"
+    else:
+        workload_path = "oltp_read_write"
+    prepare_cmd = f"sysbench {workload_path} {common} prepare 2>&1"
 
     # Use streaming Popen for progress reporting on large data loads
     proc = _ssh_popen(host_ip, key_path, prepare_cmd)
@@ -1474,6 +1491,8 @@ def _build_deploy_params(args):
             multi_phase_name = profile.get("multi_phase")
             multi_phase = (MULTI_PHASE_PROFILES[multi_phase_name]["phases"]
                            if multi_phase_name else None)
+            if "workload" in profile:
+                workload = profile["workload"]
         else:
             tables = args.tables if args.tables is not None else 16
             table_size = args.table_size if args.table_size is not None else 100000
@@ -1485,6 +1504,9 @@ def _build_deploy_params(args):
         skip_trx = workload in ("oltp_read_only", "oltp_point_select")
         if skip_trx:
             extra_args.append("--skip_trx=true")
+        if profile_name and profile_name in WORKLOAD_PROFILES:
+            extra_args.extend(
+                WORKLOAD_PROFILES[profile_name].get("extra_sysbench_args", []))
 
         return {
             "server_type": server_type,
@@ -1622,7 +1644,8 @@ def _action_deploy(args):
     params = _build_deploy_params(args)
 
     server_type = params["server_type"]
-    needs_lua = params.get("workload", "") in ("custom_iud", "custom_mixed")
+    needs_lua = params.get("workload", "") in (
+        "custom_iud", "custom_mixed", "custom_kv_sql")
 
     log(f"Deploying {server_type} benchmark to {host}...")
     if server_type == "valkey":
@@ -1792,12 +1815,14 @@ def _main_aurora(args):
 
     # Upload Lua scripts
     lua_dir = None
-    if workload in ("custom_iud", "custom_mixed"):
+    if workload in ("custom_iud", "custom_mixed", "custom_kv_sql"):
         lua_dir = upload_lua_scripts(host, key_path)
 
     if not args.skip_prepare:
         sysbench_prepare(host, key_path, endpoint, port, "admin", password,
-                         db, tables, table_size, prepare_threads)
+                         db, tables, table_size, prepare_threads,
+                         workload=workload,
+                         lua_dir=lua_dir or "/tmp/lua")
 
     iud_rates = None
     rows_before = None

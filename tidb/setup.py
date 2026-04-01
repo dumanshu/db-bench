@@ -227,6 +227,12 @@ def parse_args():
         help="Enable TiCDC replication mode: deploy downstream cluster + changefeed.",
     )
     parser.add_argument(
+        "--tikv-config-profile",
+        choices=["default", "kv_sql"],
+        default="default",
+        help="TiKV configuration profile. 'kv_sql' applies tuned settings for KV-over-SQL workloads on 8-CPU/32GB nodes.",
+    )
+    parser.add_argument(
         "--ticdc-replicas",
         type=int,
         default=1,
@@ -312,6 +318,7 @@ class BootstrapContext:
     multi_az: bool = False
     production: bool = False
     client_zone: str = "us-east-1a"
+    tikv_config_profile: str = "default"
 
     @property
     def host(self) -> InstanceInfo:
@@ -818,13 +825,51 @@ def deploy_tidb_cluster(host: InstanceInfo, ctx: BootstrapContext):
     yaml_lines.append(f'    replicas: {ctx.tikv_replicas}')
     yaml_lines.append('    requests:')
     yaml_lines.append('      storage: "50Gi"')
-    yaml_lines.append('    config: |')
-    yaml_lines.append('      [storage]')
-    yaml_lines.append('      reserve-space = "0MB"')
-    yaml_lines.append('      [rocksdb]')
-    yaml_lines.append('      max-open-files = 256')
-    yaml_lines.append('      [raftdb]')
-    yaml_lines.append('      max-open-files = 256')
+    if ctx.tikv_config_profile == "kv_sql":
+        yaml_lines.append('    config: |')
+        yaml_lines.append('      [server]')
+        yaml_lines.append('      grpc-concurrency = 4')
+        yaml_lines.append('      grpc-concurrent-stream = 65535')
+        yaml_lines.append('      [storage]')
+        yaml_lines.append('      reserve-space = "10GiB"')
+        yaml_lines.append('      scheduler-worker-pool-size = 4')
+        yaml_lines.append('      [storage.block-cache]')
+        yaml_lines.append('      capacity = "16GiB"')
+        yaml_lines.append('      [readpool.unified]')
+        yaml_lines.append('      max-thread-count = 20')
+        yaml_lines.append('      auto-adjust-pool-size = true')
+        yaml_lines.append('      [readpool.storage]')
+        yaml_lines.append('      use-unified-pool = true')
+        yaml_lines.append('      [readpool.coprocessor]')
+        yaml_lines.append('      use-unified-pool = true')
+        yaml_lines.append('      [raftstore]')
+        yaml_lines.append('      store-io-pool-size = 4')
+        yaml_lines.append('      region-split-size = "512MiB"')
+        yaml_lines.append('      region-compact-check-step = 100')
+        yaml_lines.append('      region-compact-tombstones-percent = 10')
+        yaml_lines.append('      region-compact-redundant-rows-percent = 10')
+        yaml_lines.append('      [rocksdb]')
+        yaml_lines.append('      max-open-files = 2048')
+        yaml_lines.append('      [rocksdb.defaultcf]')
+        yaml_lines.append('      level0-file-num-compaction-trigger = 30')
+        yaml_lines.append('      [rocksdb.writecf]')
+        yaml_lines.append('      level0-file-num-compaction-trigger = 30')
+        yaml_lines.append('      [raftdb]')
+        yaml_lines.append('      max-open-files = 2048')
+        yaml_lines.append('      [raft-engine]')
+        yaml_lines.append('      enable = true')
+        yaml_lines.append('      [gc]')
+        yaml_lines.append('      enable-compaction-filter = false')
+        yaml_lines.append('      [resolved-ts]')
+        yaml_lines.append('      advance-ts-interval = "2s"')
+    else:
+        yaml_lines.append('    config: |')
+        yaml_lines.append('      [storage]')
+        yaml_lines.append('      reserve-space = "0MB"')
+        yaml_lines.append('      [rocksdb]')
+        yaml_lines.append('      max-open-files = 256')
+        yaml_lines.append('      [raftdb]')
+        yaml_lines.append('      max-open-files = 256')
     yaml_lines.append('    nodeSelector:')
     yaml_lines.append('      tidb.pingcap.com/tikv: ""')
     yaml_lines.append('    tolerations:')
@@ -848,7 +893,16 @@ def deploy_tidb_cluster(host: InstanceInfo, ctx: BootstrapContext):
     yaml_lines.append(f'    replicas: {ctx.tidb_replicas}')
     yaml_lines.append('    service:')
     yaml_lines.append('      type: NodePort')
-    yaml_lines.append('    config: {}')
+    yaml_lines.append('    config: |')
+    yaml_lines.append('      token-limit = 3000')
+    yaml_lines.append('      lease = "300s"')
+    yaml_lines.append('      [performance]')
+    yaml_lines.append('      gogc = 500')
+    yaml_lines.append('      max-procs = 32')
+    yaml_lines.append('      [tikv-client]')
+    yaml_lines.append('      region-cache-ttl = 31536000')
+    yaml_lines.append('      [tikv-client.copr-cache]')
+    yaml_lines.append('      capacity-mb = 1000')
     yaml_lines.append('    nodeSelector:')
     yaml_lines.append('      tidb.pingcap.com/tidb: ""')
     yaml_lines.append('    tolerations:')
@@ -1370,6 +1424,7 @@ def main():
         multi_az=multi_az,
         production=production,
         client_zone=args.client_zone,
+        tikv_config_profile=args.tikv_config_profile,
     )
 
     # -----------------------------------------------------------------------
