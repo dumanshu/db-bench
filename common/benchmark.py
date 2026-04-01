@@ -2047,6 +2047,11 @@ def _run_tidb_benchmark(
         format_minute_report, CdcLagTracker,
     )
     from common.report import CostTracker, print_summary
+    from common.sampler import (
+        start_sampler, stop_sampler, parse_metrics_csv,
+        derive_interval_metrics, safe_stats, render_history_chart,
+    )
+    from common.report import _print_client_extended_metrics, _print_resource_history
 
     if not key_path.exists():
         raise SystemExit(f"ERROR: SSH key not found: {key_path}")
@@ -2154,6 +2159,16 @@ mysql -h {db_host} -P {port} -u root -e \
     cost_tracker.start()
 
     benchmark_start_time = time.time()
+
+    # Start client resource sampler
+    sampler_csv_path = f"/tmp/tidb_sampler_{int(time.time())}.csv"
+    sampler_started = False
+    try:
+        start_sampler(bench_host, bench_key, 'generic', interval=1,
+                      user='ec2-user')
+        sampler_started = True
+    except Exception as e:
+        log(f"Warning: could not start sampler: {e}")
 
     cdc_tracker = None
     if args.ticdc:
@@ -2298,6 +2313,48 @@ mysql -h {db_host} -P {port} -u root -e \
         log(f"  Benchmark DB: {disk_final['db_data_gb']:.2f}GB")
 
     cost_tracker.print_cost_summary()
+
+    interval_data = []
+    sampler_ws = {}
+    client_cpu_pct = None
+    if sampler_started:
+        try:
+            stop_sampler(bench_host, bench_key, sampler_csv_path,
+                         user='ec2-user')
+            metrics_rows = parse_metrics_csv(sampler_csv_path)
+            if metrics_rows:
+                bench_start_epoch = metrics_rows[0].get('epoch', 0)
+                bench_end_epoch = metrics_rows[-1].get('epoch', 0)
+                cpu_samples, _ = derive_interval_metrics(
+                    metrics_rows, bench_start_epoch, bench_end_epoch, 'generic')
+                cpu_vals = [s['cpu_pct'] for s in cpu_samples
+                            if s.get('cpu_pct') is not None]
+                if cpu_vals:
+                    client_cpu_pct = round(sum(cpu_vals) / len(cpu_vals), 1)
+                interval_data = cpu_samples
+                sampler_ws = {
+                    'client_thermal_mc': safe_stats(
+                        [s.get('client_thermal_mc') for s in cpu_samples]),
+                    'client_loadavg_1m': safe_stats(
+                        [s.get('client_loadavg_1m') for s in cpu_samples]),
+                    'client_loadavg_5m': safe_stats(
+                        [s.get('client_loadavg_5m') for s in cpu_samples]),
+                    'client_loadavg_15m': safe_stats(
+                        [s.get('client_loadavg_15m') for s in cpu_samples]),
+                    'client_cpufreq_avg_mhz': safe_stats(
+                        [s.get('client_cpufreq_avg_mhz') for s in cpu_samples]),
+                }
+        except Exception as e:
+            log(f"Warning: could not collect sampler metrics: {e}")
+
+    if sampler_ws or interval_data:
+        fake_result = {
+            'window_stats': sampler_ws,
+            'interval_data': interval_data,
+            'ec2_instance_type': cluster_info.get('tidb_instance', ''),
+        }
+        _print_client_extended_metrics([fake_result])
+        _print_resource_history([fake_result])
 
     if cdc_tracker:
         cdc_tracker.stop()
