@@ -29,25 +29,17 @@ aurora/          Aurora benchmarking (planned)
 
 ### SSH Key Setup
 
-Each module requires an EC2 key pair for SSH access to provisioned instances. Generate and import them before first use:
+All modules share a single EC2 key pair (`dbbench-key`) stored at `common/dbbench-key.pem`. The setup scripts create it automatically on first run, but you can also generate and import it manually:
 
 ```bash
-# TiDB key pair
-ssh-keygen -t ed25519 -f tidb/tidb-load-test-key.pem -N "" -C "tidb-load-test"
+ssh-keygen -t ed25519 -f common/dbbench-key.pem -N "" -C "dbbench"
 aws ec2 import-key-pair \
-  --key-name tidb-load-test-key \
-  --public-key-material fileb://tidb/tidb-load-test-key.pem.pub \
-  --profile sandbox --region us-east-1
-
-# Valkey key pair
-ssh-keygen -t ed25519 -f valkey/valkey-load-test-key.pem -N "" -C "valkey-load-test"
-aws ec2 import-key-pair \
-  --key-name valkey-load-test-key \
-  --public-key-material fileb://valkey/valkey-load-test-key.pem.pub \
+  --key-name dbbench-key \
+  --public-key-material fileb://common/dbbench-key.pem.pub \
   --profile sandbox --region us-east-1
 ```
 
-The `.pem` files are gitignored. Each setup script defaults to looking for its key at `<module>/<module>-load-test-key.pem` (e.g. `tidb/tidb-load-test-key.pem`).
+The `.pem` file is gitignored.
 
 ## Running
 

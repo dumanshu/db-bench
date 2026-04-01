@@ -2020,9 +2020,7 @@ def _main_tidb(args):
     elif client_state.get("key_path"):
         ssh_key_resolved = client_state["key_path"]
     else:
-        ssh_key_resolved = str(
-            Path(__file__).resolve().parent.parent / "tidb" /
-            "tidb-load-test-key.pem")
+        ssh_key_resolved = str(DEFAULT_SSH_KEY_PATH)
     key_path = Path(ssh_key_resolved).expanduser().resolve()
 
     # Log file setup
