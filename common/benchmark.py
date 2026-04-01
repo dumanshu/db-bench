@@ -1933,13 +1933,16 @@ def _main_aurora(args):
         iud_rates["total_iud_per_sec"] = round(total_iud, 1)
 
     cpu_pct = None
+    cpu_datapoints = []
     net_metrics = {}
     writer_id = info.get("writer_id", "")
     rds_profile = args.rds_profile or aws_profile
     if writer_id:
         log("Fetching Aurora CPU from CloudWatch...")
-        cpu_pct = get_aurora_cpu(writer_id, region, rds_profile,
-                                 bench_start, bench_end)
+        cpu_data = get_aurora_cpu(writer_id, region, rds_profile,
+                                  bench_start, bench_end)
+        cpu_pct = cpu_data["avg"] if cpu_data else None
+        cpu_datapoints = cpu_data.get("datapoints", []) if cpu_data else []
         if cpu_pct is not None:
             log(f"  Aurora writer CPU avg: {cpu_pct:.1f}%")
         else:
@@ -1957,7 +1960,9 @@ def _main_aurora(args):
             log(f"  Network xmit: {xmit:.1f} Mbps")
 
     print_results(result, iud_rates, cpu_pct, tables, table_size,
-                  client_cpu_pct, net_metrics)
+                  client_cpu_pct, net_metrics,
+                  aurora_instance_type=info.get("aurora_instance_type", ""),
+                  ec2_instance_type=info.get("ec2_instance_type", ""))
     save_results(result, iud_rates, script_dir, workload,
                  state=info, tables=tables, table_size=table_size,
                  cpu_pct=cpu_pct, client_cpu_pct=client_cpu_pct,
@@ -1970,7 +1975,13 @@ def _main_aurora(args):
             'ec2_instance_type': info.get('ec2_instance_type', ''),
         }
         _print_client_extended_metrics([fake_result])
-        _print_resource_history([fake_result])
+        server_node_data = []
+        if cpu_datapoints:
+            server_node_data.append({
+                "label": "Aurora Writer",
+                "interval_data": [{"client_cpu_pct": v} for v in cpu_datapoints],
+            })
+        _print_resource_history([fake_result], server_nodes=server_node_data)
 
     if not args.skip_cleanup:
         sysbench_cleanup(host, key_path, endpoint, port, "admin", password,

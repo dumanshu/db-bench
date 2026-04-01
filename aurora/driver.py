@@ -116,7 +116,11 @@ def discover_stack(script_dir: Path, region: str, profile: str,
 
 
 def get_aurora_cpu(writer_id: str, region: str, profile: str,
-                   start_time: str, end_time: str) -> float | None:
+                   start_time: str, end_time: str) -> dict | None:
+    """Return ``{"avg": float, "datapoints": [float, ...]}`` or *None*.
+
+    *datapoints* contains the per-minute Average values sorted by Timestamp.
+    """
     try:
         cmd = [
             "aws", "cloudwatch", "get-metric-statistics",
@@ -138,8 +142,10 @@ def get_aurora_cpu(writer_id: str, region: str, profile: str,
         points = data.get("Datapoints", [])
         if not points:
             return None
-        avg = sum(p["Average"] for p in points) / len(points)
-        return round(avg, 1)
+        sorted_points = sorted(points, key=lambda p: p["Timestamp"])
+        datapoints = [p["Average"] for p in sorted_points]
+        avg = round(sum(datapoints) / len(datapoints), 1)
+        return {"avg": avg, "datapoints": datapoints}
     except Exception:
         return None
 
@@ -211,7 +217,9 @@ def print_results(result: dict, iud_rates: dict | None = None,
                    cpu_pct: float | None = None,
                    tables: int = 0, table_size: int = 0,
                    client_cpu_pct: float | None = None,
-                   net_metrics: dict | None = None) -> None:
+                   net_metrics: dict | None = None,
+                   aurora_instance_type: str = "",
+                   ec2_instance_type: str = "") -> None:
     total_rows = tables * table_size
     est_gb = round(total_rows * cb.BYTES_PER_ROW / 1e9, 1) if total_rows else 0
     thread_label = result.get("thread_label", str(result.get("threads", "?")))
@@ -219,6 +227,10 @@ def print_results(result: dict, iud_rates: dict | None = None,
     print("=" * 70)
     print(f"Benchmark Results: {result.get('workload', 'unknown')}")
     print("=" * 70)
+    if aurora_instance_type:
+        print(f"  Server:           {aurora_instance_type} (Aurora MySQL)")
+    if ec2_instance_type:
+        print(f"  Client:           {ec2_instance_type}")
     print(f"  Threads:          {thread_label}")
     print(f"  Duration:         {result.get('duration_s', '?')}s "
           f"(elapsed: {result.get('elapsed_s', '?')}s)")

@@ -188,7 +188,8 @@ def discover_client_host(state, ec2c):
     for res in resp["Reservations"]:
         for inst in res["Instances"]:
             if inst["State"]["Name"] == "running":
-                return inst.get("PublicIpAddress") or inst.get("PrivateIpAddress")
+                ip = inst.get("PublicIpAddress") or inst.get("PrivateIpAddress")
+                return ip, inst.get("InstanceType", "")
 
     raise SystemExit(f"ERROR: Client instance {instance_id} is not running.")
 
@@ -527,7 +528,7 @@ def main():
     log(f"  Region:    {region}")
 
     ec2c = ec2_client(region, args.aws_profile)
-    client_ip = discover_client_host(state, ec2c)
+    client_ip, client_instance_type = discover_client_host(state, ec2c)
     log(f"  Client VM: {client_ip}")
 
     key_path = Path(args.ssh_key).expanduser().resolve()
@@ -632,6 +633,9 @@ def main():
     log("=" * 70)
     log("PHASE 3: Results")
     log("=" * 70)
+    log(f"  Server:           DSQL Serverless ({cluster_id})")
+    if client_instance_type:
+        log(f"  Client:           {client_instance_type}")
 
     combined_output = "\n".join(all_output)
     client_metrics = parse_pgbench_output(combined_output)
