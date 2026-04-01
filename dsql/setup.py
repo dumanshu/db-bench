@@ -62,9 +62,7 @@ AMI_SSM_PARAM = os.environ.get(
 )
 _RESOLVED_AMI_ID = None
 
-# Key pair -- reuse tidb key pair (already exists in most benchmark accounts)
-KEY_NAME = "tidb-load-test-key"
-DEFAULT_SSH_KEY_PATH = Path(__file__).resolve().parent.parent / "tidb" / "tidb-load-test-key.pem"
+from common.aws import KEY_NAME, DEFAULT_SSH_KEY_PATH
 
 # State file -- persists cluster info between setup / benchmark / validate
 STATE_FILE = Path(__file__).resolve().with_name("dsql-state.json")

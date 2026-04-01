@@ -6,7 +6,7 @@ PROFILE="sandbox-storage"
 REGION="us-east-1"
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 STATE_FILE="$SCRIPT_DIR/aurora-bench-state.json"
-KEY="$SCRIPT_DIR/aurora-bench-key.pem"
+KEY="$(cd "$SCRIPT_DIR/.." && pwd)/common/dbbench-key.pem"
 
 WRITER_ID=$(python3 -c "import json; print(json.load(open('$STATE_FILE'))['writer_id'])")
 

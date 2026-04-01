@@ -37,7 +37,7 @@ DSQL_PORT = 5432
 BOTO_CONFIG = botocore.config.Config(retries={"max_attempts": 6, "mode": "adaptive"})
 
 STATE_FILE = Path(__file__).resolve().with_name("dsql-state.json")
-SSH_KEY_PATH = Path(__file__).resolve().parent.parent / "tidb" / "tidb-load-test-key.pem"
+from common.aws import DEFAULT_SSH_KEY_PATH as SSH_KEY_PATH
 
 
 # ---------------------------------------------------------------------------

@@ -7,7 +7,7 @@ aurora/setup.py -- Provision Aurora MySQL + EC2 benchmark stack in AWS sandbox.
 Creates:
   - VPC with 2 subnets (different AZs), IGW, route table
   - Security groups for Aurora (3306 from EC2) and EC2 (SSH + outbound)
-  - SSH key pair (saved to <script_dir>/aurora-bench-key.pem)
+  - SSH key pair (shared dbbench-key)
   - Aurora cluster parameter group (binlog=ROW, transaction_isolation=READ-COMMITTED)
   - Aurora DB subnet group
   - Aurora MySQL cluster (IO-Optimized, aurora-iopt1)
@@ -58,7 +58,7 @@ DEFAULT_REGION = "us-east-1"
 DEFAULT_SEED = "auroralt-001"
 DEFAULT_PROFILE = os.environ.get("AWS_PROFILE", "sandbox")
 STACK_PREFIX = "aurora-bench"
-KEY_NAME = "aurora-bench-key"
+from common.aws import KEY_NAME, DEFAULT_SSH_KEY_PATH, ensure_keypair
 
 VPC_CIDR = "10.44.0.0/16"
 SUBNET_A_CIDR = "10.44.1.0/24"
@@ -220,42 +220,6 @@ def create_security_groups(ec2_client, vpc_id: str) -> dict:
     log(f"  RDS SG: {rds_sg_id} (MySQL from VPC CIDR)")
 
     return {"rds_sg_id": rds_sg_id}
-
-
-# ---------------------------------------------------------------------------
-# SSH key pair
-# ---------------------------------------------------------------------------
-def create_key_pair(ec2_client, script_dir: Path) -> str:
-    key_file = script_dir / f"{KEY_NAME}.pem"
-
-    if key_file.exists():
-        log(f"Key file already exists: {key_file}")
-        try:
-            ec2_client.describe_key_pairs(KeyNames=[KEY_NAME])
-            log(f"  Key pair '{KEY_NAME}' exists in AWS")
-            return str(key_file)
-        except ClientError:
-            pass  # key exists locally but not in AWS, recreate
-
-    # Remove stale AWS key if present
-    try:
-        ec2_client.delete_key_pair(KeyName=KEY_NAME)
-    except ClientError:
-        pass
-
-    log(f"Creating key pair '{KEY_NAME}'...")
-    kp = ec2_client.create_key_pair(
-        KeyName=KEY_NAME,
-        KeyType="rsa",
-        TagSpecifications=_tag_spec("key-pair", "key"),
-    )
-    if key_file.exists():
-        os.chmod(key_file, 0o600)
-        key_file.unlink()
-    key_file.write_text(kp["KeyMaterial"])
-    os.chmod(key_file, 0o400)
-    log(f"  Saved to {key_file}")
-    return str(key_file)
 
 
 # ---------------------------------------------------------------------------
@@ -861,7 +825,7 @@ def main() -> None:
     sgs = create_security_groups(ec2_client, net["vpc_id"])
     state.update(sgs)
 
-    key_path = create_key_pair(ec2_client, script_dir)
+    key_path = ensure_keypair(KEY_NAME, DEFAULT_SSH_KEY_PATH)
     state["key_path"] = key_path
 
     pg_name = create_parameter_group(rds)

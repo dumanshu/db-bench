@@ -18,6 +18,8 @@ from pathlib import Path
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+from common.aws import DEFAULT_SSH_KEY_PATH
+
 import boto3
 import botocore
 from botocore.config import Config
@@ -54,7 +56,7 @@ def parse_args():
     parser = argparse.ArgumentParser(description="Validate Valkey load-test deployment")
     parser.add_argument("--region", default=REGION, help="AWS region (default: us-east-1)")
     parser.add_argument("--seed", default=SEED, help="Stack seed (default: vlklt-001)")
-    parser.add_argument("--ssh-private-key-path", dest="ssh_key_path", default=str(Path(__file__).with_name("valkey-load-test-key.pem")), help="SSH key for ec2-user")
+    parser.add_argument("--ssh-private-key-path", dest="ssh_key_path", default=str(DEFAULT_SSH_KEY_PATH), help="SSH key for ec2-user")
     parser.add_argument("--ssh-cidr", help="CIDR used for SSH bastion access (defaults to detected public IP)")
     parser.add_argument("--bench-operations", type=int, default=DEFAULT_BENCH_OPS, help="Total operations for read-only benchmark")
     parser.add_argument("--bench-concurrency", type=int, default=DEFAULT_BENCH_CONCURRENCY, help="Client concurrency for benchmark")

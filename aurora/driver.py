@@ -23,7 +23,7 @@ DEFAULT_REGION = "us-east-1"
 DEFAULT_SEED = "auroralt-001"
 DEFAULT_PROFILE = os.environ.get("AWS_PROFILE", "sandbox")
 STACK_PREFIX = "aurora-bench"
-KEY_NAME = "aurora-bench-key"
+from common.aws import KEY_NAME
 STATE_FILE = "aurora-bench-state.json"
 DEFAULT_PORT = 3306
 DEFAULT_DB = "sbtest"

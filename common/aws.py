@@ -4,6 +4,9 @@ import os
 import time
 from pathlib import Path
 
+KEY_NAME = "dbbench-key"
+DEFAULT_SSH_KEY_PATH = Path(__file__).resolve().parent / "dbbench-key.pem"
+
 import botocore
 
 import common.util as _u

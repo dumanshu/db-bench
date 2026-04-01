@@ -140,8 +140,8 @@ def main():
     ap.add_argument("--region", default=DEFAULT_REGION)
     ap.add_argument("--seed", default=DEFAULT_SEED)
     ap.add_argument("--aws-profile", default=DEFAULT_PROFILE)
-    default_key = Path(__file__).resolve().with_name("valkey-load-test-key.pem")
-    ap.add_argument("--ssh-key", default=str(default_key), help=f"Path to SSH key for ec2-user (default: {default_key})")
+    from common.aws import DEFAULT_SSH_KEY_PATH
+    ap.add_argument("--ssh-key", default=str(DEFAULT_SSH_KEY_PATH), help="Path to SSH key for ec2-user")
     ap.add_argument("--client-ip", help="Override client public IP (auto if omitted)")
     ap.add_argument(
         "--stat-name",

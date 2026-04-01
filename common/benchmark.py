@@ -14,6 +14,7 @@ import time
 from pathlib import Path
 from typing import Optional, Callable
 
+from common.aws import DEFAULT_SSH_KEY_PATH
 from common.ssh import ssh_run_simple, ssh_capture_simple, scp_put_simple
 from common.util import log
 
@@ -1441,13 +1442,7 @@ def _resolve_host_and_key(args):
     elif client_state.get("key_path"):
         key_path = client_state["key_path"]
     else:
-        base_dir = Path(__file__).resolve().parent.parent
-        if server_type == "aurora":
-            key_path = str(base_dir / "aurora" / "aurora-bench-key.pem")
-        elif server_type == "valkey":
-            key_path = str(base_dir / "valkey" / "valkey-load-test-key.pem")
-        else:
-            key_path = str(base_dir / "tidb" / "tidb-load-test-key.pem")
+        key_path = str(DEFAULT_SSH_KEY_PATH)
 
     if not host:
         log("ERROR: Could not determine host IP. "

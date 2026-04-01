@@ -42,7 +42,8 @@ def parse_args():
     parser.add_argument("--seed", default=DEFAULT_SEED, help="Stack seed, e.g. vlklt-001.")
     parser.add_argument("--aws-profile", default=DEFAULT_PROFILE, help="AWS profile name for discovery.")
     parser.add_argument("--client-ip", help="Override client public IP (auto-discovered if omitted).")
-    parser.add_argument("--ssh-key", default="valkey-load-test-key.pem", help="Path to SSH key for ec2-user.")
+    from common.aws import DEFAULT_SSH_KEY_PATH
+    parser.add_argument("--ssh-key", default=str(DEFAULT_SSH_KEY_PATH), help="Path to SSH key for ec2-user.")
     parser.add_argument("--envoy-ip", help="Override Envoy private IP (auto).")
     parser.add_argument("--valkey-ip", help="Override Valkey private IP (auto).")
     parser.add_argument("--samples", type=int, default=15, help="Number of 1s pidstat samples (captures duration seconds).")

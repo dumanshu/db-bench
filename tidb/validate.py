@@ -17,6 +17,7 @@ import boto3
 from botocore.config import Config
 
 from common.util import ts
+from common.aws import DEFAULT_SSH_KEY_PATH
 
 DEFAULT_REGION = "us-east-1"
 DEFAULT_SEED = "tidblt-001"
@@ -295,7 +296,7 @@ def parse_args():
     )
     parser.add_argument(
         "--ssh-key",
-        default=str(Path(__file__).resolve().with_name("tidb-load-test-key.pem")),
+        default=str(DEFAULT_SSH_KEY_PATH),
         help="Path to SSH private key",
     )
     parser.add_argument(

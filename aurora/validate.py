@@ -34,7 +34,7 @@ DEFAULT_REGION = "us-east-1"
 DEFAULT_SEED = "auroralt-001"
 DEFAULT_PROFILE = os.environ.get("AWS_PROFILE", "sandbox")
 DEFAULT_PORT = 3306
-KEY_NAME = "aurora-bench-key"
+from common.aws import KEY_NAME, DEFAULT_SSH_KEY_PATH
 STACK_PREFIX = "aurora-bench"
 
 BOTO_CONFIG = {
@@ -497,7 +497,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--aws-profile", default=DEFAULT_PROFILE,
                    help=f"AWS CLI profile (default: {DEFAULT_PROFILE})")
     p.add_argument("--ssh-key", default=None,
-                   help="Path to SSH private key (default: <script_dir>/aurora-bench-key.pem)")
+                   help="Path to SSH private key")
     p.add_argument("--skip-benchmark", action="store_true",
                    help="Skip the quick sysbench validation benchmark")
     p.add_argument("--verbose", "-v", action="store_true",
@@ -522,7 +522,7 @@ def main() -> None:
     if args.ssh_key:
         key_path = args.ssh_key
     else:
-        key_path = str(Path(__file__).resolve().parent / f"{KEY_NAME}.pem")
+        key_path = str(DEFAULT_SSH_KEY_PATH)
 
     if not os.path.isfile(key_path):
         log(f"WARNING: SSH key not found at {key_path}")
