@@ -1854,7 +1854,7 @@ def _main_aurora(args):
                 bench_end_epoch = metrics_rows[-1].get('epoch', 0)
                 cpu_samples, _ = derive_interval_metrics(
                     metrics_rows, bench_start_epoch, bench_end_epoch, 'aurora')
-                cpu_vals = [s['cpu_pct'] for s in cpu_samples if s.get('cpu_pct') is not None]
+                cpu_vals = [s['client_cpu_pct'] for s in cpu_samples if s.get('client_cpu_pct') is not None]
                 if cpu_vals:
                     client_cpu_pct = round(sum(cpu_vals) / len(cpu_vals), 1)
                 interval_data = cpu_samples
@@ -2327,8 +2327,8 @@ mysql -h {db_host} -P {port} -u root -e \
                 bench_end_epoch = metrics_rows[-1].get('epoch', 0)
                 cpu_samples, _ = derive_interval_metrics(
                     metrics_rows, bench_start_epoch, bench_end_epoch, 'generic')
-                cpu_vals = [s['cpu_pct'] for s in cpu_samples
-                            if s.get('cpu_pct') is not None]
+                cpu_vals = [s['client_cpu_pct'] for s in cpu_samples
+                            if s.get('client_cpu_pct') is not None]
                 if cpu_vals:
                     client_cpu_pct = round(sum(cpu_vals) / len(cpu_vals), 1)
                 interval_data = cpu_samples

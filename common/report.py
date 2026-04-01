@@ -632,14 +632,16 @@ def _print_resource_history(results):
     all_mem_pct = []
     for r in results:
         for iv in r.get("interval_data", []):
-            cpu = iv.get("cpu_pct")
+            cpu = iv.get("client_cpu_pct")
             if cpu is not None and isinstance(cpu, (int, float)):
                 all_cpu.append(cpu)
-            mem_mb = iv.get("mem_used_mb")
+            mem_mb = iv.get("client_mem_used_mb")
             if mem_mb is not None and isinstance(mem_mb, (int, float)):
-                spec = INSTANCE_PRICING.get(r.get("ec2_instance_type", ""), {})
-                total_mb = spec.get("mem_gb", 0) * 1024
-                if total_mb > 0:
+                total_mb = iv.get("client_mem_total_mb")
+                if total_mb is None or total_mb <= 0:
+                    spec = INSTANCE_PRICING.get(r.get("ec2_instance_type", ""), {})
+                    total_mb = spec.get("mem_gb", 0) * 1024
+                if total_mb and total_mb > 0:
                     all_mem_pct.append(mem_mb / total_mb * 100.0)
 
     if not all_cpu and not all_mem_pct:
