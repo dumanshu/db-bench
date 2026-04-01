@@ -633,3 +633,31 @@ def get_ebs_volumes(region, profile, instance_id):
                 vol_info["device"] = attach.get("Device")
         volumes.append(vol_info)
     return volumes
+
+
+# ---------------------------------------------------------------------------
+# EC2 fleet discovery (cross-benchmark)
+# ---------------------------------------------------------------------------
+
+def discover_stack_instances(project_tag, region=None, profile=None):
+    """Discover all running EC2 instances with the given Project tag."""
+    client = ec2_client(profile=profile, region=region)
+    filters = [
+        {"Name": "tag:Project", "Values": [project_tag]},
+        {"Name": "instance-state-name", "Values": ["running"]},
+    ]
+    resp = client.describe_instances(Filters=filters)
+    instances = []
+    for reservation in resp.get("Reservations", []):
+        for inst in reservation.get("Instances", []):
+            tags = {t["Key"]: t["Value"] for t in inst.get("Tags", [])}
+            instances.append({
+                "instance_id": inst["InstanceId"],
+                "instance_type": inst.get("InstanceType", ""),
+                "role": tags.get("Role", ""),
+                "name": tags.get("Name", ""),
+                "private_ip": inst.get("PrivateIpAddress", ""),
+                "public_ip": inst.get("PublicIpAddress", ""),
+            })
+    instances.sort(key=lambda x: x["role"])
+    return instances

@@ -4,7 +4,7 @@ import time
 from datetime import datetime
 from pathlib import Path
 
-from common.sampler import render_history_chart
+from common.sampler import render_history_chart, render_history_chart_raw
 from common.util import log
 
 INSTANCE_PRICING = {
@@ -630,6 +630,8 @@ def _print_client_extended_metrics(results):
 def _print_resource_history(results, server_nodes=None):
     all_cpu = []
     all_mem_pct = []
+    all_net_rx = []
+    all_net_tx = []
     for r in results:
         for iv in r.get("interval_data", []):
             cpu = iv.get("client_cpu_pct")
@@ -643,9 +645,15 @@ def _print_resource_history(results, server_nodes=None):
                     total_mb = spec.get("mem_gb", 0) * 1024
                 if total_mb and total_mb > 0:
                     all_mem_pct.append(mem_mb / total_mb * 100.0)
+            rx = iv.get("client_net_rx_mbps")
+            if rx is not None and isinstance(rx, (int, float)):
+                all_net_rx.append(rx)
+            tx = iv.get("client_net_tx_mbps")
+            if tx is not None and isinstance(tx, (int, float)):
+                all_net_tx.append(tx)
 
     has_server = bool(server_nodes)
-    if not all_cpu and not all_mem_pct and not has_server:
+    if not all_cpu and not all_mem_pct and not all_net_rx and not has_server:
         return
 
     log("")
@@ -654,6 +662,10 @@ def _print_resource_history(results, server_nodes=None):
         log(f"  {render_history_chart(all_cpu, width=50, label='Client CPU%')}")
     if all_mem_pct:
         log(f"  {render_history_chart(all_mem_pct, width=50, label='Client Mem%')}")
+    if all_net_rx:
+        log(f"  {render_history_chart_raw(all_net_rx, width=50, label='Client Net RX MB/s')}")
+    if all_net_tx:
+        log(f"  {render_history_chart_raw(all_net_tx, width=50, label='Client Net TX MB/s')}")
 
     if server_nodes:
         for node in server_nodes:
@@ -662,15 +674,67 @@ def _print_resource_history(results, server_nodes=None):
             ncpu = [iv.get("client_cpu_pct") for iv in idata
                     if iv.get("client_cpu_pct") is not None]
             nmem = []
+            nrx = []
+            ntx = []
             for iv in idata:
                 mb = iv.get("client_mem_used_mb")
                 tmb = iv.get("client_mem_total_mb")
                 if mb is not None and tmb and tmb > 0:
                     nmem.append(mb / tmb * 100.0)
+                rx = iv.get("client_net_rx_mbps")
+                if rx is not None and isinstance(rx, (int, float)):
+                    nrx.append(rx)
+                tx = iv.get("client_net_tx_mbps")
+                if tx is not None and isinstance(tx, (int, float)):
+                    ntx.append(tx)
             if ncpu:
                 log(f"  {render_history_chart(ncpu, width=50, label=f'{label} CPU%')}")
             if nmem:
                 log(f"  {render_history_chart(nmem, width=50, label=f'{label} Mem%')}")
+            if nrx:
+                log(f"  {render_history_chart_raw(nrx, width=50, label=f'{label} Net RX MB/s')}")
+            if ntx:
+                log(f"  {render_history_chart_raw(ntx, width=50, label=f'{label} Net TX MB/s')}")
+    log("")
+
+
+def print_ec2_fleet_sparklines(ec2_instances, start_epoch, end_epoch, region=None):
+    """Discover and render sparklines for all EC2 instances in a stack.
+
+    Args:
+        ec2_instances: List of dicts from discover_stack_instances()
+        start_epoch: Benchmark start time
+        end_epoch: Benchmark end time
+        region: AWS region
+    """
+    from common.sampler import query_ec2_cloudwatch_timeseries
+
+    if not ec2_instances:
+        return
+
+    log("")
+    log("\u2500\u2500 EC2 FLEET RESOURCE HISTORY " + "\u2500" * 30)
+    for inst in ec2_instances:
+        iid = inst.get("instance_id", "")
+        role = inst.get("role", "unknown")
+        itype = inst.get("instance_type", "")
+        prefix = f"{role} ({itype})"
+        try:
+            ts = query_ec2_cloudwatch_timeseries(
+                iid, start_epoch, end_epoch, region=region,
+            )
+        except Exception:
+            log(f"  {prefix}: (cloudwatch error)")
+            continue
+        cpu = ts.get("cpu_pct", [])
+        rx = ts.get("net_rx_mbps", [])
+        tx = ts.get("net_tx_mbps", [])
+        if cpu:
+            log(f"  {render_history_chart(cpu, width=50, label=f'{prefix} CPU%')}")
+        if rx:
+            log(f"  {render_history_chart_raw(rx, width=50, label=f'{prefix} Net RX MB/s')}")
+        if tx:
+            log(f"  {render_history_chart_raw(tx, width=50, label=f'{prefix} Net TX MB/s')}")
     log("")
 
 

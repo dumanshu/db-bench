@@ -998,6 +998,47 @@ def query_cloudwatch_metrics(server_type, resource_id, start_epoch, end_epoch,
 
 
 # ---------------------------------------------------------------------------
+# EC2 instance CloudWatch time-series (cross-benchmark)
+# ---------------------------------------------------------------------------
+
+def query_ec2_cloudwatch_timeseries(instance_id, start_epoch, end_epoch,
+                                     region=None, period=60):
+    """Query CloudWatch for EC2 CPU and network time-series.
+
+    Returns dict with keys: cpu_pct, net_rx_mbps, net_tx_mbps --
+    each a chronologically ordered list of per-period values.
+    """
+    start_dt = datetime.fromtimestamp(start_epoch, tz=timezone.utc)
+    end_dt = datetime.fromtimestamp(end_epoch, tz=timezone.utc)
+
+    session = aws_session()
+    cw = session.client("cloudwatch", region_name=region or session.region_name)
+    dims = [{"Name": "InstanceId", "Value": instance_id}]
+
+    def _fetch(metric_name, stat="Average"):
+        resp = cw.get_metric_statistics(
+            Namespace="AWS/EC2",
+            MetricName=metric_name,
+            Dimensions=dims,
+            StartTime=start_dt,
+            EndTime=end_dt,
+            Period=period,
+            Statistics=[stat],
+        )
+        points = sorted(resp.get("Datapoints", []), key=lambda p: p["Timestamp"])
+        return [p[stat] for p in points]
+
+    cpu_pct = _fetch("CPUUtilization")
+    net_in_bytes = _fetch("NetworkIn")
+    net_out_bytes = _fetch("NetworkOut")
+
+    net_rx_mbps = [v / period / 1_000_000 for v in net_in_bytes]
+    net_tx_mbps = [v / period / 1_000_000 for v in net_out_bytes]
+
+    return {"cpu_pct": cpu_pct, "net_rx_mbps": net_rx_mbps, "net_tx_mbps": net_tx_mbps}
+
+
+# ---------------------------------------------------------------------------
 # Full windowed analysis (combines everything)
 # ---------------------------------------------------------------------------
 
