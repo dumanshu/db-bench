@@ -1328,8 +1328,8 @@ def parse_args():
                           help="Aurora master password")
     aurora_g.add_argument("--db", default=None,
                           help="Database name (Aurora default: sbtest)")
-    aurora_g.add_argument("--rds-profile", default=None,
-                          help="AWS profile for CloudWatch RDS metrics")
+    aurora_g.add_argument("--rds-profile", default="sandbox-storage",
+                          help="AWS profile for CloudWatch RDS metrics (default: sandbox-storage)")
     aurora_g.add_argument("--skip-iud-measurement", action="store_true",
                           help="Skip InnoDB row counter measurement")
     aurora_g.add_argument("--skip-cleanup", action="store_true",

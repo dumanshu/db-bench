@@ -553,6 +553,23 @@ def cleanup_stack(session: boto3.Session, region: str, stack: str,
     ec2_client = session.client("ec2")
     rds = (rds_session or session).client("rds")
 
+    # Fail-fast: verify RDS credentials before proceeding.
+    # If the RDS profile lacks permissions, we must not proceed to
+    # EC2/VPC cleanup and state file deletion -- that would leave
+    # orphaned RDS resources with no way to re-run cleanup.
+    try:
+        rds.describe_db_clusters(MaxRecords=20)
+    except ClientError as e:
+        code = e.response["Error"]["Code"]
+        if code in ("AccessDenied", "AccessDeniedException",
+                    "InvalidClientTokenId", "ExpiredTokenException",
+                    "UnrecognizedClientException"):
+            log(f"FATAL: RDS credentials check failed ({code}). "
+                f"Aborting cleanup to prevent orphaned RDS resources. "
+                f"Fix --rds-profile and retry.")
+            raise SystemExit(1)
+        # Other errors (throttling, etc.) are not auth failures -- proceed
+
     cluster_id = f"{stack}-cluster"
     pg_name = f"{stack}-cluster-pg"
     sg_name = f"{stack}-subnet-group"
@@ -756,8 +773,8 @@ def parse_args() -> argparse.Namespace:
                    help=f"AWS region (default: {DEFAULT_REGION})")
     p.add_argument("--aws-profile", default=DEFAULT_PROFILE,
                    help=f"AWS CLI profile for EC2/VPC (default: {DEFAULT_PROFILE})")
-    p.add_argument("--rds-profile", default=None,
-                   help="AWS CLI profile for RDS operations (default: same as --aws-profile)")
+    p.add_argument("--rds-profile", default="sandbox-storage",
+                   help="AWS CLI profile for RDS operations (default: sandbox-storage)")
     p.add_argument("--instance-type", default=DEFAULT_AURORA_INSTANCE,
                    help=f"Aurora instance type (default: {DEFAULT_AURORA_INSTANCE})")
     p.add_argument("--replicas", type=int, default=1,
