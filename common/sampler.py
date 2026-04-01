@@ -107,6 +107,80 @@ def read_net_bytes():
     return {"net_rx_bytes": rx_total, "net_tx_bytes": tx_total}
 '''
 
+_SAMPLER_THERMAL_FN = '''
+def read_thermal():
+    import glob
+    temps = []
+    for zone in sorted(glob.glob("/sys/class/thermal/thermal_zone*/temp")):
+        try:
+            with open(zone) as f:
+                temps.append(int(f.read().strip()))
+        except (IOError, ValueError):
+            pass
+    return {"thermal_zone0_mc": temps[0] if temps else 0}
+'''
+
+_SAMPLER_CPUFREQ_FN = '''
+def read_cpufreq():
+    import glob
+    freqs = []
+    for path in sorted(glob.glob("/sys/devices/system/cpu/cpu*/cpufreq/scaling_cur_freq")):
+        try:
+            with open(path) as f:
+                freqs.append(int(f.read().strip()))
+        except (IOError, ValueError):
+            pass
+    if not freqs:
+        return {"cpufreq_min_mhz": 0, "cpufreq_max_mhz": 0, "cpufreq_avg_mhz": 0}
+    return {
+        "cpufreq_min_mhz": round(min(freqs) / 1000),
+        "cpufreq_max_mhz": round(max(freqs) / 1000),
+        "cpufreq_avg_mhz": round(sum(freqs) / len(freqs) / 1000),
+    }
+'''
+
+_SAMPLER_LOADAVG_FN = '''
+def read_loadavg():
+    with open("/proc/loadavg") as f:
+        parts = f.read().split()
+    return {
+        "loadavg_1m": float(parts[0]),
+        "loadavg_5m": float(parts[1]),
+        "loadavg_15m": float(parts[2]),
+    }
+'''
+
+_SAMPLER_PER_CORE_CPU_FN = '''
+import json as _json
+
+_prev_per_core = {}
+
+def read_per_core_cpu_pct():
+    global _prev_per_core
+    cores = {}
+    with open("/proc/stat") as f:
+        for line in f:
+            if line.startswith("cpu") and not line.startswith("cpu "):
+                parts = line.split()
+                name = parts[0]
+                vals = [int(x) for x in parts[1:8]]
+                cores[name] = vals
+    result = {}
+    for name, vals in sorted(cores.items()):
+        total = sum(vals)
+        idle = vals[3]
+        if name in _prev_per_core:
+            prev_total, prev_idle = _prev_per_core[name]
+            dt = total - prev_total
+            di = idle - prev_idle
+            if dt > 0:
+                result[name] = round((1.0 - di / dt) * 100, 1)
+            else:
+                result[name] = 0.0
+        _prev_per_core[name] = (total, idle)
+    return _json.dumps(result) if result else ""
+'''
+
 _SAMPLER_MYSQL_FN = '''
 MYSQL_HOST = "{mysql_host}"
 MYSQL_USER = "{mysql_user}"
@@ -184,6 +258,14 @@ _SAMPLER_MAIN_COMMON_FIELDS = [
     "cpu_iowait", "cpu_irq", "cpu_softirq", "cpu_steal",
     "mem_total_mb", "mem_avail_mb", "mem_buffers_mb", "mem_cached_mb",
     "net_rx_bytes", "net_tx_bytes",
+    "thermal_zone0_mc",
+    "cpufreq_min_mhz",
+    "cpufreq_max_mhz",
+    "cpufreq_avg_mhz",
+    "loadavg_1m",
+    "loadavg_5m",
+    "loadavg_15m",
+    "per_core_cpu_pct_json",
 ]
 
 _SAMPLER_MYSQL_FIELDS = [
@@ -249,6 +331,10 @@ def main():
             cpu = read_cpu_jiffies()
             mem = read_memory()
             net = read_net_bytes()
+            thermal = read_thermal()
+            cpufreq = read_cpufreq()
+            loadavg = read_loadavg()
+            per_core_json = read_per_core_cpu_pct()
             row = {{
                 "epoch": epoch,
                 "cpu_user": cpu["user"],
@@ -265,6 +351,14 @@ def main():
                 "mem_cached_mb": mem["mem_cached_mb"],
                 "net_rx_bytes": net["net_rx_bytes"],
                 "net_tx_bytes": net["net_tx_bytes"],
+                "thermal_zone0_mc": thermal["thermal_zone0_mc"],
+                "cpufreq_min_mhz": cpufreq["cpufreq_min_mhz"],
+                "cpufreq_max_mhz": cpufreq["cpufreq_max_mhz"],
+                "cpufreq_avg_mhz": cpufreq["cpufreq_avg_mhz"],
+                "loadavg_1m": loadavg["loadavg_1m"],
+                "loadavg_5m": loadavg["loadavg_5m"],
+                "loadavg_15m": loadavg["loadavg_15m"],
+                "per_core_cpu_pct_json": per_core_json,
             }}{collect_extra}
             w.writerow(row)
             f.flush()
@@ -295,6 +389,10 @@ def generate_sampler_script(server_type, interval=5,
         _SAMPLER_MEM_FN,
         _SAMPLER_NET_FN,
     ]
+    parts.append(_SAMPLER_THERMAL_FN)
+    parts.append(_SAMPLER_CPUFREQ_FN)
+    parts.append(_SAMPLER_LOADAVG_FN)
+    parts.append(_SAMPLER_PER_CORE_CPU_FN)
 
     if server_type in ("aurora", "tidb"):
         parts.append(_SAMPLER_MYSQL_FN.format(
@@ -570,6 +668,81 @@ def safe_stats(values):
 
 
 # ---------------------------------------------------------------------------
+# Unicode sparkline history charts
+# ---------------------------------------------------------------------------
+
+SPARK_CHARS = '\u2581\u2582\u2583\u2584\u2585\u2586\u2587\u2588'
+
+
+def render_history_chart(values, width=40, label=""):
+    """Render a sparkline for percentage values (0-100 scale).
+
+    Returns a string like ``"CPU%: ▁▂▃▅▇█▇▅▃▂ (avg 45%, peak 89%)"``
+    or ``"CPU%: (no data)"`` when *values* is empty / all-None.
+    """
+    clean = [v for v in (values or []) if v is not None and isinstance(v, (int, float))]
+    if not clean:
+        return f"{label}: (no data)" if label else "(no data)"
+
+    # Subsample to *width* evenly spaced points when needed
+    if len(clean) > width:
+        step = len(clean) / width
+        clean = [clean[int(i * step)] for i in range(width)]
+
+    avg = sum(clean) / len(clean)
+    peak = max(clean)
+
+    chars = []
+    for v in clean:
+        clamped = max(0.0, min(100.0, v))
+        idx = int(clamped / 100.0 * 7)
+        idx = max(0, min(7, idx))
+        chars.append(SPARK_CHARS[idx])
+
+    sparkline = "".join(chars)
+    if label:
+        return f"{label}: {sparkline} (avg {avg:.0f}%, peak {peak:.0f}%)"
+    return f"{sparkline} (avg {avg:.0f}%, peak {peak:.0f}%)"
+
+
+def render_history_chart_raw(values, width=40, label=""):
+    """Render a sparkline for arbitrary numeric values (scaled to min/max).
+
+    Unlike :func:`render_history_chart` this does **not** assume a 0-100
+    percentage scale -- it normalises to the actual data range.
+
+    Returns e.g. ``"Load 1m: ▁▂▃▅▇█▇▅▃▂ (avg 3.2, peak 7.1)"``.
+    """
+    clean = [v for v in (values or []) if v is not None and isinstance(v, (int, float))]
+    if not clean:
+        return f"{label}: (no data)" if label else "(no data)"
+
+    # Subsample to *width* evenly spaced points when needed
+    if len(clean) > width:
+        step = len(clean) / width
+        clean = [clean[int(i * step)] for i in range(width)]
+
+    avg = sum(clean) / len(clean)
+    peak = max(clean)
+    lo = min(clean)
+    span = peak - lo
+
+    chars = []
+    for v in clean:
+        if span == 0:
+            idx = 4  # mid-level when all values are identical
+        else:
+            idx = int((v - lo) / span * 7)
+            idx = max(0, min(7, idx))
+        chars.append(SPARK_CHARS[idx])
+
+    sparkline = "".join(chars)
+    if label:
+        return f"{label}: {sparkline} (avg {avg:.1f}, peak {peak:.1f})"
+    return f"{sparkline} (avg {avg:.1f}, peak {peak:.1f})"
+
+
+# ---------------------------------------------------------------------------
 # Windowed interval derivation
 # ---------------------------------------------------------------------------
 
@@ -624,6 +797,14 @@ def derive_interval_metrics(metrics_rows, window_epoch_start, window_epoch_end,
             "client_mem_total_mb": total,
             "client_net_rx_mbps": round(net_rx_bps / 1_000_000, 2) if net_rx_bps is not None else None,
             "client_net_tx_mbps": round(net_tx_bps / 1_000_000, 2) if net_tx_bps is not None else None,
+            "client_thermal_mc": curr.get("thermal_zone0_mc"),
+            "client_cpufreq_min_mhz": curr.get("cpufreq_min_mhz"),
+            "client_cpufreq_max_mhz": curr.get("cpufreq_max_mhz"),
+            "client_cpufreq_avg_mhz": curr.get("cpufreq_avg_mhz"),
+            "client_loadavg_1m": curr.get("loadavg_1m"),
+            "client_loadavg_5m": curr.get("loadavg_5m"),
+            "client_loadavg_15m": curr.get("loadavg_15m"),
+            "client_per_core_cpu_pct": curr.get("per_core_cpu_pct_json"),
         })
 
         if server_type in ("aurora", "tidb"):
@@ -665,6 +846,10 @@ def build_interval_data(window_intervals, cpu_samples, db_samples,
             entry["client_mem_used_mb"] = closest_cpu.get("client_mem_used_mb")
             entry["client_net_rx_mbps"] = closest_cpu.get("client_net_rx_mbps")
             entry["client_net_tx_mbps"] = closest_cpu.get("client_net_tx_mbps")
+            entry["client_thermal_mc"] = closest_cpu.get("client_thermal_mc")
+            entry["client_cpufreq_avg_mhz"] = closest_cpu.get("client_cpufreq_avg_mhz")
+            entry["client_loadavg_1m"] = closest_cpu.get("client_loadavg_1m")
+            entry["client_per_core_cpu_pct"] = closest_cpu.get("client_per_core_cpu_pct")
 
         rows.append(entry)
     return rows
@@ -855,6 +1040,21 @@ def analyze_window(sysbench_text, csv_path, run_start_epoch,
         ),
         "client_net_tx_mbps": safe_stats(
             [r.get("client_net_tx_mbps") for r in cpu_samples]
+        ),
+        "client_thermal_mc": safe_stats(
+            [r.get("client_thermal_mc") for r in cpu_samples]
+        ),
+        "client_cpufreq_avg_mhz": safe_stats(
+            [r.get("client_cpufreq_avg_mhz") for r in cpu_samples]
+        ),
+        "client_loadavg_1m": safe_stats(
+            [r.get("client_loadavg_1m") for r in cpu_samples]
+        ),
+        "client_loadavg_5m": safe_stats(
+            [r.get("client_loadavg_5m") for r in cpu_samples]
+        ),
+        "client_loadavg_15m": safe_stats(
+            [r.get("client_loadavg_15m") for r in cpu_samples]
         ),
     }
 
