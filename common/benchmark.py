@@ -797,7 +797,7 @@ def sysbench_prepare(host_ip: str, key_path: str, endpoint: str, port: int,
         f"--mysql-db={db} --tables={tables} --table-size={table_size} "
         f"--threads={threads}"
     )
-    if workload in ("custom_iud", "custom_mixed", "custom_kv_sql"):
+    if workload == "custom_kv_sql":
         workload_path = f"{lua_dir}/{workload}.lua"
     else:
         workload_path = "oltp_read_write"
