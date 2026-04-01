@@ -4,6 +4,7 @@ import time
 from datetime import datetime
 from pathlib import Path
 
+from common.sampler import render_history_chart
 from common.util import log
 
 INSTANCE_PRICING = {
@@ -331,6 +332,41 @@ def _section_node_resources(lines, runs):
         )
     lines.append("")
 
+    ws_list = [r.get("window_stats", {}) for r in runs if r.get("window_stats")]
+    if ws_list:
+        thermal_vals = [ws["client_thermal_mc"]["avg"] for ws in ws_list
+                        if ws.get("client_thermal_mc", {}).get("avg") is not None]
+        loadavg_1m = [ws["client_loadavg_1m"]["avg"] for ws in ws_list
+                      if ws.get("client_loadavg_1m", {}).get("avg") is not None]
+        loadavg_5m = [ws["client_loadavg_5m"]["avg"] for ws in ws_list
+                      if ws.get("client_loadavg_5m", {}).get("avg") is not None]
+        loadavg_15m = [ws["client_loadavg_15m"]["avg"] for ws in ws_list
+                       if ws.get("client_loadavg_15m", {}).get("avg") is not None]
+        cpufreq_vals = [ws["client_cpufreq_avg_mhz"]["avg"] for ws in ws_list
+                        if ws.get("client_cpufreq_avg_mhz", {}).get("avg") is not None]
+
+        ext_rows = []
+        if thermal_vals:
+            avg_c = sum(thermal_vals) / len(thermal_vals) / 1000.0
+            ext_rows.append(("Thermal", f"{avg_c:.1f} C"))
+        if loadavg_1m and loadavg_5m and loadavg_15m:
+            la1 = sum(loadavg_1m) / len(loadavg_1m)
+            la5 = sum(loadavg_5m) / len(loadavg_5m)
+            la15 = sum(loadavg_15m) / len(loadavg_15m)
+            ext_rows.append(("Load Avg (1m/5m/15m)", f"{la1:.2f} / {la5:.2f} / {la15:.2f}"))
+        if cpufreq_vals:
+            avg_mhz = sum(cpufreq_vals) / len(cpufreq_vals)
+            ext_rows.append(("CPU Frequency", f"{avg_mhz:.0f} MHz"))
+
+        if ext_rows:
+            lines.append("### Client Extended Metrics")
+            lines.append("")
+            lines.append("| Metric | Value |")
+            lines.append("|--------|------:|")
+            for metric, val in ext_rows:
+                lines.append(f"| {metric} | {val} |")
+            lines.append("")
+
 
 def _section_instance_specs(lines, runs):
     instance_types = sorted(set(r.get("instance_type", "") for r in runs))
@@ -558,6 +594,86 @@ class CostTracker:
         log("=" * 70)
 
 
+def _print_client_extended_metrics(results):
+    ws_list = [r.get("window_stats", {}) for r in results if r.get("window_stats")]
+    if not ws_list:
+        return
+
+    thermal_vals = [ws["client_thermal_mc"]["avg"] for ws in ws_list
+                    if ws.get("client_thermal_mc", {}).get("avg") is not None]
+    loadavg_1m = [ws["client_loadavg_1m"]["avg"] for ws in ws_list
+                  if ws.get("client_loadavg_1m", {}).get("avg") is not None]
+    loadavg_5m = [ws["client_loadavg_5m"]["avg"] for ws in ws_list
+                  if ws.get("client_loadavg_5m", {}).get("avg") is not None]
+    loadavg_15m = [ws["client_loadavg_15m"]["avg"] for ws in ws_list
+                   if ws.get("client_loadavg_15m", {}).get("avg") is not None]
+    cpufreq_vals = [ws["client_cpufreq_avg_mhz"]["avg"] for ws in ws_list
+                    if ws.get("client_cpufreq_avg_mhz", {}).get("avg") is not None]
+
+    extras = []
+    if thermal_vals:
+        avg_c = sum(thermal_vals) / len(thermal_vals) / 1000.0
+        extras.append(f"Thermal: {avg_c:.1f}C")
+    if loadavg_1m and loadavg_5m and loadavg_15m:
+        la1 = sum(loadavg_1m) / len(loadavg_1m)
+        la5 = sum(loadavg_5m) / len(loadavg_5m)
+        la15 = sum(loadavg_15m) / len(loadavg_15m)
+        extras.append(f"Load: {la1:.2f}/{la5:.2f}/{la15:.2f}")
+    if cpufreq_vals:
+        avg_mhz = sum(cpufreq_vals) / len(cpufreq_vals)
+        extras.append(f"CPU Freq: {avg_mhz:.0f} MHz")
+
+    if extras:
+        log(f"  Client ext:  {' | '.join(extras)}")
+
+
+def _print_resource_history(results, server_nodes=None):
+    all_cpu = []
+    all_mem_pct = []
+    for r in results:
+        for iv in r.get("interval_data", []):
+            cpu = iv.get("client_cpu_pct")
+            if cpu is not None and isinstance(cpu, (int, float)):
+                all_cpu.append(cpu)
+            mem_mb = iv.get("client_mem_used_mb")
+            if mem_mb is not None and isinstance(mem_mb, (int, float)):
+                total_mb = iv.get("client_mem_total_mb")
+                if total_mb is None or total_mb <= 0:
+                    spec = INSTANCE_PRICING.get(r.get("ec2_instance_type", ""), {})
+                    total_mb = spec.get("mem_gb", 0) * 1024
+                if total_mb and total_mb > 0:
+                    all_mem_pct.append(mem_mb / total_mb * 100.0)
+
+    has_server = bool(server_nodes)
+    if not all_cpu and not all_mem_pct and not has_server:
+        return
+
+    log("")
+    log("\u2500\u2500 RESOURCE HISTORY " + "\u2500" * 42)
+    if all_cpu:
+        log(f"  {render_history_chart(all_cpu, width=50, label='Client CPU%')}")
+    if all_mem_pct:
+        log(f"  {render_history_chart(all_mem_pct, width=50, label='Client Mem%')}")
+
+    if server_nodes:
+        for node in server_nodes:
+            label = node.get("label", "Server")
+            idata = node.get("interval_data", [])
+            ncpu = [iv.get("client_cpu_pct") for iv in idata
+                    if iv.get("client_cpu_pct") is not None]
+            nmem = []
+            for iv in idata:
+                mb = iv.get("client_mem_used_mb")
+                tmb = iv.get("client_mem_total_mb")
+                if mb is not None and tmb and tmb > 0:
+                    nmem.append(mb / tmb * 100.0)
+            if ncpu:
+                log(f"  {render_history_chart(ncpu, width=50, label=f'{label} CPU%')}")
+            if nmem:
+                log(f"  {render_history_chart(nmem, width=50, label=f'{label} Mem%')}")
+    log("")
+
+
 def print_summary(results, server_type) -> None:
     if isinstance(results, dict):
         results = [results]
@@ -660,7 +776,11 @@ def print_summary(results, server_type) -> None:
             spec = INSTANCE_PRICING.get(client_inst, {})
             mem_s = f"{spec['mem_gb']}GB" if spec else "N/A"
             log(f"{'Client':<12} {client_inst:<22} {cpu_s:>8} {mem_s:>14} {'N/A':>14} {'N/A':>14}")
+
+        _print_client_extended_metrics(results)
         log("=" * 100)
+
+    _print_resource_history(results)
 
 
 def save_results(results, output_dir, label) -> Path:

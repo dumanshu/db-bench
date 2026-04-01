@@ -22,6 +22,8 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import boto3
 from botocore.config import Config
 
+from common.sampler import start_sampler, stop_sampler
+
 DEFAULT_REGION = "us-east-1"
 DEFAULT_SEED = "vlklt-001"
 DEFAULT_PROFILE = os.environ.get("AWS_PROFILE", "sandbox")
@@ -306,6 +308,20 @@ def main():
     if flame_jump_key and not flame_jump_key.exists():
         raise SystemExit(f"Flamegraph jump SSH key not found: {flame_jump_key}")
 
+    # Start system resource sampler
+    sampler_csv = f"/tmp/valkey_metrics_{int(time.time())}.csv"
+    try:
+        start_sampler(
+            host_ip=args.ssh_host,
+            key_path=args.ssh_key,
+            server_type="valkey",
+            interval=1,
+            user=args.ssh_user,
+        )
+        print(f"System sampler started on {args.ssh_host}")
+    except Exception as e:
+        print(f"Warning: Failed to start sampler: {e} (continuing without monitoring)")
+
     benchmark_cmd = build_remote_cmd(target_cmd, args.ssh_host, args.ssh_user, ssh_key)
     print(f"Remote command: {' '.join(shlex.quote(part) for part in benchmark_cmd)}")
     bench_proc = subprocess.Popen(
@@ -347,6 +363,16 @@ def main():
     finally:
         bench_proc.wait()
         output_thread.join()
+        try:
+            stop_sampler(
+                host_ip=args.ssh_host,
+                key_path=args.ssh_key,
+                local_csv_path=sampler_csv,
+                user=args.ssh_user,
+            )
+            print(f"System metrics saved to {sampler_csv}")
+        except Exception as e:
+            print(f"Warning: Failed to collect sampler metrics: {e}")
         if flamegraph_proc:
             flamegraph_proc.join()
 

@@ -209,6 +209,35 @@ def get_instance_info(region: str, profile: Optional[str], seed: str) -> dict:
     return info
 
 
+def discover_all_nodes(region: str, profile: Optional[str], seed: str) -> list:
+    """Return all running EC2 instances in the TiDB cluster with public IPs.
+
+    Each entry is ``{"role": ..., "public_ip": ..., "private_ip": ...,
+    "instance_type": ...}``.  Useful for deploying the resource sampler
+    on every node in the cluster.
+    """
+    client = ec2_client(profile, region)
+    stack = f"tidb-loadtest-{seed}"
+    filters = [
+        {"Name": "tag:Project", "Values": [stack]},
+        {"Name": "instance-state-name", "Values": ["running"]},
+    ]
+    resp = client.describe_instances(Filters=filters)
+    nodes = []
+    for reservation in resp.get("Reservations", []):
+        for inst in reservation.get("Instances", []):
+            tags = {tag["Key"]: tag["Value"] for tag in inst.get("Tags", [])}
+            public_ip = inst.get("PublicIpAddress")
+            if public_ip:
+                nodes.append({
+                    "role": tags.get("Role", "unknown"),
+                    "public_ip": public_ip,
+                    "private_ip": inst.get("PrivateIpAddress", ""),
+                    "instance_type": inst.get("InstanceType", ""),
+                })
+    return nodes
+
+
 def get_cluster_info(host: str, key_path: Path, port: int = DEFAULT_PORT,
                      db_host: str = "127.0.0.1") -> dict:
     script = f"""

@@ -28,6 +28,8 @@ from pathlib import Path
 import boto3
 import botocore
 
+from common.sampler import start_sampler, stop_sampler
+
 # ---------------------------------------------------------------------------
 DEFAULT_REGION = os.environ.get("AWS_DEFAULT_REGION", "us-east-1")
 DEFAULT_SEED = "dsqllt-001"
@@ -573,6 +575,21 @@ def main():
     segment_max = TOKEN_LIFETIME_SECONDS - TOKEN_REFRESH_MARGIN
     all_output = []
     all_progress = []
+
+    # -- Start EC2 client resource sampler --------------------------------
+    sampler_csv = str(
+        Path(__file__).resolve().with_name(
+            f"dsql-sampler-{datetime.datetime.now().strftime('%Y%m%d-%H%M%S')}.csv"
+        )
+    )
+    try:
+        start_sampler(
+            host_ip=client_ip, key_path=str(key_path),
+            server_type="generic", interval=1, user="ec2-user",
+        )
+    except Exception as e:
+        print(f"Warning: Failed to start sampler: {e}")
+
     bench_start = datetime.datetime.now(datetime.timezone.utc)
 
     if total_duration <= segment_max:
@@ -600,6 +617,15 @@ def main():
 
     bench_end = datetime.datetime.now(datetime.timezone.utc)
     bench_duration = (bench_end - bench_start).total_seconds()
+
+    try:
+        stop_sampler(
+            host_ip=client_ip, key_path=str(key_path),
+            local_csv_path=sampler_csv, user="ec2-user",
+        )
+        log(f"  Sampler CSV: {sampler_csv}")
+    except Exception as e:
+        print(f"Warning: Failed to stop sampler: {e}")
 
     # ── Parse results ────────────────────────────────────────────────────
     log("")
