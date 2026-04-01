@@ -14,10 +14,8 @@ import time
 from pathlib import Path
 from typing import Optional
 
-import boto3
-from botocore.config import Config
-
-from common.util import log
+from common.util import log, ec2_client
+from common.ssh import ssh_capture_simple
 from common.benchmark import (
     seeded_database_name,
     parse_sysbench_output as _common_parse_output,
@@ -83,12 +81,6 @@ AWS_COSTS = {
     },
 }
 
-BOTO_CONFIG = Config(
-    retries={"max_attempts": 10, "mode": "adaptive"},
-    connect_timeout=15,
-    read_timeout=60,
-)
-
 # ---------------------------------------------------------------------------
 # TiDB-specific SSH helpers (different API from common.ssh)
 # ---------------------------------------------------------------------------
@@ -104,16 +96,6 @@ def ssh_run(host: str, script: str, key_path: Path, strict: bool = True):
         "-i", str(key_path), f"ec2-user@{host}", "bash", "-s",
     ]
     subprocess.run(cmd, input=full, text=True, check=strict)
-
-
-def ssh_capture(host: str, script: str, key_path: Path):
-    full = "set -euo pipefail\n" + textwrap.dedent(script).lstrip()
-    cmd = [
-        "ssh", "-o", "BatchMode=yes", "-o", "StrictHostKeyChecking=no",
-        "-o", "IdentitiesOnly=yes", "-o", "ConnectTimeout=30",
-        "-i", str(key_path), f"ec2-user@{host}", "bash", "-s",
-    ]
-    return subprocess.run(cmd, input=full, text=True, capture_output=True)
 
 
 def ssh_stream(host: str, script: str, key_path: Path):
@@ -137,13 +119,8 @@ def ssh_stream(host: str, script: str, key_path: Path):
 # ---------------------------------------------------------------------------
 
 
-def ec2_client(profile: Optional[str], region: str):
-    session = boto3.session.Session(profile_name=profile, region_name=region)
-    return session.client("ec2", region_name=region, config=BOTO_CONFIG)
-
-
 def discover_tidb_host(region: str, profile: Optional[str], seed: str) -> str:
-    client = ec2_client(profile, region)
+    client = ec2_client(profile=profile, region=region)
     stack = f"tidb-loadtest-{seed}"
     filters = [
         {"Name": "tag:Project", "Values": [stack]},
@@ -163,7 +140,7 @@ def discover_tidb_host(region: str, profile: Optional[str], seed: str) -> str:
 
 def discover_tidb_endpoint(region: str, profile: Optional[str], seed: str) -> str:
     """Return a k3s node private IP for NodePort access from a decoupled client."""
-    client = ec2_client(profile, region)
+    client = ec2_client(profile=profile, region=region)
     stack = f"tidb-loadtest-{seed}"
     filters = [
         {"Name": "tag:Project", "Values": [stack]},
@@ -187,7 +164,7 @@ def discover_tidb_endpoint(region: str, profile: Optional[str], seed: str) -> st
 
 
 def get_instance_info(region: str, profile: Optional[str], seed: str) -> dict:
-    client = ec2_client(profile, region)
+    client = ec2_client(profile=profile, region=region)
     stack = f"tidb-loadtest-{seed}"
     filters = [
         {"Name": "tag:Project", "Values": [stack]},
@@ -251,7 +228,7 @@ SELECT 'region_count', COUNT(*) FROM information_schema.tikv_region_status;
 
 kubectl top pods -n tidb-cluster --no-headers 2>/dev/null | head -10 || echo "kubectl_error"
 """
-    result = ssh_capture(host, script, key_path)
+    result = ssh_capture_simple(host, key_path, script)
     info = {
         "tidb_version": "unknown", "tidb_count": 0, "tikv_count": 0,
         "pd_count": 0, "region_count": 0, "pods": [],
@@ -328,7 +305,7 @@ mysql -h "$DOWNSTREAM_IP" -P {self.downstream_port} -u root -e "
     ADD COLUMN dst_write_ts TIMESTAMP(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6);
 " 2>/dev/null && echo "OK"
 """
-        result = ssh_capture(self.host, script, self.key_path)
+        result = ssh_capture_simple(self.host, self.key_path, script)
         return "OK" in result.stdout
 
     def _write_row(self) -> Optional[int]:
@@ -341,7 +318,7 @@ mysql -h "$UPSTREAM_IP" -P 4000 -u root -N -e \
   "INSERT INTO cdc_test.lag_tracker (seq) VALUES ({seq});" 2>/dev/null \
   && echo "OK"
 """
-        result = ssh_capture(self.host, script, self.key_path)
+        result = ssh_capture_simple(self.host, self.key_path, script)
         if "OK" in result.stdout:
             return seq
         return None
@@ -355,7 +332,7 @@ mysql -h "$DOWNSTREAM_IP" -P {self.downstream_port} -u root -N -e \
    FROM cdc_test.lag_tracker \
    WHERE seq > {self._last_read_seq} ORDER BY seq;" 2>/dev/null
 """
-        result = ssh_capture(self.host, script, self.key_path)
+        result = ssh_capture_simple(self.host, self.key_path, script)
         rows: list[tuple[int, float]] = []
         for line in result.stdout.strip().split('\n'):
             parts = line.strip().split()
@@ -406,7 +383,7 @@ DOWNSTREAM_IP=$(kubectl get svc {self.downstream_svc} -n {self.downstream_ns} \
 mysql -h "$DOWNSTREAM_IP" -P {self.downstream_port} -u root -N -e \
   "SELECT seq FROM cdc_test.lag_tracker WHERE seq = {seq};" 2>/dev/null
 """
-            result = ssh_capture(self.host, script, self.key_path)
+            result = ssh_capture_simple(self.host, self.key_path, script)
             if str(seq) in result.stdout:
                 arrived = True
                 break
@@ -572,7 +549,7 @@ echo "Client: CPU=${CPU}% Mem=${MEM} Conn=${CONN}"
 echo "Pods:"
 kubectl top pods -n tidb-cluster --no-headers 2>/dev/null | awk '{printf "  %-20s CPU:%-6s Mem:%s\\n", $1, $2, $3}' | head -8 || echo "  N/A"
 """
-            result = ssh_capture(host, script, key_path)
+            result = ssh_capture_simple(host, key_path, script)
             if result.stdout.strip():
                 for line in result.stdout.strip().split('\n'):
                     log(line)
@@ -611,7 +588,7 @@ GROUP BY TYPE, INSTANCE
 ORDER BY TYPE, INSTANCE;
 " 2>/dev/null || echo "NODE N/A"
 '''
-    result = ssh_capture(host, script, key_path)
+    result = ssh_capture_simple(host, key_path, script)
     return result.stdout.strip()
 
 
@@ -639,7 +616,7 @@ GROUP BY TYPE, INSTANCE
 ORDER BY TYPE, INSTANCE;
 " 2>/dev/null || echo "N/A"
 '''
-    result = ssh_capture(host, script, key_path)
+    result = ssh_capture_simple(host, key_path, script)
     if result.stdout.strip():
         for line in result.stdout.strip().split('\n'):
             log(line)
@@ -675,7 +652,7 @@ FROM information_schema.tables
 WHERE table_schema = '{database}';
 " 2>/dev/null || echo "DB_DATA_BYTES=0"
 '''
-    result = ssh_capture(host, script, key_path)
+    result = ssh_capture_simple(host, key_path, script)
     info = {
         "ebs_total_gb": ebs_size_gb, "ebs_used_gb": 0, "ebs_used_pct": 0,
         "tikv_store_gb": 0, "tikv_store_pct": 0, "db_data_gb": 0,

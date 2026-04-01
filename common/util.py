@@ -125,6 +125,15 @@ def ec2():
     return aws_session().client("ec2", region_name=REGION, config=BOTO_CONFIG)
 
 
+def ec2_client(profile=None, region=None):
+    """Create an EC2 client with explicit profile/region (does not use globals)."""
+    session = boto3.session.Session(
+        profile_name=profile,
+        region_name=region or REGION,
+    )
+    return session.client("ec2", region_name=region or REGION, config=BOTO_CONFIG)
+
+
 def ssm():
     return aws_session().client("ssm", region_name=REGION, config=BOTO_CONFIG)
 

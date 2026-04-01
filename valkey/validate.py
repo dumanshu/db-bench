@@ -2,17 +2,12 @@
 """Validation and benchmarking utility for Valkey load-test stacks."""
 
 import argparse
-import ipaddress
 import json
 import os
-import shutil
 import subprocess
 import sys
-import textwrap
 import time
-import urllib.request
 from dataclasses import dataclass
-from datetime import datetime
 from decimal import Decimal
 from pathlib import Path
 
@@ -20,9 +15,11 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from common.aws import DEFAULT_SSH_KEY_PATH
 
-import boto3
 import botocore
-from botocore.config import Config
+
+from common.types import InstanceInfo
+from common.util import BOTO_CONFIG, log, need_cmd, my_public_cidr
+from common.ssh import ssh_run, ssh_capture
 
 
 REGION = "us-east-1"
@@ -36,12 +33,6 @@ DEFAULT_BENCH_CONCURRENCY = 100
 DEFAULT_MTR_COUNT = 20
 DEFAULT_MTR_INTERVAL = 0.2
 HOURS_PER_MONTH = Decimal("730")
-
-BOTO_CONFIG = Config(
-    retries={"max_attempts": 10, "mode": "adaptive"},
-    connect_timeout=15,
-    read_timeout=60,
-)
 
 AWS_LOCATION_MAP = {
     "us-east-1": "US East (N. Virginia)",
@@ -74,53 +65,24 @@ def configure_runtime(region=None, seed=None):
     STACK = f"valkey-loadtest-{SEED}"
 
 
-def ts():
-    return datetime.now().strftime("[%Y-%m-%dT%H:%M:%S%z]")
-
-
-def log(msg):
-    print(f"{ts()} {msg}", flush=True)
-
-
-def need_cmd(cmd):
-    if shutil.which(cmd):
-        return
-    raise SystemExit(f"ERROR: Required command '{cmd}' not found in PATH.")
-
-
-def my_public_cidr():
-    with urllib.request.urlopen("https://checkip.amazonaws.com", timeout=10) as resp:
-        ip = resp.read().decode().strip()
-    ipaddress.ip_address(ip)
-    return f"{ip}/32"
-
-
-def aws_session():
+def _aws_session():
     try:
+        import boto3
         return boto3.session.Session(profile_name=AWS_PROFILE, region_name=REGION)
     except botocore.exceptions.ProfileNotFound:
         raise SystemExit(f"ERROR: AWS profile '{AWS_PROFILE}' not found.")
 
 
 def ec2():
-    return aws_session().client("ec2", region_name=REGION, config=BOTO_CONFIG)
+    return _aws_session().client("ec2", region_name=REGION, config=BOTO_CONFIG)
 
 
 def elbv2():
-    return aws_session().client("elbv2", region_name=REGION, config=BOTO_CONFIG)
+    return _aws_session().client("elbv2", region_name=REGION, config=BOTO_CONFIG)
 
 
 def pricing():
-    return aws_session().client("pricing", region_name="us-east-1", config=BOTO_CONFIG)
-
-
-@dataclass
-class InstanceInfo:
-    role: str
-    instance_id: str
-    instance_type: str
-    public_ip: str
-    private_ip: str
+    return _aws_session().client("pricing", region_name="us-east-1", config=BOTO_CONFIG)
 
 
 @dataclass
@@ -146,9 +108,9 @@ def describe_stack_instances():
             infos[role] = InstanceInfo(
                 role=role,
                 instance_id=inst["InstanceId"],
-                instance_type=inst.get("InstanceType", ""),
                 public_ip=inst.get("PublicIpAddress"),
                 private_ip=inst.get("PrivateIpAddress"),
+                instance_type=inst.get("InstanceType", ""),
             )
     return infos
 
@@ -163,57 +125,6 @@ def discover_envoy_lb_dns():
     if not lbs:
         return None
     return lbs[0].get("DNSName")
-
-
-def host_target_and_jump(host: InstanceInfo, ctx: BootstrapContext):
-    target = host.public_ip or host.private_ip
-    if not target:
-        raise RuntimeError(f"{host.role} has no reachable IP")
-    jump = None
-    if host.role != ctx.client.role and not host.public_ip:
-        if not ctx.client.public_ip:
-            raise RuntimeError("Client missing public IP for ProxyJump")
-        jump = ctx.client.public_ip
-    return target, jump
-
-
-def ssh_base_cmd(host: InstanceInfo, ctx: BootstrapContext):
-    target, jump = host_target_and_jump(host, ctx)
-    cmd = [
-        "ssh",
-        "-o", "BatchMode=yes",
-        "-o", "StrictHostKeyChecking=no",
-        "-o", "IdentitiesOnly=yes",
-        "-o", "ConnectTimeout=10",
-        "-i", str(ctx.ssh_key_path),
-    ]
-    if jump:
-        proxy = (
-            "ssh -o StrictHostKeyChecking=no -o ConnectTimeout=10 "
-            f"-o IdentitiesOnly=yes -i {ctx.ssh_key_path} ec2-user@{jump} -W %h:%p"
-        )
-        cmd += ["-o", f"ProxyCommand={proxy}"]
-    cmd += [f"ec2-user@{target}"]
-    return cmd
-
-
-def ssh_run(host: InstanceInfo, script: str, ctx: BootstrapContext, strict=True):
-    full = textwrap.dedent(script).lstrip()
-    if strict:
-        full = "set -euo pipefail\n" + full
-    cmd = ssh_base_cmd(host, ctx) + ["bash", "-s"]
-    subprocess.run(cmd, input=full, text=True, check=strict)
-
-
-def ssh_capture(host: InstanceInfo, script: str, ctx: BootstrapContext, strict=True):
-    full = textwrap.dedent(script).lstrip()
-    if strict:
-        full = "set -euo pipefail\n" + full
-    cmd = ssh_base_cmd(host, ctx) + ["bash", "-s"]
-    proc = subprocess.run(cmd, input=full, text=True, capture_output=True)
-    if strict:
-        proc.check_returncode()
-    return proc
 
 
 def cluster_summary(client: InstanceInfo, valkey_hosts, ctx: BootstrapContext):

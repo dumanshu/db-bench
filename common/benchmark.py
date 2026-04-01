@@ -37,7 +37,7 @@ def _load_bench_client(seed):
 # Constants
 # ---------------------------------------------------------------------------
 
-MYSQL_IGNORE_ERRORS = "1062,8002,8028,8249"
+MYSQL_IGNORE_ERRORS = "1062,1213,8002,8028,8249"
 BYTES_PER_ROW = 250
 DATA_TO_RAM_RATIO = 5
 
@@ -1979,7 +1979,7 @@ def _main_tidb(args):
         DEFAULT_REGION, DEFAULT_SEED, DEFAULT_PROFILE, DEFAULT_PORT,
         INTERNAL_SERVICE_PORT, DEFAULT_DATABASE, DEFAULT_EBS_SIZE_GB,
         TIDB_MYSQL_IGNORE_ERRORS, AWS_COSTS,
-        ssh_run, ssh_capture, ssh_stream,
+        ssh_run, ssh_stream,
         discover_tidb_host, get_instance_info, get_cluster_info,
         print_cluster_summary, fetch_resource_snapshot_compact,
         fetch_final_resource_snapshot, get_disk_utilization,
@@ -2020,9 +2020,7 @@ def _main_tidb(args):
     elif client_state.get("key_path"):
         ssh_key_resolved = client_state["key_path"]
     else:
-        ssh_key_resolved = str(
-            Path(__file__).resolve().parent.parent / "tidb" /
-            "tidb-load-test-key.pem")
+        ssh_key_resolved = str(DEFAULT_SSH_KEY_PATH)
     key_path = Path(ssh_key_resolved).expanduser().resolve()
 
     # Log file setup
@@ -2058,7 +2056,7 @@ def _run_tidb_benchmark(
     """Inner TiDB benchmark logic (matches tidb/benchmark.py _run_benchmark)."""
     from tidb.driver import (
         DEFAULT_EBS_SIZE_GB, TIDB_MYSQL_IGNORE_ERRORS, AWS_COSTS,
-        ssh_run, ssh_capture, ssh_stream,
+        ssh_run, ssh_stream,
         discover_tidb_host, discover_tidb_endpoint,
         get_instance_info, get_cluster_info, discover_all_nodes,
         print_cluster_summary, fetch_resource_snapshot_compact,
@@ -2276,7 +2274,7 @@ mysql -h {db_host} -P {port} -u root -e \
         )
 
     def _run_capture(cmd_str):
-        return ssh_capture(bench_host, cmd_str + " 2>&1", bench_key)
+        return ssh_capture_simple(bench_host, bench_key, cmd_str + " 2>&1")
 
     def _resource_fn():
         return fetch_resource_snapshot_compact(host, key_path, port,
