@@ -481,7 +481,7 @@ def parse_metrics_csv(csv_path):
         for row in reader:
             parsed = {}
             for k, v in row.items():
-                if v == "":
+                if v is None or v == "":
                     parsed[k] = None
                     continue
                 try:

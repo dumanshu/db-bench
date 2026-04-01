@@ -1698,6 +1698,9 @@ def _main_aurora(args):
         get_innodb_rows, print_results, save_results,
     )
     import aurora.driver as adrv
+    from common.sampler import (start_sampler, stop_sampler, parse_metrics_csv,
+                                derive_interval_metrics, safe_stats, render_history_chart)
+    from common.report import _print_client_extended_metrics, _print_resource_history
 
     # Apply defaults for unset args
     region = args.region or DEFAULT_REGION
@@ -1812,6 +1815,17 @@ def _main_aurora(args):
         lua_dir=lua_dir,
     )
 
+    # Start client resource sampler
+    sampler_csv_path = f"/tmp/aurora_sampler_{int(time.time())}.csv"
+    sampler_started = False
+    try:
+        start_sampler(host, key_path, 'aurora', interval=1, user='ec2-user',
+                      mysql_host=endpoint, mysql_user='admin',
+                      mysql_password=password, mysql_port=str(port))
+        sampler_started = True
+    except Exception as e:
+        log(f"Warning: could not start sampler: {e}")
+
     bench_start = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
     if args.parallel > 1:
@@ -1826,6 +1840,34 @@ def _main_aurora(args):
 
     bench_end = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
+    # Stop sampler and collect metrics
+    cpu_samples = []
+    interval_data = []
+    sampler_ws = {}
+    client_cpu_pct = None
+    if sampler_started:
+        try:
+            stop_sampler(host, key_path, sampler_csv_path, user='ec2-user')
+            metrics_rows = parse_metrics_csv(sampler_csv_path)
+            if metrics_rows:
+                bench_start_epoch = metrics_rows[0].get('epoch', 0)
+                bench_end_epoch = metrics_rows[-1].get('epoch', 0)
+                cpu_samples, _ = derive_interval_metrics(
+                    metrics_rows, bench_start_epoch, bench_end_epoch, 'aurora')
+                cpu_vals = [s['cpu_pct'] for s in cpu_samples if s.get('cpu_pct') is not None]
+                if cpu_vals:
+                    client_cpu_pct = round(sum(cpu_vals) / len(cpu_vals), 1)
+                interval_data = cpu_samples
+                sampler_ws = {
+                    'client_thermal_mc': safe_stats([s.get('client_thermal_mc') for s in cpu_samples]),
+                    'client_loadavg_1m': safe_stats([s.get('client_loadavg_1m') for s in cpu_samples]),
+                    'client_loadavg_5m': safe_stats([s.get('client_loadavg_5m') for s in cpu_samples]),
+                    'client_loadavg_15m': safe_stats([s.get('client_loadavg_15m') for s in cpu_samples]),
+                    'client_cpufreq_avg_mhz': safe_stats([s.get('client_cpufreq_avg_mhz') for s in cpu_samples]),
+                }
+        except Exception as e:
+            log(f"Warning: could not collect sampler metrics: {e}")
+
     result.setdefault("workload", workload)
     result.setdefault("threads", threads)
     result["duration_s"] = duration
@@ -1839,8 +1881,6 @@ def _main_aurora(args):
 
     if result.get("latency_p95_ms") and not result.get("latency_95th_pct_ms"):
         result["latency_95th_pct_ms"] = result["latency_p95_ms"]
-
-    client_cpu_pct = None
 
     if not args.skip_iud_measurement and rows_before is not None:
         log("Taking InnoDB row counter snapshot (after)...")
@@ -1888,6 +1928,15 @@ def _main_aurora(args):
                  state=info, tables=tables, table_size=table_size,
                  cpu_pct=cpu_pct, client_cpu_pct=client_cpu_pct,
                  net_metrics=net_metrics, parallel=args.parallel)
+
+    if sampler_ws or interval_data:
+        fake_result = {
+            'window_stats': sampler_ws,
+            'interval_data': interval_data,
+            'ec2_instance_type': info.get('ec2_instance_type', ''),
+        }
+        _print_client_extended_metrics([fake_result])
+        _print_resource_history([fake_result])
 
     if not args.skip_cleanup:
         sysbench_cleanup(host, key_path, endpoint, port, "admin", password,
