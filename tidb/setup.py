@@ -132,8 +132,7 @@ AMI_SSM_PARAM = os.environ.get(
 )
 _RESOLVED_AMI_ID = None
 
-KEY_NAME = "tidb-load-test-key"
-DEFAULT_SSH_KEY_PATH = Path(__file__).resolve().with_name("tidb-load-test-key.pem")
+from common.aws import KEY_NAME, DEFAULT_SSH_KEY_PATH
 
 VPC_CIDR = "10.43.0.0/16"
 PUB_CIDR = "10.43.1.0/24"

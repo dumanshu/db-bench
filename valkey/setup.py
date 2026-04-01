@@ -77,8 +77,7 @@ AMI_SSM_PARAM = os.environ.get(
 _RESOLVED_AMI_ID = None
 
 # Existing KeyPair required
-KEY_NAME = "valkey-load-test-key"
-DEFAULT_SSH_KEY_PATH = Path(__file__).resolve().with_name("valkey-load-test-key.pem")
+from common.aws import KEY_NAME, DEFAULT_SSH_KEY_PATH
 
 # Amazon Linux 2 AMI resolved via SSM (override with VALKEY_AMI_ID when needed)
 
