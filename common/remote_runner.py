@@ -80,7 +80,7 @@ def generate_sysbench_script(params: dict) -> tuple[str, str]:
     skip_cleanup = params.get("skip_cleanup", False)
     multi_phase = params.get("multi_phase")
 
-    if workload in ("custom_iud", "custom_mixed"):
+    if workload in ("custom_iud", "custom_mixed", "custom_kv_sql"):
         workload_arg = f"{lua_dir}/{workload}.lua"
     else:
         workload_arg = workload
