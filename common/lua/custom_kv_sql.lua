@@ -19,6 +19,7 @@ sysbench.cmdline.options = {
 
 local con
 local drv
+local driver_name
 local profile
 local num_tables
 local table_size
@@ -30,6 +31,7 @@ local max_versions
 function thread_init()
    drv = sysbench.sql.driver()
    con = drv:connect()
+   driver_name = drv:name()
 
    profile = sysbench.opt.kv_profile
    num_tables = sysbench.opt.tables
@@ -88,13 +90,23 @@ local function prefix_query()
    local tbl = random_table()
    local key_id = existing_key_id()
    local prefix = string.format("sk_%05d", key_id % 100000)
-   con:query(string.format(
-      "SELECT * FROM %s WHERE primary_key = '%s' AND secondary_key LIKE concat(cast('%s' as char), '%%') ORDER BY secondary_key ASC LIMIT %d",
-      tbl,
-      string.format("pk_%010d", key_id),
-      prefix,
-      sysbench.opt.prefix_limit
-   ))
+   if driver_name == "pgsql" then
+      con:query(string.format(
+         "SELECT * FROM %s WHERE primary_key = '%s' AND secondary_key LIKE '%s' || '%%' ORDER BY secondary_key ASC LIMIT %d",
+         tbl,
+         string.format("pk_%010d", key_id),
+         prefix,
+         sysbench.opt.prefix_limit
+      ))
+   else
+      con:query(string.format(
+         "SELECT * FROM %s WHERE primary_key = '%s' AND secondary_key LIKE concat(cast('%s' as char), '%%') ORDER BY secondary_key ASC LIMIT %d",
+         tbl,
+         string.format("pk_%010d", key_id),
+         prefix,
+         sysbench.opt.prefix_limit
+      ))
+   end
 end
 
 local function range_query()
@@ -134,13 +146,25 @@ local function upsert_conditional()
    local val = random_value(val_size_write)
 
    con:query("BEGIN")
-   con:query(string.format(
-      "INSERT INTO %s (primary_key, secondary_key, timestamp, value) VALUES ('%s', '%s', %d, '%s') " ..
-      "ON DUPLICATE KEY UPDATE " ..
-      "timestamp = IF(VALUES(timestamp) >= timestamp, VALUES(timestamp), timestamp), " ..
-      "value = IF(VALUES(timestamp) >= timestamp, VALUES(value), value)",
-      tbl, pk, sk, ts, val
-   ))
+   if driver_name == "pgsql" then
+      con:query(string.format(
+         "INSERT INTO %s (primary_key, secondary_key, timestamp, value) VALUES ('%s', '%s', %d, '%s') " ..
+         "ON CONFLICT (primary_key, secondary_key, timestamp) DO UPDATE SET " ..
+         "timestamp = CASE WHEN EXCLUDED.timestamp >= %s.timestamp THEN EXCLUDED.timestamp ELSE %s.timestamp END, " ..
+         "value = CASE WHEN EXCLUDED.timestamp >= %s.timestamp THEN EXCLUDED.value ELSE %s.value END",
+         tbl, pk, sk, ts, val,
+         tbl, tbl,
+         tbl, tbl
+      ))
+   else
+      con:query(string.format(
+         "INSERT INTO %s (primary_key, secondary_key, timestamp, value) VALUES ('%s', '%s', %d, '%s') " ..
+         "ON DUPLICATE KEY UPDATE " ..
+         "timestamp = IF(VALUES(timestamp) >= timestamp, VALUES(timestamp), timestamp), " ..
+         "value = IF(VALUES(timestamp) >= timestamp, VALUES(value), value)",
+         tbl, pk, sk, ts, val
+      ))
+   end
    con:query("COMMIT")
 end
 
@@ -153,11 +177,19 @@ local function upsert_unconditional()
    local val = random_value(val_size_write)
 
    con:query("BEGIN")
-   con:query(string.format(
-      "INSERT INTO %s (primary_key, secondary_key, timestamp, value) VALUES ('%s', '%s', %d, '%s') " ..
-      "ON DUPLICATE KEY UPDATE value = VALUES(value)",
-      tbl, pk, sk, ts, val
-   ))
+   if driver_name == "pgsql" then
+      con:query(string.format(
+         "INSERT INTO %s (primary_key, secondary_key, timestamp, value) VALUES ('%s', '%s', %d, '%s') " ..
+         "ON CONFLICT (primary_key, secondary_key, timestamp) DO UPDATE SET value = EXCLUDED.value",
+         tbl, pk, sk, ts, val
+      ))
+   else
+      con:query(string.format(
+         "INSERT INTO %s (primary_key, secondary_key, timestamp, value) VALUES ('%s', '%s', %d, '%s') " ..
+         "ON DUPLICATE KEY UPDATE value = VALUES(value)",
+         tbl, pk, sk, ts, val
+      ))
+   end
    con:query("COMMIT")
 end
 
@@ -168,16 +200,30 @@ local function version_delete()
    local sk = string.format("sk_%010d", key_id)
 
    con:query("BEGIN")
-   con:query(string.format(
-      "DELETE FROM %s WHERE primary_key = '%s' AND secondary_key = '%s' " ..
-      "AND timestamp < (" ..
-         "SELECT ts FROM (SELECT timestamp AS ts FROM %s WHERE primary_key = '%s' AND secondary_key = '%s' " ..
-         "ORDER BY timestamp DESC LIMIT 1 OFFSET %d) AS subq" ..
-      ")",
-      tbl, pk, sk,
-      tbl, pk, sk,
-      max_versions
-   ))
+   if driver_name == "pgsql" then
+      con:query(string.format(
+         "WITH cutoff AS (" ..
+            "SELECT timestamp AS ts FROM %s WHERE primary_key = '%s' AND secondary_key = '%s' " ..
+            "ORDER BY timestamp DESC LIMIT 1 OFFSET %d" ..
+         ") " ..
+         "DELETE FROM %s WHERE primary_key = '%s' AND secondary_key = '%s' " ..
+         "AND timestamp < (SELECT ts FROM cutoff)",
+         tbl, pk, sk,
+         max_versions,
+         tbl, pk, sk
+      ))
+   else
+      con:query(string.format(
+         "DELETE FROM %s WHERE primary_key = '%s' AND secondary_key = '%s' " ..
+         "AND timestamp < (" ..
+            "SELECT ts FROM (SELECT timestamp AS ts FROM %s WHERE primary_key = '%s' AND secondary_key = '%s' " ..
+            "ORDER BY timestamp DESC LIMIT 1 OFFSET %d) AS subq" ..
+         ")",
+         tbl, pk, sk,
+         tbl, pk, sk,
+         max_versions
+      ))
+   end
    con:query("COMMIT")
 end
 
@@ -215,6 +261,7 @@ end
 function prepare()
    local drv = sysbench.sql.driver()
    local con = drv:connect()
+   local driver_name = drv:name()
    local num_tables = sysbench.opt.tables
    local table_size = sysbench.opt.table_size
    local pk_sz = sysbench.opt.pk_size
@@ -226,15 +273,27 @@ function prepare()
 
       print(string.format("Creating table %s...", tbl))
       con:query(string.format("DROP TABLE IF EXISTS %s", tbl))
-      con:query(string.format([[
-         CREATE TABLE %s (
-            primary_key VARBINARY(1024) NOT NULL,
-            secondary_key VARBINARY(1024) NOT NULL,
-            timestamp BIGINT NOT NULL,
-            value MEDIUMBLOB,
-            PRIMARY KEY (primary_key, secondary_key, timestamp) CLUSTERED
-         )
-      ]], tbl))
+      if driver_name == "pgsql" then
+         con:query(string.format([[
+            CREATE TABLE %s (
+               primary_key BYTEA NOT NULL,
+               secondary_key BYTEA NOT NULL,
+               timestamp BIGINT NOT NULL,
+               value BYTEA,
+               PRIMARY KEY (primary_key, secondary_key, timestamp)
+            )
+         ]], tbl))
+      else
+         con:query(string.format([[
+            CREATE TABLE %s (
+               primary_key VARBINARY(1024) NOT NULL,
+               secondary_key VARBINARY(1024) NOT NULL,
+               timestamp BIGINT NOT NULL,
+               value MEDIUMBLOB,
+               PRIMARY KEY (primary_key, secondary_key, timestamp) CLUSTERED
+            )
+         ]], tbl))
+      end
 
       local batch_size = 1000
       local rows_inserted = 0

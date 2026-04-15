@@ -38,9 +38,16 @@ function event()
             "UPDATE %s SET k = k + 1 WHERE id = %d",
             table_name, id))
     else
-        con:query(string.format(
-            "DELETE FROM %s WHERE id = %d LIMIT 1",
-            table_name, id))
+        local driver = drv:name()
+        if driver == "pgsql" then
+            con:query(string.format(
+                "DELETE FROM %s WHERE ctid = (SELECT ctid FROM %s WHERE id = %d LIMIT 1)",
+                table_name, table_name, id))
+        else
+            con:query(string.format(
+                "DELETE FROM %s WHERE id = %d LIMIT 1",
+                table_name, id))
+        end
     end
 
     con:query("COMMIT")
