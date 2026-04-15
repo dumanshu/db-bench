@@ -11,6 +11,7 @@ import re
 import subprocess
 import textwrap
 import time
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional, Callable
 
@@ -40,6 +41,53 @@ def _load_bench_client(seed):
 MYSQL_IGNORE_ERRORS = "1062,1213,8002,8028,8249"
 BYTES_PER_ROW = 250
 DATA_TO_RAM_RATIO = 5
+
+# Engine type classification
+PG_ENGINE_TYPES = {"dsql", "aurora-pg"}
+MYSQL_ENGINE_TYPES = {"aurora", "tidb"}
+
+# DSQL IAM token constants
+DSQL_TOKEN_LIFETIME_SECONDS = 900
+DSQL_TOKEN_REFRESH_MARGIN = 120  # refresh 2min before expiry
+
+# Isolation-level mapping: CLI value -> SQL keyword
+ISOLATION_LEVEL_MAP = {
+    "read-committed": "READ COMMITTED",
+    "repeatable-read": "REPEATABLE READ",
+    "serializable": "SERIALIZABLE",
+}
+
+# DSQL pricing (us-east-1, per-million request processing units)
+DSQL_PRICING = {
+    "write_rpu_per_million": 2.25,
+    "read_rpu_per_million": 0.45,
+    "storage_per_gb_month": 0.25,
+}
+
+# Aurora I/O-Optimized pricing: no per-I/O charge, ~30% higher instance cost.
+# We default to I/O-Optimized because it is the recommended production
+# configuration and avoids the per-I/O variance that makes cost comparison
+# unreliable.  The multiplier is applied on top of INSTANCE_PRICING hourly
+# rates (which reflect Standard pricing).
+AURORA_IO_OPTIMIZED_MULTIPLIER = 1.30
+
+
+def is_pg_engine(server_type: str) -> bool:
+    """Return True if the server type uses the PostgreSQL wire protocol."""
+    return server_type in PG_ENGINE_TYPES
+
+
+def _pg_cli_cmd(host: str, port: int, user: str, password: str,
+                db: str, sql: str) -> str:
+    """Build a psql one-liner for remote SSH execution.
+
+    Pattern: ``PGPASSWORD=xxx psql -h HOST -p PORT -U USER -d DB -c "SQL"``
+    """
+    pw_env = f"PGPASSWORD='{password}' " if password else ""
+    return (
+        f"{pw_env}psql -h '{host}' -p {port} -U {user} -d {db} "
+        f"-c \"{sql}\""
+    )
 
 WORKLOADS = [
     "oltp_read_write",
@@ -252,6 +300,8 @@ def _empty_result() -> dict:
         "reconnects": None,
         "availability_pct": None,
         "errors_per_sec": None,
+        "errors_total": None,
+        "retries_total": None,
     }
 
 
@@ -437,11 +487,13 @@ def parse_sysbench_output(text: str) -> dict:
     if m:
         result["ignored_errors"] = int(m.group(1))
         result["errors_per_sec"] = float(m.group(2))
+    result["errors_total"] = result["ignored_errors"]
 
     # -- Reconnects: "reconnects:  0  (0.00 per sec.)" -----------------------
     m = re.search(r'reconnects:\s+(\d+)', text)
     if m:
         result["reconnects"] = int(m.group(1))
+    result["retries_total"] = result["reconnects"]
 
     # -- Latency block --------------------------------------------------------
     # Parse within the "Latency (ms):" section to avoid false matches from
@@ -494,15 +546,22 @@ def parse_interval_line(line: str) -> Optional[dict]:
     m = _INTERVAL_RE.search(line)
     if not m:
         return None
+    tps = float(m.group(3))
+    err_per_sec = float(m.group(7))
+    if tps + err_per_sec > 0:
+        avail = round(tps / (tps + err_per_sec) * 100, 4)
+    else:
+        avail = 100.0 if tps > 0 else None
     return {
         "elapsed_s": float(m.group(1)),
         "threads": int(m.group(2)),
-        "tps": float(m.group(3)),
+        "tps": tps,
         "qps": float(m.group(4)),
         "latency_pct": int(m.group(5)),
         "latency_pct_ms": float(m.group(6)),
-        "err_per_sec": float(m.group(7)),
+        "err_per_sec": err_per_sec,
         "reconn_per_sec": float(m.group(8)),
+        "availability_pct": avail,
     }
 
 
@@ -514,6 +573,64 @@ def parse_interval_lines(text: str) -> list[dict]:
         if iv:
             intervals.append(iv)
     return intervals
+
+
+# ---------------------------------------------------------------------------
+# Warmup
+# ---------------------------------------------------------------------------
+
+
+def warmup_database(
+    host_ip: str,
+    key_path: str,
+    endpoint: str,
+    port: int,
+    user: str,
+    password: str,
+    db: str,
+    tables: int,
+    table_size: int,
+    server_type: str = "aurora",
+    warmup_duration: int = 30,
+    threads: int = 4,
+    lua_dir: Optional[str] = None,
+):
+    """Run a short read-only warmup to prime buffer pools and PG statistics.
+
+    For PG engines, runs ``ANALYZE`` on each sysbench table first, then a
+    short sysbench ``oltp_read_only`` pass.  For MySQL engines, just the
+    sysbench read-only pass.
+    """
+    pg = is_pg_engine(server_type)
+
+    if pg:
+        log("Warmup: running ANALYZE on sysbench tables...")
+        for i in range(1, tables + 1):
+            analyze_sql = f"ANALYZE sbtest{i}"
+            analyze_cmd = _pg_cli_cmd(endpoint, port, user, password, db,
+                                      analyze_sql)
+            try:
+                ssh_run_simple(host_ip, key_path, analyze_cmd)
+            except Exception as e:
+                log(f"  Warning: ANALYZE sbtest{i} failed: {e}")
+
+    log(f"Warmup: {warmup_duration}s read-only pass ({threads} threads)...")
+    warmup_cmd = build_sysbench_cmd(
+        host_ip=host_ip, key_path=key_path,
+        workload="oltp_read_only", threads=threads,
+        duration=warmup_duration, tables=tables,
+        table_size=table_size, endpoint=endpoint,
+        port=port, user=user, password=password,
+        db=db, report_interval=warmup_duration,
+        lua_dir=lua_dir,
+        server_type=server_type,
+    )
+    try:
+        run_sysbench(host_ip, key_path, warmup_cmd,
+                     timeout=warmup_duration + 60)
+        log("Warmup complete.")
+    except Exception as e:
+        log(f"Warning: warmup sysbench pass failed: {e}")
 
 
 # ---------------------------------------------------------------------------
@@ -537,6 +654,8 @@ def build_sysbench_cmd(
     report_interval: int,
     extra_args: Optional[list[str]] = None,
     lua_dir: Optional[str] = None,
+    server_type: str = "aurora",
+    isolation_level: str = "read-committed",
 ) -> str:
     """Build a sysbench command string suitable for remote SSH execution.
 
@@ -547,8 +666,14 @@ def build_sysbench_cmd(
 
     *host_ip* and *key_path* are accepted for API consistency but are not
     used by this function.
+
+    When *server_type* is a PG engine (dsql, aurora-pg), the command uses
+    ``--db-driver=pgsql`` and ``--pgsql-*`` connection flags instead of
+    ``--mysql-*``.
+
+    *isolation_level* sets the transaction isolation level via a connection
+    init command.  Supported values are keys of :data:`ISOLATION_LEVEL_MAP`.
     """
-    # Resolve workload argument
     if workload in ("custom_iud", "custom_mixed", "custom_kv_sql"):
         remote_lua_dir = lua_dir or "/tmp/lua"
         workload_arg = f"{remote_lua_dir}/{workload}.lua"
@@ -557,24 +682,41 @@ def build_sysbench_cmd(
 
     parts = [f"sysbench {workload_arg}"]
 
-    # Connection parameters
-    parts.append(f"--mysql-host='{endpoint}'")
-    parts.append(f"--mysql-port={port}")
-    parts.append(f"--mysql-user={user}")
-    if password:
-        parts.append(f"--mysql-password='{password}'")
-    parts.append(f"--mysql-db={db}")
+    pg = is_pg_engine(server_type)
+    if pg:
+        parts.append("--db-driver=pgsql")
+        parts.append(f"--pgsql-host='{endpoint}'")
+        parts.append(f"--pgsql-port={port}")
+        parts.append(f"--pgsql-user={user}")
+        if password:
+            parts.append(f"--pgsql-password='{password}'")
+        parts.append(f"--pgsql-db={db}")
+    else:
+        parts.append(f"--mysql-host='{endpoint}'")
+        parts.append(f"--mysql-port={port}")
+        parts.append(f"--mysql-user={user}")
+        if password:
+            parts.append(f"--mysql-password='{password}'")
+        parts.append(f"--mysql-db={db}")
 
-    # Table / concurrency parameters
     parts.append(f"--tables={tables}")
     parts.append(f"--table-size={table_size}")
     parts.append(f"--threads={threads}")
     parts.append(f"--time={duration}")
     parts.append(f"--report-interval={report_interval}")
 
-    # Defaults: 99th-percentile reporting, ignore known transient errors
     parts.append("--percentile=99")
-    parts.append(f"--mysql-ignore-errors={MYSQL_IGNORE_ERRORS}")
+    if not pg:
+        parts.append(f"--mysql-ignore-errors={MYSQL_IGNORE_ERRORS}")
+
+    iso_sql = ISOLATION_LEVEL_MAP.get(isolation_level, "")
+    if iso_sql:
+        if pg:
+            parts.append(
+                f"--pgsql-options='--default_transaction_isolation={iso_sql.lower().replace(' ', '_')}'")
+        else:
+            parts.append(
+                f"--mysql-init-command='SET SESSION TRANSACTION ISOLATION LEVEL {iso_sql}'")
 
     if extra_args:
         parts.extend(extra_args)
@@ -762,7 +904,8 @@ def sysbench_prepare(host_ip: str, key_path: str, endpoint: str, port: int,
                      user: str, password: str, db: str, tables: int,
                      table_size: int, threads: int = 1,
                      workload: str = "oltp_read_write",
-                     lua_dir: str = "/tmp/lua") -> None:
+                     lua_dir: str = "/tmp/lua",
+                     server_type: str = "aurora") -> None:
     """Prepare sysbench tables (CREATE DATABASE + ``sysbench ... prepare``).
 
     Creates the database if it does not exist, then runs the sysbench
@@ -773,37 +916,54 @@ def sysbench_prepare(host_ip: str, key_path: str, endpoint: str, port: int,
     log(f"Preparing sysbench: {tables} tables x {table_size:,} rows "
         f"(~{est_gb} GB), {threads} threads")
 
-    # Build connection options
-    pw_opt = f"-p'{password}'" if password else ""
+    pg = is_pg_engine(server_type)
 
-    # Create database
-    create_db_script = (
-        f"mysql -h '{endpoint}' -P {port} -u {user} {pw_opt} "
-        f"-e 'CREATE DATABASE IF NOT EXISTS {db}' 2>&1"
-    )
+    if pg:
+        create_db_script = (
+            _pg_cli_cmd(endpoint, port, user, password, "postgres",
+                        f"CREATE DATABASE {db}") + " 2>&1 || true"
+        )
+    else:
+        pw_opt = f"-p'{password}'" if password else ""
+        create_db_script = (
+            f"mysql -h '{endpoint}' -P {port} -u {user} {pw_opt} "
+            f"-e 'CREATE DATABASE IF NOT EXISTS {db}' 2>&1"
+        )
     r = ssh_run_simple(host_ip, key_path, create_db_script, timeout=60)
     if r.returncode != 0:
         log(f"WARNING: CREATE DATABASE returned {r.returncode}: "
             f"{r.stdout.strip()} {r.stderr.strip()}")
 
-    # Build sysbench prepare command
-    common = (
-        f"--mysql-host='{endpoint}' --mysql-port={port} "
-        f"--mysql-user={user} "
-    )
-    if password:
-        common += f"--mysql-password='{password}' "
-    common += (
-        f"--mysql-db={db} --tables={tables} --table-size={table_size} "
-        f"--threads={threads}"
-    )
+    if pg:
+        common = (
+            f"--db-driver=pgsql "
+            f"--pgsql-host='{endpoint}' --pgsql-port={port} "
+            f"--pgsql-user={user} "
+        )
+        if password:
+            common += f"--pgsql-password='{password}' "
+        common += (
+            f"--pgsql-db={db} --tables={tables} --table-size={table_size} "
+            f"--threads={threads}"
+        )
+    else:
+        common = (
+            f"--mysql-host='{endpoint}' --mysql-port={port} "
+            f"--mysql-user={user} "
+        )
+        if password:
+            common += f"--mysql-password='{password}' "
+        common += (
+            f"--mysql-db={db} --tables={tables} --table-size={table_size} "
+            f"--threads={threads}"
+        )
+
     if workload in ("custom_iud", "custom_mixed", "custom_kv_sql"):
         workload_path = f"{lua_dir}/{workload}.lua"
     else:
         workload_path = "oltp_read_write"
     prepare_cmd = f"sysbench {workload_path} {common} prepare 2>&1"
 
-    # Use streaming Popen for progress reporting on large data loads
     proc = _ssh_popen(host_ip, key_path, prepare_cmd)
     tables_done = 0
     start = time.time()
@@ -835,16 +995,27 @@ def sysbench_prepare(host_ip: str, key_path: str, endpoint: str, port: int,
 
 def sysbench_cleanup(host_ip: str, key_path: str, endpoint: str, port: int,
                      user: str, password: str, db: str,
-                     tables: int) -> None:
+                     tables: int, server_type: str = "aurora") -> None:
     """Drop sysbench tables via ``sysbench ... cleanup``."""
     log(f"Cleaning up sysbench tables in {db}...")
-    common = (
-        f"--mysql-host='{endpoint}' --mysql-port={port} "
-        f"--mysql-user={user} "
-    )
-    if password:
-        common += f"--mysql-password='{password}' "
-    common += f"--mysql-db={db} --tables={tables}"
+    pg = is_pg_engine(server_type)
+    if pg:
+        common = (
+            f"--db-driver=pgsql "
+            f"--pgsql-host='{endpoint}' --pgsql-port={port} "
+            f"--pgsql-user={user} "
+        )
+        if password:
+            common += f"--pgsql-password='{password}' "
+        common += f"--pgsql-db={db} --tables={tables}"
+    else:
+        common = (
+            f"--mysql-host='{endpoint}' --mysql-port={port} "
+            f"--mysql-user={user} "
+        )
+        if password:
+            common += f"--mysql-password='{password}' "
+        common += f"--mysql-db={db} --tables={tables}"
     script = f"sysbench oltp_read_write {common} cleanup 2>&1"
     ssh_run_simple(host_ip, key_path, script, timeout=120)
     log("  Cleanup done")
@@ -853,7 +1024,8 @@ def sysbench_cleanup(host_ip: str, key_path: str, endpoint: str, port: int,
 def fast_fill(host_ip: str, key_path: str, endpoint: str, port: int,
               user: str, password: str, fill_db: str, fill_tables: int,
               seed_rows: int, doublings: int,
-              fill_threads: int = 64) -> None:
+              fill_threads: int = 64,
+              server_type: str = "aurora") -> None:
     """Populate a database using INSERT...SELECT doubling.
 
     Creates *fill_tables* tables with *seed_rows* rows each via
@@ -863,25 +1035,37 @@ def fast_fill(host_ip: str, key_path: str, endpoint: str, port: int,
     final_rows = seed_rows * (2 ** doublings)
     total_rows = final_rows * fill_tables
     est_gb = round(total_rows * BYTES_PER_ROW / 1e9, 1)
-    pw_opt = f"-p'{password}'" if password else ""
+    pg = is_pg_engine(server_type)
 
     log("=== FILL PHASE ===")
     log(f"Target: {fill_tables} tables x {final_rows:,} rows/table "
         f"(~{est_gb} GB), {doublings} doublings from {seed_rows:,} seed")
 
-    # Drop existing fill database
     log(f"Dropping existing '{fill_db}' (if any)...")
-    drop_script = (
-        f"mysql -h '{endpoint}' -P {port} -u {user} {pw_opt} "
-        f"-e 'DROP DATABASE IF EXISTS {fill_db}' 2>&1"
-    )
+    if pg:
+        drop_script = (
+            _pg_cli_cmd(endpoint, port, user, password, "postgres",
+                        f"DROP DATABASE IF EXISTS {fill_db}") + " 2>&1"
+        )
+    else:
+        pw_opt = f"-p'{password}'" if password else ""
+        drop_script = (
+            f"mysql -h '{endpoint}' -P {port} -u {user} {pw_opt} "
+            f"-e 'DROP DATABASE IF EXISTS {fill_db}' 2>&1"
+        )
     ssh_run_simple(host_ip, key_path, drop_script, timeout=120)
 
-    # Create fill database and seed tables
-    create_script = (
-        f"mysql -h '{endpoint}' -P {port} -u {user} {pw_opt} "
-        f"-e 'CREATE DATABASE IF NOT EXISTS {fill_db}' 2>&1"
-    )
+    if pg:
+        create_script = (
+            _pg_cli_cmd(endpoint, port, user, password, "postgres",
+                        f"CREATE DATABASE {fill_db}") + " 2>&1 || true"
+        )
+    else:
+        pw_opt = f"-p'{password}'" if password else ""
+        create_script = (
+            f"mysql -h '{endpoint}' -P {port} -u {user} {pw_opt} "
+            f"-e 'CREATE DATABASE IF NOT EXISTS {fill_db}' 2>&1"
+        )
     r = ssh_run_simple(host_ip, key_path, create_script, timeout=60)
     if r.returncode != 0:
         log(f"ERROR creating fill database: {r.stdout} {r.stderr}")
@@ -889,9 +1073,9 @@ def fast_fill(host_ip: str, key_path: str, endpoint: str, port: int,
 
     log(f"Creating {fill_tables} seed tables with {seed_rows:,} rows each...")
     sysbench_prepare(host_ip, key_path, endpoint, port, user, password,
-                     fill_db, fill_tables, seed_rows, fill_threads)
+                     fill_db, fill_tables, seed_rows, fill_threads,
+                     server_type=server_type)
 
-    # Doubling loop
     for d in range(1, doublings + 1):
         rows_before = seed_rows * (2 ** (d - 1))
         rows_after = rows_before * 2
@@ -899,10 +1083,16 @@ def fast_fill(host_ip: str, key_path: str, endpoint: str, port: int,
         log(f"Doubling {d}/{doublings}: {rows_before:,} -> {rows_after:,} "
             f"rows/table (inserting ~{batch_gb} GB across {fill_tables} tables)...")
 
-        script = _build_doubling_script(
-            endpoint, port, user, password, fill_db,
-            fill_tables, fill_threads,
-        )
+        if pg:
+            script = _build_doubling_script_pg(
+                endpoint, port, user, password, fill_db,
+                fill_tables, fill_threads,
+            )
+        else:
+            script = _build_doubling_script(
+                endpoint, port, user, password, fill_db,
+                fill_tables, fill_threads,
+            )
         start = time.time()
         r = ssh_run_simple(host_ip, key_path, script, timeout=7200)
         elapsed = time.time() - start
@@ -917,16 +1107,31 @@ def fast_fill(host_ip: str, key_path: str, endpoint: str, port: int,
                 log(f"  WARN: {line}")
         log(f"  Doubling {d} complete in {elapsed:.0f}s -- {stdout_last}")
 
-    # Report final stats
-    stats_script = (
-        f"mysql -h '{endpoint}' -P {port} -u {user} {pw_opt} {fill_db} "
-        f"-e \"SELECT COUNT(*) as tables_count, "
-        f"SUM(table_rows) as total_rows, "
-        f"ROUND(SUM(data_length + index_length)/1024/1024/1024, 2) as total_gb "
-        f"FROM information_schema.tables "
-        f"WHERE table_schema='{fill_db}'\" "
-        f"--batch 2>/dev/null"
-    )
+    if pg:
+        stats_script = (
+            _pg_cli_cmd(endpoint, port, user, password, fill_db,
+                        "SELECT count(*) AS tables_count FROM information_schema.tables "
+                        f"WHERE table_schema='public' AND table_type='BASE TABLE'")
+            + " 2>/dev/null && "
+            + _pg_cli_cmd(endpoint, port, user, password, fill_db,
+                          "SELECT SUM(n_live_tup) AS total_rows "
+                          "FROM pg_stat_user_tables")
+            + " 2>/dev/null && "
+            + _pg_cli_cmd(endpoint, port, user, password, fill_db,
+                          "SELECT pg_size_pretty(pg_database_size(current_database())) AS total_size")
+            + " 2>/dev/null"
+        )
+    else:
+        pw_opt = f"-p'{password}'" if password else ""
+        stats_script = (
+            f"mysql -h '{endpoint}' -P {port} -u {user} {pw_opt} {fill_db} "
+            f"-e \"SELECT COUNT(*) as tables_count, "
+            f"SUM(table_rows) as total_rows, "
+            f"ROUND(SUM(data_length + index_length)/1024/1024/1024, 2) as total_gb "
+            f"FROM information_schema.tables "
+            f"WHERE table_schema='{fill_db}'\" "
+            f"--batch 2>/dev/null"
+        )
     r = ssh_run_simple(host_ip, key_path, stats_script, timeout=60)
     log(f"Fill stats:\n{r.stdout.strip()}")
     log("=== FILL COMPLETE ===")
@@ -969,6 +1174,46 @@ wait
 FINAL_ROWS=$(mysql -h "$DB_HOST" -P "$DB_PORT" -u "$DB_USER" {pw_flag} "$DB_NAME" \
     -sN -e "SELECT SUM(table_rows) FROM information_schema.tables \
     WHERE table_schema='$DB_NAME'" 2>/dev/null)
+echo "DOUBLING_COMPLETE errors=$ERRORS total_rows=$FINAL_ROWS"
+"""
+
+
+def _build_doubling_script_pg(endpoint: str, port: int, user: str,
+                               password: str, db: str, tables: int,
+                               max_parallel: int) -> str:
+    """Build a bash script that doubles every table via INSERT...SELECT (PG)."""
+    pw_env = f"PGPASSWORD='{password}' " if password else ""
+    return f"""#!/bin/bash
+DB_HOST='{endpoint}'
+DB_PORT={port}
+DB_USER='{user}'
+DB_NAME='{db}'
+ERRORS=0
+
+do_insert() {{
+    local tbl=$1
+    if ! {pw_env}psql -h "$DB_HOST" -p "$DB_PORT" -U "$DB_USER" -d "$DB_NAME" \
+         -c "INSERT INTO sbtest$tbl (k, c, pad) SELECT k, c, pad FROM sbtest$tbl" \
+         2>/tmp/double_err_$tbl.log; then
+        echo "FAILED: sbtest$tbl: $(cat /tmp/double_err_$tbl.log)" >&2
+        return 1
+    fi
+    rm -f /tmp/double_err_$tbl.log
+}}
+
+running=0
+for i in $(seq 1 {tables}); do
+    do_insert $i &
+    running=$((running + 1))
+    if [ $running -ge {max_parallel} ]; then
+        wait -n 2>/dev/null || ERRORS=$((ERRORS + 1))
+        running=$((running - 1))
+    fi
+done
+wait
+
+FINAL_ROWS=$({pw_env}psql -h "$DB_HOST" -p "$DB_PORT" -U "$DB_USER" -d "$DB_NAME" \
+    -tA -c "SELECT SUM(n_live_tup) FROM pg_stat_user_tables" 2>/dev/null)
 echo "DOUBLING_COMPLETE errors=$ERRORS total_rows=$FINAL_ROWS"
 """
 
@@ -1278,18 +1523,21 @@ def run_multi_phase_benchmark(
 def parse_args():
     """Unified argument parser for ``python3 -m common.benchmark``.
 
-    Supports ``--server-type {aurora,tidb}`` with shared and
+    Supports ``--server-type {aurora,tidb,dsql,aurora-pg}`` with shared and
     server-specific arguments.
     """
     import argparse
 
     p = argparse.ArgumentParser(
-        description="Run sysbench benchmarks against Aurora MySQL or TiDB.",
+        description="Run sysbench benchmarks against Aurora MySQL, TiDB, "
+                    "Aurora PostgreSQL, or DSQL.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=textwrap.dedent("""\
             Examples:
               python3 -m common.benchmark --server-type aurora
               python3 -m common.benchmark --server-type tidb --profile heavy
+              python3 -m common.benchmark --server-type dsql --dsql-cluster-endpoint abc.dsql.us-east-1.on.aws
+              python3 -m common.benchmark --server-type aurora-pg --endpoint mywriter.cluster-xxx.us-east-1.rds.amazonaws.com
               python3 -m aurora.benchmark   (equivalent to --server-type aurora)
               python3 -m tidb.benchmark     (equivalent to --server-type tidb)
         """),
@@ -1297,7 +1545,7 @@ def parse_args():
 
     # Required: server type
     p.add_argument("--server-type", required=True,
-                   choices=["aurora", "tidb", "valkey"],
+                   choices=["aurora", "tidb", "valkey", "dsql", "aurora-pg"],
                    help="Database server type to benchmark")
 
     p.add_argument("--action", choices=["run", "deploy", "status", "fetch"],
@@ -1372,6 +1620,10 @@ def parse_args():
     p.add_argument("--profile", choices=list(WORKLOAD_PROFILES.keys()),
                    default=None,
                    help="Workload profile (quick/light/medium/heavy/stress/scaling)")
+    p.add_argument("--isolation-level",
+                   choices=list(ISOLATION_LEVEL_MAP.keys()),
+                   default="read-committed",
+                   help="Transaction isolation level (default: read-committed)")
 
     # --- TiDB-specific arguments ---
     tidb_g = p.add_argument_group("TiDB-specific options")
@@ -1394,6 +1646,30 @@ def parse_args():
     tidb_g.add_argument("--downstream-port", type=int, default=None,
                         help="Downstream TiDB internal service port")
 
+    # --- DSQL-specific arguments ---
+    dsql_g = p.add_argument_group("DSQL-specific options")
+    dsql_g.add_argument("--dsql-cluster-endpoint", default=None,
+                        help="DSQL cluster endpoint (e.g. abc.dsql.us-east-1.on.aws)")
+    dsql_g.add_argument("--dsql-cluster-id", default=None,
+                        help="DSQL cluster ID for CloudWatch metrics")
+    dsql_g.add_argument("--dsql-region", default=None,
+                        help="AWS region for DSQL (default: --region or us-east-1)")
+    dsql_g.add_argument("--dsql-db-profile", default=None,
+                        help="AWS profile for DSQL database APIs (default: --aws-profile)")
+    dsql_g.add_argument("--skip-cloudwatch", action="store_true",
+                        help="Skip CloudWatch metric collection (DSQL)")
+
+    # --- Aurora PostgreSQL-specific arguments ---
+    apg_g = p.add_argument_group("Aurora PostgreSQL-specific options")
+    apg_g.add_argument("--apg-password", default=None,
+                       help="Aurora PG master password (or env AURORA_PG_MASTER_PASSWORD)")
+    apg_g.add_argument("--apg-user", default="postgres",
+                       help="Aurora PG master username (default: postgres)")
+    apg_g.add_argument("--apg-db", default="sbtest",
+                       help="Aurora PG database name (default: sbtest)")
+    apg_g.add_argument("--apg-rds-profile", default=None,
+                       help="AWS profile for Aurora PG CloudWatch metrics")
+
     return p.parse_args()
 
 
@@ -1413,6 +1689,10 @@ def main():
         _main_tidb(args)
     elif args.server_type == "valkey":
         _main_valkey(args)
+    elif args.server_type == "dsql":
+        _main_dsql(args)
+    elif args.server_type == "aurora-pg":
+        _main_aurora_pg(args)
     else:
         raise SystemExit(f"Unknown server type: {args.server_type}")
 
@@ -1523,6 +1803,7 @@ def _build_deploy_params(args):
             "skip_prepare": args.skip_prepare,
             "skip_cleanup": not args.cleanup,
             "multi_phase": multi_phase,
+            "isolation_level": getattr(args, "isolation_level", "read-committed"),
         }
 
     elif server_type == "valkey":
@@ -1560,7 +1841,82 @@ def _build_deploy_params(args):
             "duration": duration,
         }
 
-    else:  # aurora
+    elif server_type == "dsql":
+        endpoint = getattr(args, "dsql_cluster_endpoint", None) or ""
+        if not endpoint:
+            endpoint = getattr(args, "endpoint", None) or ""
+        if not endpoint:
+            raise SystemExit(
+                "ERROR: DSQL endpoint required. Use --dsql-cluster-endpoint "
+                "or --endpoint.")
+
+        port = args.port if args.port is not None else 5432
+        workload = args.workload or "oltp_read_write"
+        tables = args.tables if args.tables is not None else 16
+        table_size = args.table_size if args.table_size is not None else 100000
+        threads = args.threads if args.threads is not None else 64
+        duration = args.duration if args.duration is not None else 300
+
+        return {
+            "server_type": "dsql",
+            "endpoint": endpoint,
+            "port": port,
+            "user": "admin",
+            "password": "__IAM_TOKEN__",
+            "db": "postgres",
+            "workload": workload,
+            "tables": tables,
+            "table_size": table_size,
+            "threads": threads,
+            "duration": duration,
+            "report_interval": (args.report_interval
+                                if args.report_interval is not None else 10),
+            "extra_args": [],
+            "lua_dir": "/tmp/lua",
+            "skip_prepare": args.skip_prepare,
+            "skip_cleanup": False,
+            "isolation_level": getattr(args, "isolation_level", "read-committed"),
+        }
+
+    elif server_type == "aurora-pg":
+        password = (getattr(args, "apg_password", None)
+                    or os.environ.get("AURORA_PG_MASTER_PASSWORD", "BenchMark2024!"))
+        port = args.port if args.port is not None else 5432
+        user = getattr(args, "apg_user", None) or "postgres"
+        db = getattr(args, "apg_db", None) or "sbtest"
+        workload = args.workload or "oltp_read_write"
+        tables = args.tables if args.tables is not None else 16
+        table_size = args.table_size if args.table_size is not None else 100000
+        threads = args.threads if args.threads is not None else 64
+        duration = args.duration if args.duration is not None else 300
+        endpoint = getattr(args, "endpoint", None) or ""
+
+        if not endpoint:
+            raise SystemExit(
+                "ERROR: Aurora PG endpoint required. Use --endpoint.")
+
+        return {
+            "server_type": "aurora-pg",
+            "endpoint": endpoint,
+            "port": port,
+            "user": user,
+            "password": password,
+            "db": db,
+            "workload": workload,
+            "tables": tables,
+            "table_size": table_size,
+            "threads": threads,
+            "duration": duration,
+            "report_interval": (args.report_interval
+                                if args.report_interval is not None else 10),
+            "extra_args": [],
+            "lua_dir": "/tmp/lua",
+            "skip_prepare": args.skip_prepare,
+            "skip_cleanup": getattr(args, "skip_cleanup", False),
+            "isolation_level": getattr(args, "isolation_level", "read-committed"),
+        }
+
+    else:  # aurora (MySQL)
         password = (args.password
                     or os.environ.get("AURORA_MASTER_PASSWORD", "BenchMark2024!"))
         port = args.port if args.port is not None else 3306
@@ -1608,6 +1964,7 @@ def _build_deploy_params(args):
             "lua_dir": "/tmp/lua",
             "skip_prepare": args.skip_prepare,
             "skip_cleanup": getattr(args, "skip_cleanup", False),
+            "isolation_level": getattr(args, "isolation_level", "read-committed"),
         }
 
 
@@ -1719,7 +2076,8 @@ def _main_aurora(args):
     import aurora.driver as adrv
     from common.sampler import (start_sampler, stop_sampler, parse_metrics_csv,
                                 derive_interval_metrics, safe_stats, render_history_chart)
-    from common.report import _print_client_extended_metrics, _print_resource_history
+    from common.report import (_print_client_extended_metrics,
+                               _print_resource_history, CostTracker)
 
     # Apply defaults for unset args
     region = args.region or DEFAULT_REGION
@@ -1833,12 +2191,17 @@ def _main_aurora(args):
                          workload=workload,
                          lua_dir=lua_dir or "/tmp/lua")
 
+    warmup_database(host, key_path, endpoint, port, "admin", password,
+                    db, tables, table_size, server_type="aurora",
+                    lua_dir=lua_dir)
+
     iud_rates = None
     rows_before = None
     if not args.skip_iud_measurement:
         log("Taking InnoDB row counter snapshot (before)...")
         rows_before = get_innodb_rows(host, key_path, endpoint, port, password)
 
+    isolation_level = getattr(args, "isolation_level", "read-committed")
     cmd_str = build_sysbench_cmd(
         host_ip=host, key_path=key_path,
         workload=workload, threads=threads,
@@ -1847,6 +2210,7 @@ def _main_aurora(args):
         port=port, user="admin", password=password,
         db=db, report_interval=report_interval,
         lua_dir=lua_dir,
+        isolation_level=isolation_level,
     )
 
     # Start client resource sampler
@@ -1860,6 +2224,9 @@ def _main_aurora(args):
     except Exception as e:
         log(f"Warning: could not start sampler: {e}")
 
+    cost_tracker = CostTracker("aurora", instance_type)
+    cost_tracker.start()
+
     bench_start = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
     if args.parallel > 1:
@@ -1872,6 +2239,7 @@ def _main_aurora(args):
         log("Benchmark failed.")
         sys.exit(1)
 
+    cost_tracker.stop()
     bench_end = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
     # Stop sampler and collect metrics
@@ -1963,6 +2331,14 @@ def _main_aurora(args):
                  cpu_pct=cpu_pct, client_cpu_pct=client_cpu_pct,
                  net_metrics=net_metrics, parallel=args.parallel)
 
+    cost_tracker.add_queries(
+        query_count=result.get("total_queries") or 0,
+        transaction_count=result.get("total_transactions") or 0,
+        avg_qps=result.get("qps") or 0,
+        avg_tps=result.get("tps") or 0,
+    )
+    cost_tracker.print_cost_summary()
+
     if sampler_ws or interval_data:
         fake_result = {
             'window_stats': sampler_ws,
@@ -1975,6 +2351,528 @@ def _main_aurora(args):
     if not args.skip_cleanup:
         sysbench_cleanup(host, key_path, endpoint, port, "admin", password,
                          db, tables)
+
+    log("Done.")
+
+
+# ---------------------------------------------------------------------------
+# DSQL main
+# ---------------------------------------------------------------------------
+
+# DSQL CloudWatch metric definitions
+DSQL_CW_METRICS = [
+    ("TotalTransactions", "Sum"),
+    ("ReadOnlyTransactions", "Sum"),
+    ("CommitLatency", "Average"),
+    ("CommitLatency", "p99", "ExtendedStatistics"),
+    ("OccConflicts", "Sum"),
+    ("QueryTimeouts", "Sum"),
+    ("BytesRead", "Sum"),
+    ("BytesWritten", "Sum"),
+    ("ComputeTime", "Sum"),
+    ("WriteDPU", "Sum"),
+    ("ReadDPU", "Sum"),
+    ("ComputeDPU", "Sum"),
+    ("TotalDPU", "Sum"),
+    ("ClusterStorageSize", "Average"),
+]
+
+
+@dataclass
+class _DsqlTokenManager:
+    endpoint: str
+    region: str
+    profile: Optional[str] = None
+    _token: str = ""
+    _expires_at: float = 0.0
+
+    def get_token(self):
+        now = time.time()
+        if self._token and now < (self._expires_at - DSQL_TOKEN_REFRESH_MARGIN):
+            return self._token
+        self._refresh()
+        return self._token
+
+    def _refresh(self):
+        import boto3
+        session = boto3.Session(region_name=self.region,
+                                profile_name=self.profile)
+        client = session.client("dsql")
+        self._token = client.generate_db_connect_admin_auth_token(
+            Hostname=self.endpoint,
+            Region=self.region,
+            ExpiresIn=DSQL_TOKEN_LIFETIME_SECONDS,
+        )
+        self._expires_at = time.time() + DSQL_TOKEN_LIFETIME_SECONDS
+        log(f"Refreshed DSQL auth token (expires in {DSQL_TOKEN_LIFETIME_SECONDS}s)")
+
+
+def _collect_dsql_cloudwatch(cluster_id, start_time, end_time, region,
+                             profile=None):
+    import boto3
+    session = boto3.Session(region_name=region, profile_name=profile)
+    cw = session.client("cloudwatch")
+    duration_seconds = int((end_time - start_time).total_seconds())
+    period = max(60, (duration_seconds // 60) * 60)
+
+    results = {}
+    for metric_spec in DSQL_CW_METRICS:
+        metric_name = metric_spec[0]
+        stat = metric_spec[1]
+        is_extended = len(metric_spec) > 2 and metric_spec[2] == "ExtendedStatistics"
+
+        try:
+            kwargs = {
+                "Namespace": "AWS/DSQL",
+                "MetricName": metric_name,
+                "Dimensions": [{"Name": "ResourceId", "Value": cluster_id}],
+                "StartTime": start_time,
+                "EndTime": end_time,
+                "Period": period,
+            }
+            if is_extended:
+                kwargs["ExtendedStatistics"] = [stat]
+            else:
+                kwargs["Statistics"] = [stat]
+
+            resp = cw.get_metric_statistics(**kwargs)
+            datapoints = resp.get("Datapoints", [])
+
+            if datapoints:
+                if is_extended:
+                    values = [dp["ExtendedStatistics"].get(stat, 0)
+                              for dp in datapoints]
+                else:
+                    values = [dp[stat] for dp in datapoints]
+                key = f"{metric_name}_{stat}"
+                results[key] = {
+                    "sum": sum(values),
+                    "avg": sum(values) / len(values),
+                    "min": min(values),
+                    "max": max(values),
+                    "count": len(values),
+                }
+        except Exception as e:
+            log(f"  Warning: Could not fetch {metric_name}/{stat}: {e}")
+
+    return results
+
+
+def _main_dsql(args):
+    """Run DSQL benchmark flow (sysbench over PG wire protocol with IAM auth)."""
+    import json
+    import sys
+    from datetime import datetime, timezone, timedelta
+
+    from common.sampler import (start_sampler, stop_sampler, parse_metrics_csv,
+                                derive_interval_metrics, safe_stats)
+
+    region = args.dsql_region or args.region or "us-east-1"
+    aws_profile = args.aws_profile or "sandbox"
+    db_profile = args.dsql_db_profile or aws_profile
+    cluster_id = args.dsql_cluster_id or ""
+    endpoint = args.dsql_cluster_endpoint or args.endpoint or ""
+
+    if not endpoint:
+        raise SystemExit(
+            "ERROR: DSQL endpoint required. Use --dsql-cluster-endpoint "
+            "or --endpoint.")
+
+    port = args.port if args.port is not None else 5432
+    workload = args.workload or "oltp_read_write"
+    tables = args.tables if args.tables is not None else 16
+    table_size = args.table_size if args.table_size is not None else 100000
+    threads = args.threads if args.threads is not None else 64
+    duration = args.duration if args.duration is not None else 300
+    report_interval = (args.report_interval if args.report_interval is not None
+                       else 10)
+
+    if getattr(args, "profile", None) and args.profile in WORKLOAD_PROFILES:
+        wp = WORKLOAD_PROFILES[args.profile]
+        if args.tables is None:
+            tables = wp["tables"]
+        if args.table_size is None:
+            table_size = wp.get("table_size", table_size)
+        if args.threads is None:
+            threads = wp["threads"]
+        if args.duration is None:
+            duration = wp["duration"]
+
+    seed = args.seed or "default"
+    client_state = _load_bench_client(seed)
+
+    if args.ssh_key:
+        key_path = args.ssh_key
+    elif client_state.get("key_path"):
+        key_path = client_state["key_path"]
+    else:
+        key_path = str(DEFAULT_SSH_KEY_PATH)
+
+    host = args.host or client_state.get("public_ip", "")
+    if not host:
+        log("ERROR: Could not determine host IP. "
+            "Use --host or ensure client state exists (--seed).")
+        sys.exit(1)
+
+    token_mgr = _DsqlTokenManager(endpoint=endpoint, region=region,
+                                   profile=db_profile)
+
+    log("=" * 70)
+    log("DSQL Sysbench Benchmark")
+    log("=" * 70)
+    log(f"  Endpoint:  {endpoint}")
+    log(f"  Region:    {region}")
+    log(f"  Client:    {host}")
+    log(f"  Workload:  {workload}")
+    log(f"  Tables:    {tables} x {table_size:,} rows")
+    log(f"  Threads:   {threads}, Duration: {duration}s")
+    print()
+
+    lua_dir = None
+    if workload in ("custom_iud", "custom_mixed", "custom_kv_sql"):
+        lua_dir = upload_lua_scripts(host, key_path)
+
+    if not args.skip_prepare:
+        token = token_mgr.get_token()
+        sysbench_prepare(host, key_path, endpoint, port, "admin", token,
+                         "postgres", tables, table_size, threads,
+                         workload=workload,
+                         lua_dir=lua_dir or "/tmp/lua",
+                         server_type="dsql")
+
+    warmup_token = token_mgr.get_token()
+    warmup_database(host, key_path, endpoint, port, "admin", warmup_token,
+                    "postgres", tables, table_size, server_type="dsql",
+                    lua_dir=lua_dir)
+
+    # Start client resource sampler
+    sampler_started = False
+    try:
+        start_sampler(host, key_path, 'generic', interval=1, user='ec2-user')
+        sampler_started = True
+    except Exception as e:
+        log(f"Warning: could not start sampler: {e}")
+
+    from common.report import CostTracker as _CT
+    cost_tracker = _CT("dsql", "serverless")
+    cost_tracker.start()
+
+    bench_start = datetime.now(timezone.utc)
+
+    # Token-segmented runs: DSQL IAM tokens expire in 15min, so split
+    # long benchmarks into segments of (token_lifetime - margin) seconds.
+    segment_max = DSQL_TOKEN_LIFETIME_SECONDS - DSQL_TOKEN_REFRESH_MARGIN
+    all_results = []
+
+    remaining = duration
+    segment_num = 0
+    while remaining > 0:
+        segment_num += 1
+        seg_duration = min(remaining, segment_max)
+
+        token = token_mgr.get_token()
+        seg_label = (f" [segment {segment_num}, {seg_duration}s]"
+                     if duration > segment_max else "")
+        if seg_label:
+            log(f"Starting sysbench segment {segment_num} ({seg_duration}s)...")
+
+        isolation_level = getattr(args, "isolation_level", "read-committed")
+        cmd_str = build_sysbench_cmd(
+            host_ip=host, key_path=key_path,
+            workload=workload, threads=threads,
+            duration=seg_duration, tables=tables,
+            table_size=table_size, endpoint=endpoint,
+            port=port, user="admin", password=token,
+            db="postgres", report_interval=report_interval,
+            lua_dir=lua_dir,
+            server_type="dsql",
+            isolation_level=isolation_level,
+        )
+
+        result = run_sysbench(host, key_path, cmd_str,
+                              timeout=seg_duration + 120)
+        if "error" in result:
+            log(f"Benchmark segment {segment_num} failed.")
+            break
+        all_results.append(result)
+        remaining -= seg_duration
+
+    cost_tracker.stop()
+    bench_end = datetime.now(timezone.utc)
+    bench_duration = (bench_end - bench_start).total_seconds()
+
+    # Stop sampler
+    sampler_csv_path = f"/tmp/dsql_sampler_{int(time.time())}.csv"
+    if sampler_started:
+        try:
+            stop_sampler(host, key_path, sampler_csv_path, user='ec2-user')
+        except Exception as e:
+            log(f"Warning: could not collect sampler metrics: {e}")
+
+    # Aggregate results across segments
+    if all_results:
+        combined = all_results[0].copy()
+        if len(all_results) > 1:
+            total_tps_sum = sum(
+                r.get("tps", 0) * r.get("elapsed_s", 1)
+                for r in all_results)
+            total_elapsed = sum(r.get("elapsed_s", 0) for r in all_results)
+            combined["tps"] = round(total_tps_sum / total_elapsed, 2) if total_elapsed else 0
+            combined["elapsed_s"] = total_elapsed
+            combined["total_queries"] = sum(
+                r.get("total_queries", 0) for r in all_results)
+            combined["segments"] = len(all_results)
+    else:
+        combined = {"error": "all segments failed"}
+
+    combined.setdefault("workload", workload)
+    combined.setdefault("threads", threads)
+    combined["duration_s"] = duration
+    combined["server_type"] = "dsql"
+    combined["endpoint"] = endpoint
+
+    log("")
+    log("=" * 70)
+    log("DSQL Sysbench Results")
+    log("=" * 70)
+    log(f"  TPS:              {combined.get('tps', 'N/A')}")
+    log(f"  Latency avg:      {combined.get('latency_avg_ms', 'N/A')} ms")
+    log(f"  Latency p95:      {combined.get('latency_p95_ms', 'N/A')} ms")
+    log(f"  Total queries:    {combined.get('total_queries', 'N/A')}")
+    if combined.get("segments"):
+        log(f"  Segments:         {combined['segments']}")
+
+    # CloudWatch metrics
+    cw_metrics = {}
+    if not args.skip_cloudwatch and cluster_id:
+        log("")
+        log("Collecting DSQL CloudWatch metrics...")
+        cw_end = bench_end + timedelta(minutes=2)
+        cw_metrics = _collect_dsql_cloudwatch(
+            cluster_id, bench_start, cw_end, region, db_profile)
+        if cw_metrics:
+            for k, v in sorted(cw_metrics.items()):
+                log(f"  {k}: avg={v['avg']:.2f}, sum={v['sum']:.2f}")
+        combined["cloudwatch_metrics"] = cw_metrics
+    elif not cluster_id:
+        log("Skipping CloudWatch (no --dsql-cluster-id provided).")
+
+    # Save results
+    output_path = str(Path(__file__).resolve().parent.parent / "dsql" /
+                      f"dsql-sysbench-{datetime.now().strftime('%Y%m%d-%H%M%S')}.json")
+    Path(output_path).parent.mkdir(parents=True, exist_ok=True)
+    Path(output_path).write_text(json.dumps(combined, indent=2, default=str))
+    log(f"\nResults saved to: {output_path}")
+
+    cost_tracker.add_queries(
+        query_count=combined.get("total_queries") or 0,
+        transaction_count=combined.get("total_transactions") or 0,
+        avg_qps=combined.get("qps") or 0,
+        avg_tps=combined.get("tps") or 0,
+    )
+    cost_tracker.print_cost_summary()
+    log("Done.")
+
+
+# ---------------------------------------------------------------------------
+# Aurora PostgreSQL main
+# ---------------------------------------------------------------------------
+
+
+def _main_aurora_pg(args):
+    """Run Aurora PostgreSQL benchmark flow (sysbench over PG wire protocol)."""
+    import sys
+    from datetime import datetime, timezone
+
+    from common.sampler import (start_sampler, stop_sampler, parse_metrics_csv,
+                                derive_interval_metrics, safe_stats)
+    from common.report import (_print_client_extended_metrics,
+                               _print_resource_history, CostTracker)
+
+    region = args.region or "us-east-1"
+    aws_profile = args.aws_profile or "sandbox"
+    port = args.port if args.port is not None else 5432
+    user = getattr(args, "apg_user", None) or "postgres"
+    password = (getattr(args, "apg_password", None)
+                or os.environ.get("AURORA_PG_MASTER_PASSWORD", "BenchMark2024!"))
+    db = getattr(args, "apg_db", None) or "sbtest"
+    workload = args.workload or "oltp_read_write"
+    tables = args.tables if args.tables is not None else 16
+    table_size = args.table_size if args.table_size is not None else 100000
+    threads = args.threads if args.threads is not None else 64
+    duration = args.duration if args.duration is not None else 300
+    report_interval = (args.report_interval if args.report_interval is not None
+                       else 10)
+
+    if getattr(args, "profile", None) and args.profile in WORKLOAD_PROFILES:
+        wp = WORKLOAD_PROFILES[args.profile]
+        if args.tables is None:
+            tables = wp["tables"]
+        if args.table_size is None:
+            table_size = wp.get("table_size", table_size)
+        if args.threads is None:
+            threads = wp["threads"]
+        if args.duration is None:
+            duration = wp["duration"]
+
+    endpoint = getattr(args, "endpoint", None) or ""
+    if not endpoint:
+        raise SystemExit(
+            "ERROR: Aurora PG endpoint required. Use --endpoint.")
+
+    seed = args.seed or "default"
+    client_state = _load_bench_client(seed)
+
+    if args.ssh_key:
+        key_path = args.ssh_key
+    elif client_state.get("key_path"):
+        key_path = client_state["key_path"]
+    else:
+        key_path = str(DEFAULT_SSH_KEY_PATH)
+
+    host = args.host or client_state.get("public_ip", "")
+    if not host:
+        log("ERROR: Could not determine host IP. "
+            "Use --host or ensure client state exists (--seed).")
+        sys.exit(1)
+
+    log("=" * 70)
+    log("Aurora PostgreSQL Sysbench Benchmark")
+    log("=" * 70)
+    log(f"  Endpoint:  {endpoint}")
+    log(f"  Region:    {region}")
+    log(f"  Client:    {host}")
+    log(f"  Workload:  {workload}")
+    log(f"  Tables:    {tables} x {table_size:,} rows")
+    log(f"  Threads:   {threads}, Duration: {duration}s")
+    print()
+
+    lua_dir = None
+    if workload in ("custom_iud", "custom_mixed", "custom_kv_sql"):
+        lua_dir = upload_lua_scripts(host, key_path)
+
+    if not args.skip_prepare:
+        sysbench_prepare(host, key_path, endpoint, port, user, password,
+                         db, tables, table_size, threads,
+                         workload=workload,
+                         lua_dir=lua_dir or "/tmp/lua",
+                         server_type="aurora-pg")
+
+    warmup_database(host, key_path, endpoint, port, user, password,
+                    db, tables, table_size, server_type="aurora-pg",
+                    lua_dir=lua_dir)
+
+    # Start client resource sampler
+    sampler_started = False
+    sampler_csv_path = f"/tmp/aurora_pg_sampler_{int(time.time())}.csv"
+    try:
+        start_sampler(host, key_path, 'generic', interval=1, user='ec2-user')
+        sampler_started = True
+    except Exception as e:
+        log(f"Warning: could not start sampler: {e}")
+
+    cost_tracker = CostTracker("aurora-pg", "serverless")
+    cost_tracker.start()
+
+    bench_start = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+    isolation_level = getattr(args, "isolation_level", "read-committed")
+    cmd_str = build_sysbench_cmd(
+        host_ip=host, key_path=key_path,
+        workload=workload, threads=threads,
+        duration=duration, tables=tables,
+        table_size=table_size, endpoint=endpoint,
+        port=port, user=user, password=password,
+        db=db, report_interval=report_interval,
+        lua_dir=lua_dir,
+        server_type="aurora-pg",
+        isolation_level=isolation_level,
+    )
+
+    result = run_sysbench(host, key_path, cmd_str,
+                          timeout=duration + 120)
+
+    if "error" in result:
+        log("Benchmark failed.")
+        sys.exit(1)
+
+    cost_tracker.stop()
+    bench_end = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+    # Stop sampler and collect metrics
+    cpu_samples = []
+    interval_data = []
+    sampler_ws = {}
+    client_cpu_pct = None
+    if sampler_started:
+        try:
+            stop_sampler(host, key_path, sampler_csv_path, user='ec2-user')
+            metrics_rows = parse_metrics_csv(sampler_csv_path)
+            if metrics_rows:
+                bench_start_epoch = metrics_rows[0].get('epoch', 0)
+                bench_end_epoch = metrics_rows[-1].get('epoch', 0)
+                cpu_samples, _ = derive_interval_metrics(
+                    metrics_rows, bench_start_epoch, bench_end_epoch, 'generic')
+                cpu_vals = [s['client_cpu_pct'] for s in cpu_samples
+                            if s.get('client_cpu_pct') is not None]
+                if cpu_vals:
+                    client_cpu_pct = round(sum(cpu_vals) / len(cpu_vals), 1)
+                interval_data = cpu_samples
+                sampler_ws = {
+                    'client_thermal_mc': safe_stats([s.get('client_thermal_mc') for s in cpu_samples]),
+                    'client_loadavg_1m': safe_stats([s.get('client_loadavg_1m') for s in cpu_samples]),
+                    'client_loadavg_5m': safe_stats([s.get('client_loadavg_5m') for s in cpu_samples]),
+                    'client_loadavg_15m': safe_stats([s.get('client_loadavg_15m') for s in cpu_samples]),
+                    'client_cpufreq_avg_mhz': safe_stats([s.get('client_cpufreq_avg_mhz') for s in cpu_samples]),
+                }
+        except Exception as e:
+            log(f"Warning: could not collect sampler metrics: {e}")
+
+    result.setdefault("workload", workload)
+    result.setdefault("threads", threads)
+    result["duration_s"] = duration
+    result["server_type"] = "aurora-pg"
+    result["endpoint"] = endpoint
+
+    if result.get("latency_p95_ms") and not result.get("latency_95th_pct_ms"):
+        result["latency_95th_pct_ms"] = result["latency_p95_ms"]
+
+    # CloudWatch: Aurora PG uses same RDS namespace as Aurora MySQL
+    cpu_pct = None
+    net_metrics = {}
+    rds_profile = getattr(args, "apg_rds_profile", None) or aws_profile
+
+    log("")
+    log("=" * 70)
+    log("Aurora PG Sysbench Results")
+    log("=" * 70)
+    log(f"  TPS:              {result.get('tps', 'N/A')}")
+    log(f"  Latency avg:      {result.get('latency_avg_ms', 'N/A')} ms")
+    log(f"  Latency p95:      {result.get('latency_p95_ms', 'N/A')} ms")
+    log(f"  Total queries:    {result.get('total_queries', 'N/A')}")
+    if client_cpu_pct is not None:
+        log(f"  Client CPU avg:   {client_cpu_pct:.1f}%")
+
+    if sampler_ws or interval_data:
+        fake_result = {
+            'window_stats': sampler_ws,
+            'interval_data': interval_data,
+            'ec2_instance_type': '',
+        }
+        _print_client_extended_metrics([fake_result])
+        _print_resource_history([fake_result])
+
+    cost_tracker.add_queries(
+        query_count=result.get("total_queries") or 0,
+        transaction_count=result.get("total_transactions") or 0,
+        avg_qps=result.get("qps") or 0,
+        avg_tps=result.get("tps") or 0,
+    )
+    cost_tracker.print_cost_summary()
+
+    if not getattr(args, "skip_cleanup", False):
+        sysbench_cleanup(host, key_path, endpoint, port, user, password,
+                         db, tables, server_type="aurora-pg")
 
     log("Done.")
 
