@@ -38,9 +38,25 @@ def _load_bench_client(seed):
 # Constants
 # ---------------------------------------------------------------------------
 
+# MySQL error codes silently ignored during benchmark execution:
+#   1062 = duplicate key (expected during concurrent inserts)
+#   1213 = deadlock (expected under contention)
+#   8002 = TiDB: region unavailable
+#   8028 = TiDB: max execution time exceeded
+#   8249 = TiDB: stale read
 MYSQL_IGNORE_ERRORS = "1062,1213,8002,8028,8249"
 BYTES_PER_ROW = 250
 DATA_TO_RAM_RATIO = 5
+
+# Workloads that can safely skip sysbench's outer transaction wrappers.
+# Removing BEGIN/COMMIT overhead reduces measurement noise for reads.
+# custom_kv_sql manages its own transactions in lua (BEGIN/COMMIT around
+# writes only); the outer wrapper is redundant for its 90-97% read path.
+SKIP_TRX_WORKLOADS = frozenset({
+    "oltp_point_select",
+    "oltp_read_only",
+    "custom_kv_sql",
+})
 
 # Engine type classification
 PG_ENGINE_TYPES = {"dsql", "aurora-pg"}
@@ -89,19 +105,52 @@ def _pg_cli_cmd(host: str, port: int, user: str, password: str,
         f"-c \"{sql}\""
     )
 
-WORKLOADS = [
-    "oltp_read_write",
-    "oltp_read_only",
-    "oltp_write_only",
-    "oltp_point_select",
-    "oltp_insert",
-    "oltp_delete",
-    "oltp_update_index",
-    "oltp_update_non_index",
-    "custom_iud",
-    "custom_mixed",
-    "custom_kv_sql",
-]
+# All supported workloads.  Value is ``None`` for standard sysbench tests
+# or ``(base_workload, extra_args)`` for microbenchmarks that override
+# flags on a base workload.
+# Ref: smalldatum.blogspot.com/2026/03/sysbench-vs-mysql-on-small-server-no.html
+WORKLOADS: dict[str, tuple[str, list[str]] | None] = {
+    # --- standard sysbench ---
+    "oltp_read_write":      None,
+    "oltp_read_only":       None,
+    "oltp_write_only":      None,
+    "oltp_point_select":    None,
+    "oltp_insert":          None,
+    "oltp_delete":          None,
+    "oltp_update_index":    None,
+    "oltp_update_non_index": None,
+    # --- custom lua ---
+    "custom_iud":           None,
+    "custom_mixed":         None,
+    "custom_kv_sql":        None,
+    # --- isolated read-only (disable all query types except one) ---
+    "read_only_simple": (
+        "oltp_read_only",
+        ["--point_selects=0", "--sum_ranges=0", "--order_ranges=0",
+         "--distinct_ranges=0", "--simple_ranges=1"],
+    ),
+    "read_only_sum": (
+        "oltp_read_only",
+        ["--point_selects=0", "--simple_ranges=0", "--order_ranges=0",
+         "--distinct_ranges=0", "--sum_ranges=1"],
+    ),
+    "read_only_order": (
+        "oltp_read_only",
+        ["--point_selects=0", "--simple_ranges=0", "--sum_ranges=0",
+         "--distinct_ranges=0", "--order_ranges=1"],
+    ),
+    "read_only_distinct": (
+        "oltp_read_only",
+        ["--point_selects=0", "--simple_ranges=0", "--sum_ranges=0",
+         "--order_ranges=0", "--distinct_ranges=1"],
+    ),
+    # --- range-size variations (range_size=100 is sysbench default, so omitted) ---
+    "read_only_range10":    ("oltp_read_only", ["--range_size=10"]),
+    "read_only_range10000": ("oltp_read_only", ["--range_size=10000"]),
+    # --- write variations ---
+    "update_nonindex_zipf": ("oltp_update_non_index", ["--rand-type=zipfian"]),
+    "read_write_range10":   ("oltp_read_write", ["--range_size=10"]),
+}
 
 # TiDB session variables for benchmarking (safe for all workloads)
 SESSION_VARS_BASE = (
@@ -189,41 +238,29 @@ INSTANCE_MEMORY_GIB = {
 WORKLOAD_PROFILES = {
     "quick": {
         "tables": 4, "table_size": 10000, "threads": 16,
-        "duration": 30, "disk_fill_pct": 30,
+        "duration": 30, "write_duration": 60, "disk_fill_pct": 30,
     },
     "light": {
         "tables": 8, "table_size": 50000, "threads": 32,
-        "duration": 60, "disk_fill_pct": 30,
-    },
-    "medium": {
-        "tables": 16, "table_size": 100000, "threads": 64,
-        "duration": 120, "disk_fill_pct": 30,
-    },
-    "heavy": {
-        "tables": 32, "table_size": 500000, "threads": 128,
-        "duration": 300, "disk_fill_pct": 30,
+        "duration": 60, "write_duration": 120, "disk_fill_pct": 30,
     },
     "standard": {
         "tables": 16, "table_size": 100000, "threads": 64,
-        "duration": 300, "disk_fill_pct": 30,
+        "duration": 300, "write_duration": 600, "disk_fill_pct": 30,
+    },
+    "heavy": {
+        "tables": 32, "table_size": 500000, "threads": 128,
+        "duration": 300, "write_duration": 600, "disk_fill_pct": 30,
     },
     "stress": {
         "tables": 16, "table_size": 100000, "threads": 64,
-        "duration": 120, "multi_phase": "stress", "disk_fill_pct": 30,
+        "duration": 120, "write_duration": 360,
+        "multi_phase": "stress", "disk_fill_pct": 30,
     },
     "scaling": {
         "tables": 16, "table_size": 100000, "threads": 64,
-        "duration": 120, "multi_phase": "scaling", "disk_fill_pct": 30,
-    },
-    "kv_sql_ml": {
-        "tables": 16, "table_size": 100000, "threads": 64,
-        "duration": 120, "workload": "custom_kv_sql",
-        "extra_sysbench_args": ["--kv-profile=ml"],
-    },
-    "kv_sql_legacy": {
-        "tables": 16, "table_size": 100000, "threads": 64,
-        "duration": 120, "workload": "custom_kv_sql",
-        "extra_sysbench_args": ["--kv-profile=legacy"],
+        "duration": 120, "write_duration": 360,
+        "multi_phase": "scaling", "disk_fill_pct": 30,
     },
 }
 
@@ -676,12 +713,15 @@ def order_workloads_read_write_read(workloads: list) -> list:
 
 def wait_for_compaction(db_type: str, host_ip: str, key_path: str,
                         endpoint: str, port: int, user: str,
-                        password: str, timeout: int = 300) -> None:
+                        password: str, timeout: int = 300,
+                        db: str = "", tables: int = 0) -> None:
     """Wait for background compaction/flush to settle after writes.
 
-    - MySQL/Aurora: flush dirty pages via innodb_max_dirty_pages_pct trick.
-    - PostgreSQL/Aurora-PG/DSQL: issue CHECKPOINT.
-    - TiDB: issue ADMIN FLUSH TIDB + sleep.
+    - MySQL/Aurora: flush dirty pages via innodb_max_dirty_pages_pct trick,
+      then ANALYZE TABLE on all benchmark tables so the optimizer has fresh
+      statistics before any post-write read pass.
+    - PostgreSQL/Aurora-PG/DSQL: issue CHECKPOINT + ANALYZE.
+    - TiDB: issue ADMIN FLUSH TIDB + ANALYZE TABLE + sleep.
     """
     log(f"Waiting for compaction/flush ({db_type})...")
 
@@ -737,6 +777,17 @@ def wait_for_compaction(db_type: str, host_ip: str, key_path: str,
             )
             ssh_run_simple(host_ip, key_path, cmd, timeout=30)
 
+        if db and tables > 0:
+            log("Running ANALYZE TABLE for fresh optimizer statistics...")
+            for i in range(1, tables + 1):
+                sql = f"ANALYZE TABLE {db}.sbtest{i}"
+                cmd = (
+                    f"mysql -sN -h '{endpoint}' -P {port} -u {user} "
+                    f"{pw_flag} -e \"{sql}\""
+                )
+                ssh_run_simple(host_ip, key_path, cmd, timeout=120)
+            log("ANALYZE TABLE complete.")
+
     elif db_type in ("aurora-pg", "dsql", "postgres"):
         pw_env = f"PGPASSWORD='{password}' " if password else ""
         cmd = (
@@ -749,6 +800,16 @@ def wait_for_compaction(db_type: str, host_ip: str, key_path: str,
         else:
             log("CHECKPOINT complete.")
 
+        if db and tables > 0:
+            log("Running ANALYZE for fresh optimizer statistics...")
+            for i in range(1, tables + 1):
+                analyze_cmd = (
+                    f"{pw_env}psql -h '{endpoint}' -p {port} -U {user} "
+                    f"-d {db} -c \"ANALYZE sbtest{i}\""
+                )
+                ssh_run_simple(host_ip, key_path, analyze_cmd, timeout=120)
+            log("ANALYZE complete.")
+
     elif db_type == "tidb":
         pw_flag = f"-p'{password}'" if password else ""
         # Flush TiDB stats/buffers
@@ -760,7 +821,18 @@ def wait_for_compaction(db_type: str, host_ip: str, key_path: str,
         r = ssh_run_simple(host_ip, key_path, cmd, timeout=60)
         if r.returncode != 0:
             log(f"Warning: ADMIN FLUSH TIDB failed: {r.stderr.strip()}")
-        # Give TiKV compaction time to settle
+
+        if db and tables > 0:
+            log("Running ANALYZE TABLE for fresh optimizer statistics...")
+            for i in range(1, tables + 1):
+                analyze_sql = f"ANALYZE TABLE {db}.sbtest{i}"
+                analyze_cmd = (
+                    f"mysql -sN -h '{endpoint}' -P {port} -u {user} "
+                    f"{pw_flag} -e \"{analyze_sql}\""
+                )
+                ssh_run_simple(host_ip, key_path, analyze_cmd, timeout=120)
+            log("ANALYZE TABLE complete.")
+
         log("Sleeping 30s for TiKV compaction...")
         time.sleep(30)
         log("TiKV compaction wait complete.")
@@ -986,6 +1058,10 @@ def build_sysbench_cmd(
     lua_dir: Optional[str] = None,
     server_type: str = "aurora",
     isolation_level: str = "read-committed",
+    warmup_time: int = 10,
+    rand_type: str = "uniform",
+    skip_trx: Optional[bool] = None,
+    db_ps_mode: str = "auto",
 ) -> str:
     """Build a sysbench command string suitable for remote SSH execution.
 
@@ -1004,6 +1080,11 @@ def build_sysbench_cmd(
     *isolation_level* sets the transaction isolation level via a connection
     init command.  Supported values are keys of :data:`ISOLATION_LEVEL_MAP`.
     """
+    micro_extra: list[str] = []
+    spec = WORKLOADS.get(workload)
+    if spec is not None:
+        workload, micro_extra = spec
+
     if workload in ("custom_iud", "custom_mixed", "custom_kv_sql"):
         remote_lua_dir = lua_dir or "/tmp/lua"
         workload_arg = f"{remote_lua_dir}/{workload}.lua"
@@ -1036,6 +1117,15 @@ def build_sysbench_cmd(
     parts.append(f"--report-interval={report_interval}")
 
     parts.append("--percentile=99")
+    parts.append(f"--warmup-time={warmup_time}")
+    parts.append(f"--rand-type={rand_type}")
+    if db_ps_mode and db_ps_mode != "auto":
+        parts.append(f"--db-ps-mode={db_ps_mode}")
+
+    should_skip_trx = skip_trx if skip_trx is not None else (workload in SKIP_TRX_WORKLOADS)
+    if should_skip_trx:
+        parts.append("--skip-trx=on")
+
     if not pg:
         parts.append(f"--mysql-ignore-errors={MYSQL_IGNORE_ERRORS}")
 
@@ -1047,6 +1137,9 @@ def build_sysbench_cmd(
         else:
             parts.append(
                 f"--mysql-init-command='SET SESSION TRANSACTION ISOLATION LEVEL {iso_sql}'")
+
+    if micro_extra:
+        parts.extend(micro_extra)
 
     if extra_args:
         parts.extend(extra_args)
@@ -2094,6 +2187,8 @@ def _build_deploy_params(args):
                        else profile["threads"])
             duration = (args.duration if args.duration is not None
                         else profile["duration"])
+            if args.duration is None and _is_write_heavy(workload) and "write_duration" in profile:
+                duration = profile["write_duration"]
             multi_phase_name = profile.get("multi_phase")
             multi_phase = (MULTI_PHASE_PROFILES[multi_phase_name]["phases"]
                            if multi_phase_name else None)
@@ -2443,6 +2538,8 @@ def _main_aurora(args):
             threads = wp["threads"]
         if args.duration is None:
             duration = wp["duration"]
+            if _is_write_heavy(workload) and "write_duration" in wp:
+                duration = wp["write_duration"]
 
     if workload not in AURORA_WORKLOADS:
         raise SystemExit(
@@ -2582,7 +2679,7 @@ def _main_aurora(args):
 
     if _is_write_heavy(workload):
         wait_for_compaction("aurora", host, key_path, endpoint, port,
-                            "admin", password)
+                            "admin", password, db=db, tables=tables)
     record_db_size("post-benchmark",
                    get_db_size_mysql(host, key_path, endpoint, port, db,
                                     "admin", password))
@@ -2851,6 +2948,8 @@ def _main_dsql(args):
             threads = wp["threads"]
         if args.duration is None:
             duration = wp["duration"]
+            if _is_write_heavy(workload) and "write_duration" in wp:
+                duration = wp["write_duration"]
 
     seed = args.seed or "default"
     client_state = _load_bench_client(seed)
@@ -2963,7 +3062,7 @@ def _main_dsql(args):
     if _is_write_heavy(workload):
         compact_token = token_mgr.get_token()
         wait_for_compaction("dsql", host, key_path, endpoint, port,
-                            "admin", compact_token)
+                            "admin", compact_token, db=db, tables=tables)
     post_size_token = token_mgr.get_token()
     record_db_size("post-benchmark",
                    get_db_size_postgres(host, key_path, endpoint, port,
@@ -3089,6 +3188,8 @@ def _main_aurora_pg(args):
             threads = wp["threads"]
         if args.duration is None:
             duration = wp["duration"]
+            if _is_write_heavy(workload) and "write_duration" in wp:
+                duration = wp["write_duration"]
 
     endpoint = getattr(args, "endpoint", None) or ""
     if not endpoint:
@@ -3185,7 +3286,7 @@ def _main_aurora_pg(args):
 
     if _is_write_heavy(workload):
         wait_for_compaction("aurora-pg", host, key_path, endpoint, port,
-                            user, password)
+                            user, password, db=db, tables=tables)
     record_db_size("post-benchmark",
                    get_db_size_postgres(host, key_path, endpoint, port,
                                        db, user, password))
@@ -3428,6 +3529,8 @@ def _run_tidb_benchmark(
         table_size = profile["table_size"]
         threads = profile["threads"]
         duration = profile["duration"]
+        if _is_write_heavy(workload) and "write_duration" in profile:
+            duration = profile["write_duration"]
         multi_phase = profile.get("multi_phase")
         if disk_fill_pct is None:
             disk_fill_pct = profile.get("disk_fill_pct", 30)
@@ -3653,7 +3756,7 @@ mysql -h {db_host} -P {port} -u root -e \
 
     if _is_write_heavy(workload):
         wait_for_compaction("tidb", bench_host, bench_key, db_host, port,
-                            "root", "")
+                            "root", "", db=db, tables=tables)
     record_db_size("post-benchmark",
                    get_db_size_mysql(bench_host, bench_key, db_host, port,
                                     database, "root", ""))
