@@ -22,9 +22,13 @@ Usage as library:
 
 import csv
 import json
+import os
 import re
 import statistics
+import subprocess
 import tempfile
+import time
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -137,6 +141,59 @@ def read_cpufreq():
         "cpufreq_max_mhz": round(max(freqs) / 1000),
         "cpufreq_avg_mhz": round(sum(freqs) / len(freqs) / 1000),
     }
+'''
+
+_SAMPLER_DISKSTATS_FN = '''
+def read_diskstats():
+    """Read aggregate disk I/O counters from /proc/diskstats.
+
+    Sums across all real block devices (skips ram*, loop*, dm-*).
+    Returns cumulative counters -- caller computes deltas.
+    """
+    reads = writes = sectors_read = sectors_written = io_ticks = 0
+    with open("/proc/diskstats") as f:
+        for line in f:
+            parts = line.split()
+            if len(parts) < 14:
+                continue
+            name = parts[2]
+            # Skip virtual / loopback / device-mapper partitions
+            if name.startswith(("ram", "loop", "dm-")):
+                continue
+            # Skip partitions (e.g. sda1) -- keep whole-disk only
+            if name[-1].isdigit() and not name.startswith("nvme"):
+                continue
+            # For nvme, skip partition entries like nvme0n1p1
+            if "p" in name and name.startswith("nvme"):
+                idx = name.rfind("p")
+                if idx > 0 and name[idx + 1:].isdigit():
+                    continue
+            reads += int(parts[3])           # reads completed
+            sectors_read += int(parts[5])    # sectors read
+            writes += int(parts[7])          # writes completed
+            sectors_written += int(parts[9]) # sectors written
+            io_ticks += int(parts[12])       # ms spent doing I/O
+    return {
+        "disk_reads_completed": reads,
+        "disk_writes_completed": writes,
+        "disk_sectors_read": sectors_read,
+        "disk_sectors_written": sectors_written,
+        "disk_io_ticks_ms": io_ticks,
+    }
+'''
+
+_SAMPLER_CTXSWITCH_FN = '''
+def read_context_switches():
+    """Read context switches and process forks from /proc/stat."""
+    ctxt = 0
+    procs = 0
+    with open("/proc/stat") as f:
+        for line in f:
+            if line.startswith("ctxt "):
+                ctxt = int(line.split()[1])
+            elif line.startswith("processes "):
+                procs = int(line.split()[1])
+    return {"ctx_switches": ctxt, "processes_created": procs}
 '''
 
 _SAMPLER_LOADAVG_FN = '''
@@ -266,6 +323,13 @@ _SAMPLER_MAIN_COMMON_FIELDS = [
     "loadavg_5m",
     "loadavg_15m",
     "per_core_cpu_pct_json",
+    "disk_reads_completed",
+    "disk_writes_completed",
+    "disk_sectors_read",
+    "disk_sectors_written",
+    "disk_io_ticks_ms",
+    "ctx_switches",
+    "processes_created",
 ]
 
 _SAMPLER_MYSQL_FIELDS = [
@@ -335,6 +399,8 @@ def main():
             cpufreq = read_cpufreq()
             loadavg = read_loadavg()
             per_core_json = read_per_core_cpu_pct()
+            disk = read_diskstats()
+            ctxsw = read_context_switches()
             row = {{
                 "epoch": epoch,
                 "cpu_user": cpu["user"],
@@ -359,6 +425,13 @@ def main():
                 "loadavg_5m": loadavg["loadavg_5m"],
                 "loadavg_15m": loadavg["loadavg_15m"],
                 "per_core_cpu_pct_json": per_core_json,
+                "disk_reads_completed": disk["disk_reads_completed"],
+                "disk_writes_completed": disk["disk_writes_completed"],
+                "disk_sectors_read": disk["disk_sectors_read"],
+                "disk_sectors_written": disk["disk_sectors_written"],
+                "disk_io_ticks_ms": disk["disk_io_ticks_ms"],
+                "ctx_switches": ctxsw["ctx_switches"],
+                "processes_created": ctxsw["processes_created"],
             }}{collect_extra}
             w.writerow(row)
             f.flush()
@@ -393,6 +466,8 @@ def generate_sampler_script(server_type, interval=5,
     parts.append(_SAMPLER_CPUFREQ_FN)
     parts.append(_SAMPLER_LOADAVG_FN)
     parts.append(_SAMPLER_PER_CORE_CPU_FN)
+    parts.append(_SAMPLER_DISKSTATS_FN)
+    parts.append(_SAMPLER_CTXSWITCH_FN)
 
     if server_type in ("aurora", "tidb"):
         parts.append(_SAMPLER_MYSQL_FN.format(
@@ -468,6 +543,124 @@ def stop_sampler(host_ip, key_path, local_csv_path, user="ec2-user",
                    user=user)
     log(f"Sampler stopped on {host_ip}, CSV saved to {local_csv_path}")
     return local_csv_path
+
+
+# ---------------------------------------------------------------------------
+# Multi-host sampler management
+# ---------------------------------------------------------------------------
+
+@dataclass
+class SamplerSession:
+    """Tracks a running sampler on one EC2 host."""
+    label: str
+    host_ip: str
+    key_path: str
+    csv_path: str
+    user: str = "ec2-user"
+    instance_type: str = ""
+    started: bool = False
+
+
+def start_samplers(hosts, server_type='generic', interval=1, user='ec2-user',
+                   **sampler_kwargs):
+    """Start sampler on multiple hosts. Returns list of SamplerSession.
+
+    ``hosts`` is a list of dicts with keys: label, host_ip, key_path,
+    and optionally instance_type, user.
+    """
+    sessions = []
+    for h in hosts:
+        label = h["label"]
+        host_ip = h["host_ip"]
+        kp = h["key_path"]
+        u = h.get("user", user)
+        it = h.get("instance_type", "")
+        csv_path = f"/tmp/sampler_{label.lower()}_{int(time.time())}.csv"
+        sess = SamplerSession(label=label, host_ip=host_ip, key_path=kp,
+                              csv_path=csv_path, user=u, instance_type=it)
+        try:
+            start_sampler(host_ip, kp, server_type, interval=interval, user=u,
+                          **sampler_kwargs)
+            sess.started = True
+            log(f"  Sampler started on {label} ({host_ip})")
+        except Exception as e:
+            log(f"Warning: could not start sampler on {label} ({host_ip}): {e}")
+        sessions.append(sess)
+    return sessions
+
+
+def stop_samplers(sessions):
+    """Stop sampler on all hosts and collect CSV files.
+
+    Returns list of dicts with keys: label, csv_path, instance_type, rows.
+    Only includes sessions that were started and collected successfully.
+    """
+    collected = []
+    for sess in sessions:
+        if not sess.started:
+            continue
+        try:
+            stop_sampler(sess.host_ip, sess.key_path, sess.csv_path,
+                         user=sess.user)
+            rows = parse_metrics_csv(sess.csv_path)
+            collected.append({
+                "label": sess.label,
+                "csv_path": sess.csv_path,
+                "instance_type": sess.instance_type,
+                "rows": rows,
+            })
+        except Exception as e:
+            log(f"Warning: could not collect sampler from {sess.label}: {e}")
+    return collected
+
+
+# ---------------------------------------------------------------------------
+# Flamegraph capture
+# ---------------------------------------------------------------------------
+
+def capture_flamegraph(host_ip, key_path, duration=30, user="ec2-user",
+                       output_dir="/tmp"):
+    """Run perf record on remote host for ``duration`` seconds and generate
+    a flamegraph SVG.  Returns local path to the SVG, or None on failure.
+
+    Requires ``perf`` and FlameGraph tools on the remote host (best-effort).
+    """
+    tag = f"fg_{int(time.time())}"
+    remote_perf = f"/tmp/{tag}.perf.data"
+    remote_folded = f"/tmp/{tag}.folded"
+    remote_svg = f"/tmp/{tag}.svg"
+
+    cmds = [
+        f"sudo perf record -F 99 -a -g -o {remote_perf} -- sleep {duration}",
+        f"sudo perf script -i {remote_perf} | stackcollapse-perf.pl > {remote_folded}",
+        f"flamegraph.pl {remote_folded} > {remote_svg}",
+    ]
+    try:
+        for cmd in cmds:
+            ssh_run_simple(host_ip, key_path, cmd, user=user)
+        local_svg = os.path.join(output_dir, f"{tag}.svg")
+        scp_get_simple(host_ip, key_path, remote_svg, local_svg, user=user)
+        log(f"Flamegraph captured: {local_svg}")
+        return local_svg
+    except Exception as e:
+        log(f"Warning: flamegraph capture failed on {host_ip}: {e}")
+        return None
+
+
+def diff_flamegraphs(baseline_folded, current_folded, output_path):
+    """Generate a differential flamegraph from two folded stack files.
+
+    Uses difffolded.pl locally.  Returns output_path on success, None on
+    failure.
+    """
+    try:
+        cmd = f"difffolded.pl {baseline_folded} {current_folded} | flamegraph.pl > {output_path}"
+        subprocess.run(cmd, shell=True, check=True, capture_output=True)
+        log(f"Differential flamegraph: {output_path}")
+        return output_path
+    except Exception as e:
+        log(f"Warning: diff flamegraph failed: {e}")
+        return None
 
 
 # ---------------------------------------------------------------------------
@@ -643,6 +836,53 @@ def compute_valkey_rates(prev, curr):
     return rates
 
 
+_DISK_COUNTER_MAP = [
+    ("disk_reads_completed", "disk_read_iops"),
+    ("disk_writes_completed", "disk_write_iops"),
+    ("disk_sectors_read", "disk_read_sectors_per_sec"),
+    ("disk_sectors_written", "disk_write_sectors_per_sec"),
+]
+
+
+def compute_disk_rates(prev, curr):
+    dt = (curr.get("epoch") or 0) - (prev.get("epoch") or 0)
+    if dt <= 0:
+        dt = 5
+    rates = {}
+    for counter, rate_key in _DISK_COUNTER_MAP:
+        p = prev.get(counter)
+        c = curr.get(counter)
+        if p is not None and c is not None:
+            rates[rate_key] = round((c - p) / dt, 1)
+    # Throughput in MB/s (512 bytes per sector)
+    rs = rates.get("disk_read_sectors_per_sec", 0)
+    ws = rates.get("disk_write_sectors_per_sec", 0)
+    rates["disk_read_mbps"] = round(rs * 512 / 1_000_000, 2)
+    rates["disk_write_mbps"] = round(ws * 512 / 1_000_000, 2)
+    # Utilisation % from io_ticks (ms of wall-clock I/O)
+    ticks_prev = prev.get("disk_io_ticks_ms")
+    ticks_curr = curr.get("disk_io_ticks_ms")
+    if ticks_prev is not None and ticks_curr is not None:
+        rates["disk_util_pct"] = round(
+            (ticks_curr - ticks_prev) / (dt * 1000) * 100, 1
+        )
+    return rates
+
+
+def compute_ctx_rates(prev, curr):
+    dt = (curr.get("epoch") or 0) - (prev.get("epoch") or 0)
+    if dt <= 0:
+        dt = 5
+    rates = {}
+    for key, rate_key in [("ctx_switches", "ctx_per_sec"),
+                          ("processes_created", "forks_per_sec")]:
+        p = prev.get(key)
+        c = curr.get(key)
+        if p is not None and c is not None:
+            rates[rate_key] = round((c - p) / dt, 1)
+    return rates
+
+
 # ---------------------------------------------------------------------------
 # Statistics helper
 # ---------------------------------------------------------------------------
@@ -794,7 +1034,7 @@ def derive_interval_metrics(metrics_rows, window_epoch_start, window_epoch_end,
         if tx_curr is not None and tx_prev is not None:
             net_tx_bps = (tx_curr - tx_prev) / dt
 
-        cpu_samples.append({
+        sample = {
             "epoch": epoch,
             "client_cpu_pct": cpu_pct,
             "client_mem_used_mb": mem_used,
@@ -809,7 +1049,14 @@ def derive_interval_metrics(metrics_rows, window_epoch_start, window_epoch_end,
             "client_loadavg_5m": curr.get("loadavg_5m"),
             "client_loadavg_15m": curr.get("loadavg_15m"),
             "client_per_core_cpu_pct": curr.get("per_core_cpu_pct_json"),
-        })
+        }
+
+        for dk, dv in compute_disk_rates(prev, curr).items():
+            sample[f"client_{dk}"] = dv
+        for ck, cv in compute_ctx_rates(prev, curr).items():
+            sample[f"client_{ck}"] = cv
+
+        cpu_samples.append(sample)
 
         if server_type in ("aurora", "tidb"):
             rates = compute_iud_rates(prev, curr)
@@ -854,6 +1101,12 @@ def build_interval_data(window_intervals, cpu_samples, db_samples,
             entry["client_cpufreq_avg_mhz"] = closest_cpu.get("client_cpufreq_avg_mhz")
             entry["client_loadavg_1m"] = closest_cpu.get("client_loadavg_1m")
             entry["client_per_core_cpu_pct"] = closest_cpu.get("client_per_core_cpu_pct")
+            for key in ("client_disk_read_iops", "client_disk_write_iops",
+                        "client_disk_read_mbps", "client_disk_write_mbps",
+                        "client_disk_util_pct",
+                        "client_ctx_per_sec", "client_forks_per_sec"):
+                if key in closest_cpu:
+                    entry[key] = closest_cpu[key]
 
         rows.append(entry)
     return rows
@@ -1059,6 +1312,27 @@ def analyze_window(sysbench_text, csv_path, run_start_epoch,
         ),
         "client_loadavg_15m": safe_stats(
             [r.get("client_loadavg_15m") for r in cpu_samples]
+        ),
+        "client_disk_read_iops": safe_stats(
+            [r.get("client_disk_read_iops") for r in cpu_samples]
+        ),
+        "client_disk_write_iops": safe_stats(
+            [r.get("client_disk_write_iops") for r in cpu_samples]
+        ),
+        "client_disk_read_mbps": safe_stats(
+            [r.get("client_disk_read_mbps") for r in cpu_samples]
+        ),
+        "client_disk_write_mbps": safe_stats(
+            [r.get("client_disk_write_mbps") for r in cpu_samples]
+        ),
+        "client_disk_util_pct": safe_stats(
+            [r.get("client_disk_util_pct") for r in cpu_samples]
+        ),
+        "client_ctx_per_sec": safe_stats(
+            [r.get("client_ctx_per_sec") for r in cpu_samples]
+        ),
+        "client_forks_per_sec": safe_stats(
+            [r.get("client_forks_per_sec") for r in cpu_samples]
         ),
     }
 

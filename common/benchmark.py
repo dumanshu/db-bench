@@ -440,6 +440,336 @@ def compute_fill_params(instance_type: str, fill_tables: int,
 
 
 # ---------------------------------------------------------------------------
+# Phase discipline helpers
+# ---------------------------------------------------------------------------
+
+
+def phase_cooldown(duration_secs: int = 120, label: str = "") -> None:
+    """Sleep between benchmark phases to let caches/buffers settle."""
+    tag = f" ({label})" if label else ""
+    log(f"Phase cooldown{tag}: sleeping {duration_secs}s...")
+    time.sleep(duration_secs)
+    log(f"Phase cooldown{tag}: done.")
+
+
+def get_db_size_mysql(host_ip: str, key_path: str, endpoint: str,
+                      port: int, db_name: str, user: str = "admin",
+                      password: str = "") -> int:
+    """Return database size in bytes via MySQL information_schema."""
+    pw_flag = f"-p'{password}'" if password else ""
+    sql = (
+        "SELECT COALESCE(SUM(DATA_LENGTH + INDEX_LENGTH), 0) "
+        f"FROM information_schema.TABLES WHERE TABLE_SCHEMA='{db_name}'"
+    )
+    cmd = (
+        f"mysql -sN -h '{endpoint}' -P {port} -u {user} {pw_flag} "
+        f"-e \"{sql}\""
+    )
+    r = ssh_run_simple(host_ip, key_path, cmd, timeout=30)
+    if r.returncode != 0:
+        log(f"Warning: get_db_size_mysql failed: {r.stderr.strip()}")
+        return 0
+    try:
+        return int(r.stdout.strip())
+    except ValueError:
+        log(f"Warning: could not parse db size: {r.stdout.strip()!r}")
+        return 0
+
+
+def get_db_size_postgres(host_ip: str, key_path: str, endpoint: str,
+                         port: int, db_name: str, user: str = "admin",
+                         password: str = "") -> int:
+    """Return database size in bytes via pg_database_size()."""
+    pw_env = f"PGPASSWORD='{password}' " if password else ""
+    cmd = (
+        f"{pw_env}psql -h '{endpoint}' -p {port} -U {user} -d {db_name} "
+        f"-tAc \"SELECT pg_database_size(current_database())\""
+    )
+    r = ssh_run_simple(host_ip, key_path, cmd, timeout=30)
+    if r.returncode != 0:
+        log(f"Warning: get_db_size_postgres failed: {r.stderr.strip()}")
+        return 0
+    try:
+        return int(r.stdout.strip())
+    except ValueError:
+        log(f"Warning: could not parse db size: {r.stdout.strip()!r}")
+        return 0
+
+
+def get_db_size_tidb(host_ip: str, key_path: str,
+                     tikv_data_dir: str = "/var/lib/tikv") -> int:
+    """Return TiKV data directory size in bytes via du."""
+    cmd = f"du -sb {tikv_data_dir} 2>/dev/null | cut -f1"
+    r = ssh_run_simple(host_ip, key_path, cmd, timeout=30)
+    if r.returncode != 0:
+        log(f"Warning: get_db_size_tidb failed: {r.stderr.strip()}")
+        return 0
+    try:
+        return int(r.stdout.strip())
+    except ValueError:
+        log(f"Warning: could not parse db size: {r.stdout.strip()!r}")
+        return 0
+
+
+def record_db_size(label: str, size_bytes: int,
+                   output_dir: Optional[str] = None) -> None:
+    """Log DB size and optionally persist to db_sizes.json."""
+    size_mb = size_bytes / (1024 * 1024)
+    size_gb = size_bytes / (1024 * 1024 * 1024)
+    log(f"DB size [{label}]: {size_bytes:,} bytes "
+        f"({size_mb:,.1f} MB / {size_gb:,.2f} GB)")
+    if output_dir:
+        import json
+        path = os.path.join(output_dir, "db_sizes.json")
+        data = {}
+        if os.path.exists(path):
+            try:
+                with open(path) as f:
+                    data = json.load(f)
+            except Exception:
+                pass
+        data[label] = {"bytes": size_bytes, "mb": round(size_mb, 1),
+                       "gb": round(size_gb, 2)}
+        with open(path, "w") as f:
+            json.dump(data, f, indent=2)
+
+
+# ---------------------------------------------------------------------------
+# Output directory standardization
+# ---------------------------------------------------------------------------
+
+
+def setup_output_dirs(db_name: str, profile: str, instance_type: str,
+                      base_dir: str = "results") -> dict:
+    """Create a standardized output directory structure for a benchmark run.
+
+    Directory layout::
+
+        {base_dir}/{db_name}/{timestamp}_{profile}_{instance}/
+            phases/          -- per-phase results
+            system/          -- sampler CSVs, system info
+            fg_diff/         -- differential flamegraphs
+            metadata.json    -- run metadata
+
+    Returns a dict with keys: ``root``, ``phases``, ``system``, ``fg_diff``,
+    ``metadata``.
+    """
+    import json
+    import platform
+    from datetime import datetime, timezone
+
+    timestamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
+    # Sanitize instance_type for use in directory name (e.g. "db.r6g.xlarge"
+    # -> "db-r6g-xlarge")
+    safe_instance = re.sub(r"[^a-zA-Z0-9_-]", "-", instance_type) if instance_type else "unknown"
+    safe_profile = re.sub(r"[^a-zA-Z0-9_-]", "-", profile) if profile else "default"
+    dir_name = f"{timestamp}_{safe_profile}_{safe_instance}"
+
+    root = os.path.join(base_dir, db_name, dir_name)
+    phases_dir = os.path.join(root, "phases")
+    system_dir = os.path.join(root, "system")
+    fg_diff_dir = os.path.join(root, "fg_diff")
+
+    os.makedirs(phases_dir, exist_ok=True)
+    os.makedirs(system_dir, exist_ok=True)
+    os.makedirs(fg_diff_dir, exist_ok=True)
+
+    git_sha = "unknown"
+    try:
+        result = subprocess.run(
+            ["git", "rev-parse", "HEAD"],
+            capture_output=True, text=True, timeout=5)
+        if result.returncode == 0:
+            git_sha = result.stdout.strip()
+    except Exception:
+        pass
+
+    metadata_path = os.path.join(root, "metadata.json")
+    metadata = {
+        "db_name": db_name,
+        "profile": profile,
+        "instance_type": instance_type,
+        "start_time": datetime.now(timezone.utc).isoformat(),
+        "git_sha": git_sha,
+        "python_version": platform.python_version(),
+    }
+    with open(metadata_path, "w") as f:
+        json.dump(metadata, f, indent=2)
+
+    paths = {
+        "root": root,
+        "phases": phases_dir,
+        "system": system_dir,
+        "fg_diff": fg_diff_dir,
+        "metadata": metadata_path,
+    }
+    log(f"Output directory: {root}")
+    return paths
+
+
+def finalize_output_dirs(paths_dict: dict, end_time: str,
+                         summary_data: Optional[dict] = None) -> None:
+    """Update metadata.json with end_time, duration, and optional summary.
+
+    Parameters
+    ----------
+    paths_dict : dict
+        The paths dict returned by :func:`setup_output_dirs`.
+    end_time : str
+        ISO-8601 end timestamp (UTC).
+    summary_data : dict, optional
+        If provided, written to ``summary.json`` in the root directory.
+    """
+    import json
+    from datetime import datetime, timezone
+
+    metadata_path = paths_dict.get("metadata", "")
+    if not metadata_path or not os.path.isfile(metadata_path):
+        return
+
+    try:
+        with open(metadata_path) as f:
+            metadata = json.load(f)
+    except Exception:
+        metadata = {}
+
+    metadata["end_time"] = end_time
+
+    start_str = metadata.get("start_time", "")
+    if start_str:
+        try:
+            start_dt = datetime.fromisoformat(start_str)
+            end_dt = datetime.fromisoformat(end_time)
+            metadata["duration_seconds"] = round(
+                (end_dt - start_dt).total_seconds(), 2)
+        except Exception:
+            pass
+
+    with open(metadata_path, "w") as f:
+        json.dump(metadata, f, indent=2)
+
+    if summary_data is not None:
+        summary_path = os.path.join(paths_dict["root"], "summary.json")
+        with open(summary_path, "w") as f:
+            json.dump(summary_data, f, indent=2, default=str)
+
+    log(f"Output finalized: {paths_dict['root']}")
+
+
+def _is_write_heavy(workload: str) -> bool:
+    """Return True if the workload involves significant writes."""
+    write_keywords = (
+        "write", "update", "insert", "delete", "iud", "mixed",
+    )
+    wl = workload.lower()
+    return any(kw in wl for kw in write_keywords)
+
+
+def order_workloads_read_write_read(workloads: list) -> list:
+    """Reorder workloads: reads first, then writes, then reads again
+    with a ``_post_write`` suffix for the second read pass."""
+    reads = [w for w in workloads if not _is_write_heavy(w)]
+    writes = [w for w in workloads if _is_write_heavy(w)]
+    post_reads = [f"{w}_post_write" for w in reads]
+    return reads + writes + post_reads
+
+
+def wait_for_compaction(db_type: str, host_ip: str, key_path: str,
+                        endpoint: str, port: int, user: str,
+                        password: str, timeout: int = 300) -> None:
+    """Wait for background compaction/flush to settle after writes.
+
+    - MySQL/Aurora: flush dirty pages via innodb_max_dirty_pages_pct trick.
+    - PostgreSQL/Aurora-PG/DSQL: issue CHECKPOINT.
+    - TiDB: issue ADMIN FLUSH TIDB + sleep.
+    """
+    log(f"Waiting for compaction/flush ({db_type})...")
+
+    if db_type in ("aurora", "mysql"):
+        pw_flag = f"-p'{password}'" if password else ""
+        # Force dirty page flush
+        flush_cmds = [
+            "SET GLOBAL innodb_max_dirty_pages_pct=0",
+            "SET GLOBAL innodb_max_dirty_pages_pct_lwm=0",
+        ]
+        for sql in flush_cmds:
+            cmd = (
+                f"mysql -sN -h '{endpoint}' -P {port} -u {user} {pw_flag} "
+                f"-e \"{sql}\""
+            )
+            ssh_run_simple(host_ip, key_path, cmd, timeout=30)
+
+        # Poll until dirty pages are near zero or timeout
+        elapsed = 0
+        poll_interval = 10
+        while elapsed < timeout:
+            sql = (
+                "SELECT variable_value FROM performance_schema.global_status "
+                "WHERE variable_name='Innodb_buffer_pool_pages_dirty'"
+            )
+            cmd = (
+                f"mysql -sN -h '{endpoint}' -P {port} -u {user} {pw_flag} "
+                f"-e \"{sql}\""
+            )
+            r = ssh_run_simple(host_ip, key_path, cmd, timeout=30)
+            try:
+                dirty = int(r.stdout.strip())
+            except (ValueError, AttributeError):
+                dirty = -1
+            if 0 <= dirty <= 10:
+                log(f"Dirty pages flushed ({dirty} remaining) "
+                    f"after {elapsed}s.")
+                break
+            time.sleep(poll_interval)
+            elapsed += poll_interval
+        else:
+            log(f"Warning: compaction wait timed out after {timeout}s.")
+
+        # Reset to defaults
+        reset_cmds = [
+            "SET GLOBAL innodb_max_dirty_pages_pct=90",
+            "SET GLOBAL innodb_max_dirty_pages_pct_lwm=10",
+        ]
+        for sql in reset_cmds:
+            cmd = (
+                f"mysql -sN -h '{endpoint}' -P {port} -u {user} {pw_flag} "
+                f"-e \"{sql}\""
+            )
+            ssh_run_simple(host_ip, key_path, cmd, timeout=30)
+
+    elif db_type in ("aurora-pg", "dsql", "postgres"):
+        pw_env = f"PGPASSWORD='{password}' " if password else ""
+        cmd = (
+            f"{pw_env}psql -h '{endpoint}' -p {port} -U {user} -d postgres "
+            f"-c \"CHECKPOINT\""
+        )
+        r = ssh_run_simple(host_ip, key_path, cmd, timeout=timeout)
+        if r.returncode != 0:
+            log(f"Warning: CHECKPOINT failed: {r.stderr.strip()}")
+        else:
+            log("CHECKPOINT complete.")
+
+    elif db_type == "tidb":
+        pw_flag = f"-p'{password}'" if password else ""
+        # Flush TiDB stats/buffers
+        sql = "ADMIN FLUSH TIDB"
+        cmd = (
+            f"mysql -sN -h '{endpoint}' -P {port} -u {user} {pw_flag} "
+            f"-e \"{sql}\""
+        )
+        r = ssh_run_simple(host_ip, key_path, cmd, timeout=60)
+        if r.returncode != 0:
+            log(f"Warning: ADMIN FLUSH TIDB failed: {r.stderr.strip()}")
+        # Give TiKV compaction time to settle
+        log("Sleeping 30s for TiKV compaction...")
+        time.sleep(30)
+        log("TiKV compaction wait complete.")
+
+    else:
+        log(f"Warning: unknown db_type '{db_type}' for compaction wait.")
+
+
+# ---------------------------------------------------------------------------
 # Parsing
 # ---------------------------------------------------------------------------
 
@@ -2180,7 +2510,10 @@ def _main_aurora(args):
         f"duration: {duration}s")
     print()
 
-    # Upload Lua scripts
+    aurora_profile = getattr(args, "profile", None) or "default"
+    bench_output_dirs = setup_output_dirs(
+        "aurora", aurora_profile, instance_type)
+
     lua_dir = None
     if workload in ("custom_iud", "custom_mixed", "custom_kv_sql"):
         lua_dir = upload_lua_scripts(host, key_path)
@@ -2194,6 +2527,11 @@ def _main_aurora(args):
     warmup_database(host, key_path, endpoint, port, "admin", password,
                     db, tables, table_size, server_type="aurora",
                     lua_dir=lua_dir)
+
+    phase_cooldown(60, "post-warmup")
+    record_db_size("pre-benchmark",
+                   get_db_size_mysql(host, key_path, endpoint, port, db,
+                                    "admin", password))
 
     iud_rates = None
     rows_before = None
@@ -2242,6 +2580,13 @@ def _main_aurora(args):
     cost_tracker.stop()
     bench_end = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
+    if _is_write_heavy(workload):
+        wait_for_compaction("aurora", host, key_path, endpoint, port,
+                            "admin", password)
+    record_db_size("post-benchmark",
+                   get_db_size_mysql(host, key_path, endpoint, port, db,
+                                    "admin", password))
+
     # Stop sampler and collect metrics
     cpu_samples = []
     interval_data = []
@@ -2266,6 +2611,13 @@ def _main_aurora(args):
                     'client_loadavg_5m': safe_stats([s.get('client_loadavg_5m') for s in cpu_samples]),
                     'client_loadavg_15m': safe_stats([s.get('client_loadavg_15m') for s in cpu_samples]),
                     'client_cpufreq_avg_mhz': safe_stats([s.get('client_cpufreq_avg_mhz') for s in cpu_samples]),
+                    'client_disk_read_iops': safe_stats([s.get('client_disk_read_iops') for s in cpu_samples]),
+                    'client_disk_write_iops': safe_stats([s.get('client_disk_write_iops') for s in cpu_samples]),
+                    'client_disk_read_mbps': safe_stats([s.get('client_disk_read_mbps') for s in cpu_samples]),
+                    'client_disk_write_mbps': safe_stats([s.get('client_disk_write_mbps') for s in cpu_samples]),
+                    'client_disk_util_pct': safe_stats([s.get('client_disk_util_pct') for s in cpu_samples]),
+                    'client_ctx_per_sec': safe_stats([s.get('client_ctx_per_sec') for s in cpu_samples]),
+                    'client_forks_per_sec': safe_stats([s.get('client_forks_per_sec') for s in cpu_samples]),
                 }
         except Exception as e:
             log(f"Warning: could not collect sampler metrics: {e}")
@@ -2352,6 +2704,8 @@ def _main_aurora(args):
         sysbench_cleanup(host, key_path, endpoint, port, "admin", password,
                          db, tables)
 
+    finalize_output_dirs(bench_output_dirs,
+                         datetime.now(timezone.utc).isoformat())
     log("Done.")
 
 
@@ -2528,6 +2882,9 @@ def _main_dsql(args):
     log(f"  Threads:   {threads}, Duration: {duration}s")
     print()
 
+    dsql_profile = getattr(args, "profile", None) or "default"
+    bench_output_dirs = setup_output_dirs("dsql", dsql_profile, "serverless")
+
     lua_dir = None
     if workload in ("custom_iud", "custom_mixed", "custom_kv_sql"):
         lua_dir = upload_lua_scripts(host, key_path)
@@ -2544,6 +2901,12 @@ def _main_dsql(args):
     warmup_database(host, key_path, endpoint, port, "admin", warmup_token,
                     "postgres", tables, table_size, server_type="dsql",
                     lua_dir=lua_dir)
+
+    phase_cooldown(60, "post-warmup")
+    dsql_size_token = token_mgr.get_token()
+    record_db_size("pre-benchmark",
+                   get_db_size_postgres(host, key_path, endpoint, port,
+                                       "postgres", "admin", dsql_size_token))
 
     # Start client resource sampler
     sampler_started = False
@@ -2596,6 +2959,15 @@ def _main_dsql(args):
             break
         all_results.append(result)
         remaining -= seg_duration
+
+    if _is_write_heavy(workload):
+        compact_token = token_mgr.get_token()
+        wait_for_compaction("dsql", host, key_path, endpoint, port,
+                            "admin", compact_token)
+    post_size_token = token_mgr.get_token()
+    record_db_size("post-benchmark",
+                   get_db_size_postgres(host, key_path, endpoint, port,
+                                       "postgres", "admin", post_size_token))
 
     cost_tracker.stop()
     bench_end = datetime.now(timezone.utc)
@@ -2671,6 +3043,9 @@ def _main_dsql(args):
         avg_tps=combined.get("tps") or 0,
     )
     cost_tracker.print_cost_summary()
+    finalize_output_dirs(bench_output_dirs,
+                         datetime.now(timezone.utc).isoformat(),
+                         summary_data=combined)
     log("Done.")
 
 
@@ -2747,6 +3122,10 @@ def _main_aurora_pg(args):
     log(f"  Threads:   {threads}, Duration: {duration}s")
     print()
 
+    apg_profile = getattr(args, "profile", None) or "default"
+    bench_output_dirs = setup_output_dirs(
+        "aurora-pg", apg_profile, "serverless")
+
     lua_dir = None
     if workload in ("custom_iud", "custom_mixed", "custom_kv_sql"):
         lua_dir = upload_lua_scripts(host, key_path)
@@ -2761,6 +3140,11 @@ def _main_aurora_pg(args):
     warmup_database(host, key_path, endpoint, port, user, password,
                     db, tables, table_size, server_type="aurora-pg",
                     lua_dir=lua_dir)
+
+    phase_cooldown(60, "post-warmup")
+    record_db_size("pre-benchmark",
+                   get_db_size_postgres(host, key_path, endpoint, port,
+                                       db, user, password))
 
     # Start client resource sampler
     sampler_started = False
@@ -2799,6 +3183,13 @@ def _main_aurora_pg(args):
     cost_tracker.stop()
     bench_end = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
+    if _is_write_heavy(workload):
+        wait_for_compaction("aurora-pg", host, key_path, endpoint, port,
+                            user, password)
+    record_db_size("post-benchmark",
+                   get_db_size_postgres(host, key_path, endpoint, port,
+                                       db, user, password))
+
     # Stop sampler and collect metrics
     cpu_samples = []
     interval_data = []
@@ -2824,6 +3215,13 @@ def _main_aurora_pg(args):
                     'client_loadavg_5m': safe_stats([s.get('client_loadavg_5m') for s in cpu_samples]),
                     'client_loadavg_15m': safe_stats([s.get('client_loadavg_15m') for s in cpu_samples]),
                     'client_cpufreq_avg_mhz': safe_stats([s.get('client_cpufreq_avg_mhz') for s in cpu_samples]),
+                    'client_disk_read_iops': safe_stats([s.get('client_disk_read_iops') for s in cpu_samples]),
+                    'client_disk_write_iops': safe_stats([s.get('client_disk_write_iops') for s in cpu_samples]),
+                    'client_disk_read_mbps': safe_stats([s.get('client_disk_read_mbps') for s in cpu_samples]),
+                    'client_disk_write_mbps': safe_stats([s.get('client_disk_write_mbps') for s in cpu_samples]),
+                    'client_disk_util_pct': safe_stats([s.get('client_disk_util_pct') for s in cpu_samples]),
+                    'client_ctx_per_sec': safe_stats([s.get('client_ctx_per_sec') for s in cpu_samples]),
+                    'client_forks_per_sec': safe_stats([s.get('client_forks_per_sec') for s in cpu_samples]),
                 }
         except Exception as e:
             log(f"Warning: could not collect sampler metrics: {e}")
@@ -2874,6 +3272,8 @@ def _main_aurora_pg(args):
         sysbench_cleanup(host, key_path, endpoint, port, user, password,
                          db, tables, server_type="aurora-pg")
 
+    finalize_output_dirs(bench_output_dirs,
+                         datetime.now(timezone.utc).isoformat())
     log("Done.")
 
 
@@ -3070,6 +3470,9 @@ mysql -h {db_host} -P {port} -u root -e \
         "host", role_types.get("client", "c8g.4xlarge"))
     server_type = role_types.get("tikv", default_type)
 
+    bench_output_dirs = setup_output_dirs(
+        "tidb", profile_name or "default", server_type)
+
     cluster_info = get_cluster_info(host, key_path, port, db_host=db_host)
     server_count = (cluster_info.get("tidb_count", 2) +
                     cluster_info.get("tikv_count", 3) +
@@ -3150,6 +3553,11 @@ mysql -h {db_host} -P {port} -u root -e \
     if args.prepare_only:
         log("Tables prepared. Skipping benchmark (--prepare-only).")
         return
+
+    phase_cooldown(120, "post-data-load")
+    record_db_size("pre-benchmark",
+                   get_db_size_mysql(bench_host, bench_key, db_host, port,
+                                    database, "root", ""))
 
     # Phase 2: Benchmark
     log("")
@@ -3243,6 +3651,13 @@ mysql -h {db_host} -P {port} -u root -e \
         avg_qps = benchmark_metrics.get("qps", 0) or 0
         avg_tps = benchmark_metrics.get("tps", 0) or 0
 
+    if _is_write_heavy(workload):
+        wait_for_compaction("tidb", bench_host, bench_key, db_host, port,
+                            "root", "")
+    record_db_size("post-benchmark",
+                   get_db_size_mysql(bench_host, bench_key, db_host, port,
+                                    database, "root", ""))
+
     cost_tracker.stop()
     cost_tracker.add_queries(
         query_count=total_queries,
@@ -3296,6 +3711,20 @@ mysql -h {db_host} -P {port} -u root -e \
                         [s.get('client_loadavg_15m') for s in cpu_samples]),
                     'client_cpufreq_avg_mhz': safe_stats(
                         [s.get('client_cpufreq_avg_mhz') for s in cpu_samples]),
+                    'client_disk_read_iops': safe_stats(
+                        [s.get('client_disk_read_iops') for s in cpu_samples]),
+                    'client_disk_write_iops': safe_stats(
+                        [s.get('client_disk_write_iops') for s in cpu_samples]),
+                    'client_disk_read_mbps': safe_stats(
+                        [s.get('client_disk_read_mbps') for s in cpu_samples]),
+                    'client_disk_write_mbps': safe_stats(
+                        [s.get('client_disk_write_mbps') for s in cpu_samples]),
+                    'client_disk_util_pct': safe_stats(
+                        [s.get('client_disk_util_pct') for s in cpu_samples]),
+                    'client_ctx_per_sec': safe_stats(
+                        [s.get('client_ctx_per_sec') for s in cpu_samples]),
+                    'client_forks_per_sec': safe_stats(
+                        [s.get('client_forks_per_sec') for s in cpu_samples]),
                 }
         except Exception as e:
             log(f"Warning: could not collect client sampler metrics: {e}")
@@ -3335,4 +3764,7 @@ mysql -h {db_host} -P {port} -u root -e \
         run_sysbench_cleanup(bench_host, bench_key, tables, port, database,
                              db_host=db_host)
 
+    from datetime import datetime as _dt, timezone as _tz
+    finalize_output_dirs(bench_output_dirs,
+                         _dt.now(_tz.utc).isoformat())
     log("Benchmark complete.")

@@ -368,6 +368,84 @@ def _section_node_resources(lines, runs):
             lines.append("")
 
 
+def _section_efficiency_metrics(lines, runs):
+    """Per-operation efficiency metrics (inspired by mdcallag/mytools sum_met.sh).
+
+    Computes resource cost per query: CPU us/q, context switches/q,
+    disk KB/q, IOPS/q.  Keeps QPS alongside for context.
+    """
+    eff_runs = []
+    for r in runs:
+        ws = r.get("window_stats", {})
+        tp = r.get("throughput", {})
+        qps = tp.get("qps", r.get("qps", 0))
+        if not qps or qps <= 0:
+            continue
+
+        cpu_pct = ws.get("client_cpu_pct", {}).get("avg")
+        ctx_per_sec = ws.get("client_ctx_per_sec", {}).get("avg")
+        disk_read_iops = ws.get("client_disk_read_iops", {}).get("avg")
+        disk_write_iops = ws.get("client_disk_write_iops", {}).get("avg")
+        disk_read_mbps = ws.get("client_disk_read_mbps", {}).get("avg")
+        disk_write_mbps = ws.get("client_disk_write_mbps", {}).get("avg")
+
+        eff = {
+            "workload": r.get("workload", "unknown"),
+            "instance": r.get("instance_type", ""),
+            "threads": r.get("threads", ""),
+            "qps": qps,
+        }
+
+        # CPU microseconds per query: (cpu_pct / 100) * 1e6 / qps
+        if cpu_pct is not None:
+            eff["cpu_us_per_q"] = (cpu_pct / 100.0) * 1_000_000 / qps
+
+        if ctx_per_sec is not None:
+            eff["cs_per_q"] = ctx_per_sec / qps
+
+        if disk_read_mbps is not None:
+            eff["rkb_per_q"] = disk_read_mbps * 1024 / qps
+
+        if disk_write_mbps is not None:
+            eff["wkb_per_q"] = disk_write_mbps * 1024 / qps
+
+        if disk_read_iops is not None and disk_write_iops is not None:
+            eff["iops_per_q"] = (disk_read_iops + disk_write_iops) / qps
+
+        eff_runs.append(eff)
+
+    if not eff_runs:
+        return
+
+    lines.append("## Efficiency Metrics (per query)")
+    lines.append("")
+    lines.append(
+        "*Resource cost per query -- lower is more efficient. "
+        "Inspired by [mdcallag/mytools](https://github.com/mdcallag/mytools).*"
+    )
+    lines.append("")
+    lines.append(
+        "| Workload | Instance | Threads | QPS | CPU us/q | CS/q "
+        "| rKB/q | wKB/q | IOPS/q |"
+    )
+    lines.append(
+        "|----------|----------|--------:|----:|---------:|-----:"
+        "|------:|------:|-------:|"
+    )
+
+    for e in eff_runs:
+        lines.append(
+            f"| {e['workload']} | {e['instance']} | {e['threads']} "
+            f"| {_fmt(e['qps'])} "
+            f"| {_fmt(e.get('cpu_us_per_q'))} "
+            f"| {_fmt(e.get('cs_per_q'), 3)} "
+            f"| {_fmt(e.get('rkb_per_q'), 3)} "
+            f"| {_fmt(e.get('wkb_per_q'), 3)} "
+            f"| {_fmt(e.get('iops_per_q'), 3)} |"
+        )
+    lines.append("")
+
+
 def _section_instance_specs(lines, runs):
     instance_types = sorted(set(r.get("instance_type", "") for r in runs))
     known = [it for it in instance_types if it in INSTANCE_PRICING]
@@ -451,6 +529,7 @@ def generate_report(results_dir, server_type, output_path=None) -> str:
     _section_iud_breakdown(lines, runs)
     _section_server_latency(lines, runs)
     _section_node_resources(lines, runs)
+    _section_efficiency_metrics(lines, runs)
     _section_instance_specs(lines, runs)
     lines.append("---")
     lines.append("")
@@ -778,6 +857,40 @@ def print_summary(results, server_type) -> None:
             log(f"{'Client':<12} {client_inst:<22} {cpu_s:>8} {mem_s:>14} {'N/A':>14} {'N/A':>14}")
 
         _print_client_extended_metrics(results)
+        log("=" * 100)
+
+    eff_rows = []
+    for r in results:
+        ws = r.get("window_stats", {})
+        tp = r.get("throughput", {})
+        qps = tp.get("qps", r.get("qps", 0))
+        if not qps or qps <= 0:
+            continue
+        cpu_pct = ws.get("client_cpu_pct", {}).get("avg")
+        ctx_ps = ws.get("client_ctx_per_sec", {}).get("avg")
+        rd_mbps = ws.get("client_disk_read_mbps", {}).get("avg")
+        wr_mbps = ws.get("client_disk_write_mbps", {}).get("avg")
+        rd_iops = ws.get("client_disk_read_iops", {}).get("avg")
+        wr_iops = ws.get("client_disk_write_iops", {}).get("avg")
+        cpu_us = (cpu_pct / 100.0) * 1_000_000 / qps if cpu_pct is not None else None
+        cs_q = ctx_ps / qps if ctx_ps is not None else None
+        rkb = rd_mbps * 1024 / qps if rd_mbps is not None else None
+        wkb = wr_mbps * 1024 / qps if wr_mbps is not None else None
+        iops_q = (rd_iops + wr_iops) / qps if rd_iops is not None and wr_iops is not None else None
+        eff_rows.append((r.get("workload", "?"), qps, cpu_us, cs_q, rkb, wkb, iops_q))
+
+    if eff_rows:
+        log("")
+        log("EFFICIENCY (per query):")
+        log("-" * 100)
+        log(f"{'Workload':<22} {'QPS':>10} {'CPU us/q':>10} {'CS/q':>8} {'rKB/q':>8} {'wKB/q':>8} {'IOPS/q':>8}")
+        log("-" * 100)
+        for wl, qps, cpu_us, cs_q, rkb, wkb, iops_q in eff_rows:
+            log(
+                f"{wl:<22} {qps:>10,.1f} "
+                f"{_fmt(cpu_us):>10} {_fmt(cs_q, 3):>8} "
+                f"{_fmt(rkb, 3):>8} {_fmt(wkb, 3):>8} {_fmt(iops_q, 3):>8}"
+            )
         log("=" * 100)
 
     _print_resource_history(results)
