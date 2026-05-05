@@ -147,12 +147,12 @@ AWS_PROFILE=sandbox python3 -m valkey.setup --cleanup
 
 ## DSQL
 
-Benchmarks Amazon Aurora DSQL, a serverless PostgreSQL-compatible database, using pgbench with IAM authentication.
+Benchmarks Amazon Aurora DSQL, a serverless PostgreSQL-compatible database, using sysbench (PostgreSQL driver) with IAM authentication.
 
 ### Features
 
 - **Serverless**: No server EC2 to provision -- only a client VM and a DSQL cluster via AWS API
-- **pgbench**: Standard PostgreSQL benchmarking tool with `--max-tries` for OCC retry handling
+- **sysbench (unified)**: Same sysbench pipeline as TiDB/Aurora MySQL/Aurora PG (`--db-driver=pgsql`), with custom lua workloads ported to Postgres and OCC retry handled inside the workloads for fair cross-engine comparison (see commit a348732)
 - **IAM auth tokens**: Automatic token generation and refresh for runs exceeding 15 minutes
 - **CloudWatch metrics**: Captures DSQL-specific server-side metrics (DPU, OCC conflicts, commit latency, storage)
 - **Cost estimation**: Estimates DSQL costs from DPU consumption during the benchmark
@@ -167,9 +167,6 @@ AWS_PROFILE=sandbox python3 -m dsql.setup --seed dsqllt-001
 # Validate
 AWS_PROFILE=sandbox python3 -m dsql.validate --seed dsqllt-001
 
-# Validate with quick benchmark
-AWS_PROFILE=sandbox python3 -m dsql.validate --seed dsqllt-001 --quick-bench
-
 # Benchmark (standard profile, 15 minutes)
 AWS_PROFILE=sandbox python3 -m dsql.benchmark --profile standard
 
@@ -183,8 +180,8 @@ python3 -m dsql.setup --seed dsqllt-001 --cleanup --aws-profile sandbox
 ### DSQL Limitations
 
 - Only `postgres` database available (no custom databases)
-- No VACUUM support (pgbench init uses `-I dtGp` to skip vacuum)
-- OCC serialization: conflicts are retried via `--max-tries`
+- No VACUUM support (sysbench PG branch prepares tables via psql without VACUUM)
+- OCC serialization: conflicts retried inside the custom lua workloads (ported for Postgres in a348732)
 - 3000-row transaction limit
 - Auth tokens expire after 15 minutes (auto-refreshed for long runs)
 
@@ -196,4 +193,4 @@ python3 -m dsql.setup --seed dsqllt-001 --cleanup --aws-profile sandbox
 - [Valkey Documentation](https://valkey.io/docs/)
 - [Envoy Proxy](https://www.envoyproxy.io/docs/)
 - [Amazon Aurora DSQL](https://docs.aws.amazon.com/aurora-dsql/latest/userguide/)
-- [pgbench Documentation](https://www.postgresql.org/docs/current/pgbench.html)
+- [sysbench](https://github.com/akopytov/sysbench)

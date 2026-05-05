@@ -84,7 +84,7 @@ LIMEOF
 # Constants
 # ---------------------------------------------------------------------------
 
-SERVER_TYPES = ("tidb", "aurora", "valkey")
+SERVER_TYPES = ("tidb", "aurora", "valkey", "dsql", "aurora-pg")
 
 # Stack name prefixes used by each server type's setup.py
 STACK_PREFIXES = {

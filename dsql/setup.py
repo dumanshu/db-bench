@@ -5,14 +5,15 @@ _sys.path.insert(0, _os.path.join(_os.path.dirname(__file__), ".."))
 DSQL Load Test Stack Provisioner
 
 Provisions AWS infrastructure for benchmarking Amazon Aurora DSQL:
-- 1 client EC2 (pgbench runner, Amazon Linux 2023 ARM64)
+- 1 client EC2 (sysbench runner, Amazon Linux 2023 ARM64)
 - 1 DSQL cluster (managed serverless, created via AWS API)
 - VPC/subnet/SG for the client VM
 - Security group rules for SSH access and DSQL connectivity (port 5432)
 
 DSQL is a fully managed serverless database -- there are no server EC2 instances
-to provision.  The client VM runs pgbench against the DSQL endpoint using IAM
-authentication tokens.
+to provision.  The client VM runs sysbench (PostgreSQL driver) against the DSQL
+endpoint using IAM authentication tokens, via the unified sysbench pipeline in
+``common.benchmark`` (see commit a348732).
 """
 
 import argparse
@@ -46,7 +47,7 @@ from common.ssh import ssh_run, ssh_capture, wait_for_ssh
 SEED = "dsqllt-001"
 
 # Client instance types
-CLIENT_INSTANCE_TYPE = "c7g.2xlarge"        # 8 vCPU, 16GB -- pgbench client
+CLIENT_INSTANCE_TYPE = "c7g.2xlarge"        # 8 vCPU, 16GB -- sysbench client
 PRODUCTION_CLIENT_TYPE = "c7g.4xlarge"      # 16 vCPU, 32GB
 
 # Network
@@ -311,15 +312,18 @@ def load_state():
 def bootstrap_client(ctx: BootstrapContext):
     log("Bootstrapping client VM...")
 
+    from common.client import install_client_tools
+    install_client_tools(
+        ctx.client.public_ip,
+        str(ctx.ssh_key_path),
+        "dsql",
+    )
+
+    # psql is needed for DSQL IAM-token DDL (sysbench_prepare PG branch).
     ssh_run(ctx.client, """
-sudo dnf -y update || true
-sudo dnf -y install postgresql16 postgresql16-contrib jq htop sysstat || true
-pgbench --version
+sudo dnf -y install postgresql16 postgresql16-contrib || true
 psql --version
 """, ctx)
-
-    from common.client import system_tuning_script
-    ssh_run(ctx.client, system_tuning_script(conf_name="dsql-bench"), ctx)
 
     # Verify connectivity to DSQL endpoint
     if ctx.dsql_endpoint:
