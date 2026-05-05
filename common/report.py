@@ -817,6 +817,66 @@ def print_ec2_fleet_sparklines(ec2_instances, start_epoch, end_epoch, region=Non
     log("")
 
 
+def finalize_benchmark_report(
+    *,
+    stack,
+    start_ts,
+    end_ts,
+    region=None,
+    profile=None,
+    results=None,
+    server_nodes=None,
+    sampler_csv=None,
+    sampler_server_type="generic",
+):
+    """Render post-benchmark resource report: client/server history + EC2 fleet.
+
+    Best-effort: each block is independently caught; the function never raises.
+
+    Args:
+        stack: Project tag value (e.g., "tidb-loadtest-001").
+        start_ts, end_ts: Benchmark start/end epoch seconds (int/float).
+        region, profile: AWS region and profile for EC2/CloudWatch lookups.
+        results: List of result dicts with `interval_data` for
+            `_print_resource_history`. Mutually exclusive with `sampler_csv`.
+        server_nodes: Optional server-node interval-data list.
+        sampler_csv: Sampler CSV path. Used only when `results` is None;
+            parsed into a synthetic client-only result.
+        sampler_server_type: Type passed to `derive_interval_metrics`
+            when parsing `sampler_csv` (default "generic").
+    """
+    try:
+        if results:
+            _print_resource_history(results, server_nodes=server_nodes)
+        elif sampler_csv:
+            from common.sampler import parse_metrics_csv, derive_interval_metrics
+            rows = parse_metrics_csv(sampler_csv)
+            if rows:
+                s_epoch = rows[0].get("epoch", 0)
+                e_epoch = rows[-1].get("epoch", 0)
+                cpu_samples, _ = derive_interval_metrics(
+                    rows, s_epoch, e_epoch, sampler_server_type)
+                if cpu_samples:
+                    fake_result = {
+                        "interval_data": cpu_samples,
+                        "ec2_instance_type": "",
+                    }
+                    _print_resource_history(
+                        [fake_result], server_nodes=server_nodes)
+    except Exception as e:
+        log(f"Warning: Could not render resource history: {e}")
+
+    try:
+        from common.aws import discover_stack_instances
+        instances = discover_stack_instances(
+            stack, region=region, profile=profile)
+        if instances:
+            print_ec2_fleet_sparklines(
+                instances, int(start_ts), int(end_ts), region=region)
+    except Exception as e:
+        log(f"Warning: Could not render EC2 fleet sparklines: {e}")
+
+
 def print_summary(results, server_type) -> None:
     if isinstance(results, dict):
         results = [results]
