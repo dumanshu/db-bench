@@ -1058,7 +1058,7 @@ def build_sysbench_cmd(
     lua_dir: Optional[str] = None,
     server_type: str = "aurora",
     isolation_level: str = "read-committed",
-    warmup_time: int = 10,
+    warmup_time: int = 0,
     rand_type: str = "uniform",
     skip_trx: Optional[bool] = None,
     db_ps_mode: str = "auto",
@@ -1117,7 +1117,11 @@ def build_sysbench_cmd(
     parts.append(f"--report-interval={report_interval}")
 
     parts.append("--percentile=99")
-    parts.append(f"--warmup-time={warmup_time}")
+    # --warmup-time is sysbench 1.1+; AL2023 ships 1.0.20 and rejects it.
+    # Framework runs its own explicit warmup pass before timed run, so the
+    # inline option is redundant anyway. Emit only when caller opts in.
+    if warmup_time and warmup_time > 0:
+        parts.append(f"--warmup-time={warmup_time}")
     parts.append(f"--rand-type={rand_type}")
     if db_ps_mode and db_ps_mode != "auto":
         parts.append(f"--db-ps-mode={db_ps_mode}")
@@ -1132,8 +1136,12 @@ def build_sysbench_cmd(
     iso_sql = ISOLATION_LEVEL_MAP.get(isolation_level, "")
     if iso_sql:
         if pg:
-            parts.append(
-                f"--pgsql-options='--default_transaction_isolation={iso_sql.lower().replace(' ', '_')}'")
+            # --pgsql-options is sysbench 1.1+ only; AL2023 ships 1.0.20.
+            # PG's session default is read committed, so skip the option
+            # entirely for the (default) "read-committed" case.
+            if isolation_level != "read-committed":
+                parts.append(
+                    f"--pgsql-options='--default_transaction_isolation={iso_sql.lower().replace(' ', '_')}'")
         else:
             parts.append(
                 f"--mysql-init-command='SET SESSION TRANSACTION ISOLATION LEVEL {iso_sql}'")
@@ -2990,8 +2998,13 @@ def _main_dsql(args):
 
     if not args.skip_prepare:
         token = token_mgr.get_token()
+        # DSQL prepare: force threads=1. With multi-threaded prepare,
+        # sysbench 1.0.20 (AL2023) only invokes prepare() in tid=0 against
+        # custom lua scripts, so the tid-sharded loop in custom_*.lua
+        # creates a single table when threads > 1. Forcing threads=1 means
+        # tid=0 iterates over every table sequentially. Slower but correct.
         sysbench_prepare(host, key_path, endpoint, port, "admin", token,
-                         "postgres", tables, table_size, threads,
+                         "postgres", tables, table_size, 1,
                          workload=workload,
                          lua_dir=lua_dir or "/tmp/lua",
                          server_type="dsql")
@@ -3062,7 +3075,7 @@ def _main_dsql(args):
     if _is_write_heavy(workload):
         compact_token = token_mgr.get_token()
         wait_for_compaction("dsql", host, key_path, endpoint, port,
-                            "admin", compact_token, db=db, tables=tables)
+                            "admin", compact_token, db="postgres", tables=tables)
     post_size_token = token_mgr.get_token()
     record_db_size("post-benchmark",
                    get_db_size_postgres(host, key_path, endpoint, port,

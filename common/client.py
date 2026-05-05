@@ -484,25 +484,44 @@ def _install_mysql_client(host_ip, key_path, timeout=300):
 
 def _install_sysbench(host_ip, key_path, timeout=600):
     log(f"  Installing sysbench on {host_ip}")
+    # Build with BOTH MySQL and PostgreSQL drivers so the same binary
+    # benchmarks Aurora MySQL/TiDB (mysql) and Aurora PG/DSQL (pgsql).
     ssh_run_simple(host_ip, key_path, """
+        # Idempotent: skip only if existing binary already has both drivers.
         if command -v sysbench >/dev/null 2>&1; then
-            echo "sysbench already installed"
-            sysbench --version
-            exit 0
+            BIN=$(command -v sysbench)
+            HAS_PG=$(ldd "$BIN" 2>/dev/null | grep -ci 'libpq\\.' || true)
+            HAS_MY=$(ldd "$BIN" 2>/dev/null | grep -ciE 'libmysqlclient\\.|libmariadb\\.' || true)
+            if [ "$HAS_PG" -gt 0 ] && [ "$HAS_MY" -gt 0 ]; then
+                echo "sysbench already installed (mysql + pgsql)"
+                sysbench --version
+                exit 0
+            fi
+            echo "sysbench present but missing driver(s); rebuilding..."
         fi
         set -euo pipefail
+        # libpq for pgsql driver; mariadb-devel/mysql-devel for mysql driver.
+        if command -v dnf >/dev/null 2>&1; then
+            sudo dnf -y install postgresql-devel mariadb105-devel \
+                || sudo dnf -y install postgresql-devel mysql-devel \
+                || sudo dnf -y install postgresql-devel
+        else
+            sudo yum -y install postgresql-devel mysql-devel || true
+        fi
         cd /tmp
         if [ ! -d sysbench ]; then
             git clone https://github.com/akopytov/sysbench.git
         fi
         cd sysbench
         git checkout 1.0.20
+        make distclean >/dev/null 2>&1 || true
         ./autogen.sh
-        ./configure --with-mysql
+        ./configure --with-mysql --with-pgsql
         make -j$(nproc)
         sudo make install
         sudo ldconfig
         sysbench --version
+        ldd "$(command -v sysbench)" | grep -Ei 'libpq|mysql|mariadb' || true
     """, timeout=timeout)
 
 
