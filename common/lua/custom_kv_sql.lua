@@ -145,7 +145,6 @@ local function upsert_conditional()
    local ts = random_timestamp()
    local val = random_value(val_size_write)
 
-   con:query("BEGIN")
    if driver_name == "pgsql" then
       con:query(string.format(
          "INSERT INTO %s (primary_key, secondary_key, timestamp, value) VALUES ('%s', '%s', %d, '%s') " ..
@@ -165,7 +164,6 @@ local function upsert_conditional()
          tbl, pk, sk, ts, val
       ))
    end
-   con:query("COMMIT")
 end
 
 local function upsert_unconditional()
@@ -176,7 +174,6 @@ local function upsert_unconditional()
    local ts = random_timestamp()
    local val = random_value(val_size_write)
 
-   con:query("BEGIN")
    if driver_name == "pgsql" then
       con:query(string.format(
          "INSERT INTO %s (primary_key, secondary_key, timestamp, value) VALUES ('%s', '%s', %d, '%s') " ..
@@ -190,7 +187,6 @@ local function upsert_unconditional()
          tbl, pk, sk, ts, val
       ))
    end
-   con:query("COMMIT")
 end
 
 local function version_delete()
@@ -199,7 +195,6 @@ local function version_delete()
    local pk = string.format("pk_%010d", key_id)
    local sk = string.format("sk_%010d", key_id)
 
-   con:query("BEGIN")
    if driver_name == "pgsql" then
       con:query(string.format(
          "WITH cutoff AS (" ..
@@ -224,7 +219,6 @@ local function version_delete()
          max_versions
       ))
    end
-   con:query("COMMIT")
 end
 
 function event()
