@@ -185,6 +185,18 @@ python3 -m dsql.setup --seed dsqllt-001 --cleanup --aws-profile sandbox
 - 3000-row transaction limit
 - Auth tokens expire after 15 minutes (auto-refreshed for long runs)
 
+### DSQL sysbench result fields
+
+The DSQL sysbench JSON includes the normal sysbench transaction metrics (`tps`, `qps`, `latency_avg_ms`, `latency_p99_ms`, query counts, and interval samples). For `custom_mixed`, it also includes:
+
+- `op_latency_ms`: client-side latency by operation category (`select`, `insert`, `update`, `delete` for the single-statement `custom_mixed` workload)
+- `query_latency_ms`: client-side latency by stable query template key, with `type`, `category`, and the raw Lua SQL template string
+- `read_qps`, `write_qps`, and `other_qps` on interval samples when sysbench emits `(r/w/o: ...)`
+
+The per-operation and per-template `p50_ms` / `p95_ms` / `p99_ms` values are derived from fixed latency buckets and represent bucket upper bounds. The top-level sysbench percentile is still the configured sysbench percentile; the default benchmark command uses `--percentile=99`, so `latency_p95_ms` can be `null` while `latency_p99_ms` is populated.
+
+DSQL does not support `pg_database_size`, so DB-size-derived storage numbers can be zero in local result JSON. Local result JSON/CSV/log artifacts are intentionally gitignored and should not be committed.
+
 ## References
 
 - [TiDB Documentation](https://docs.pingcap.com/tidb/stable)
