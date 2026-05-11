@@ -3723,13 +3723,20 @@ def _main_dsql(args):
         remaining -= seg_duration
 
     if _is_write_heavy(workload):
-        compact_token = token_mgr.get_token()
-        wait_for_compaction("dsql", host, key_path, endpoint, port,
-                            "admin", compact_token, db="postgres", tables=tables)
-    post_size_token = token_mgr.get_token()
-    record_db_size("post-benchmark",
-                   get_db_size_postgres(host, key_path, endpoint, port,
-                                       "postgres", "admin", post_size_token))
+        try:
+            compact_token = token_mgr.get_token()
+            wait_for_compaction("dsql", host, key_path, endpoint, port,
+                                "admin", compact_token, db="postgres",
+                                tables=tables)
+        except Exception as e:
+            log(f"Warning: post-benchmark compaction wait failed: {e}")
+    try:
+        post_size_token = token_mgr.get_token()
+        record_db_size("post-benchmark",
+                       get_db_size_postgres(host, key_path, endpoint, port,
+                                           "postgres", "admin", post_size_token))
+    except Exception as e:
+        log(f"Warning: post-benchmark DB size failed: {e}")
 
     cost_tracker.stop()
     bench_end = datetime.now(timezone.utc)
@@ -3757,6 +3764,14 @@ def _main_dsql(args):
     combined["duration_s"] = duration
     combined["server_type"] = "dsql"
     combined["endpoint"] = endpoint
+    combined["cluster_id"] = cluster_id
+    combined["region"] = region
+    combined["database"] = "postgres"
+    combined["tables"] = tables
+    combined["table_size"] = table_size
+    combined["client_host"] = host
+    combined["benchmark_start_utc"] = bench_start.isoformat()
+    combined["benchmark_end_utc"] = bench_end.isoformat()
 
     _attach_common_runtime_stats(
         combined,
@@ -3819,6 +3834,10 @@ def _main_dsql(args):
         log("")
         log("Collecting DSQL CloudWatch metrics...")
         cw_end = bench_end + timedelta(minutes=2)
+        combined["cloudwatch_window"] = {
+            "start_utc": bench_start.isoformat(),
+            "end_utc": cw_end.isoformat(),
+        }
         cw_metrics = _collect_dsql_cloudwatch(
             cluster_id, bench_start, cw_end, region, db_profile)
         if cw_metrics:
@@ -4384,6 +4403,7 @@ mysql -h {db_host} -P {port} -u root -e \
 
     cost_tracker.start()
     benchmark_start_time = time.time()
+    benchmark_start_utc = datetime.now(timezone.utc)
 
     for sampler_attempt in range(1, 4):
         try:
@@ -4517,6 +4537,7 @@ mysql -h {db_host} -P {port} -u root -e \
             avg_tps = weighted_tps / total_duration
     else:
         benchmark_metrics = _run_streaming(threads, duration)
+        benchmark_end_utc = datetime.now(timezone.utc)
         print_summary(benchmark_metrics, "tidb")
         total_queries = benchmark_metrics.get("total_queries", 0) or 0
         total_transactions = (benchmark_metrics.get("total_transactions", 0)
@@ -4603,6 +4624,8 @@ mysql -h {db_host} -P {port} -u root -e \
             log(f"Warning: could not collect client sampler metrics: {e}")
 
     if not multi_phase and 'benchmark_metrics' in locals():
+        benchmark_end_utc = locals().get(
+            "benchmark_end_utc", datetime.now(timezone.utc))
         _attach_common_runtime_stats(
             benchmark_metrics,
             sampler_csv_path if sampler_started else None,
@@ -4622,6 +4645,8 @@ mysql -h {db_host} -P {port} -u root -e \
         benchmark_metrics["control_host"] = host
         benchmark_metrics["profile"] = profile_name
         benchmark_metrics["cluster_info"] = cluster_info
+        benchmark_metrics["benchmark_start_utc"] = benchmark_start_utc.isoformat()
+        benchmark_metrics["benchmark_end_utc"] = benchmark_end_utc.isoformat()
         interval_data = benchmark_metrics.get('interval_data', interval_data)
         sampler_ws = benchmark_metrics.get('window_stats', sampler_ws)
 
