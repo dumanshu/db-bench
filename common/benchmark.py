@@ -4166,8 +4166,8 @@ def _main_tidb(args):
     client_state = _load_bench_client(seed)
 
     if not args.host and client_state.get("public_ip"):
-        args.host = client_state["public_ip"]
-        log(f"Using bench-client from state file: {args.host}")
+        log("Using bench-client from state file for sysbench: "
+            f"{client_state['public_ip']}")
 
     if args.ssh_key:
         ssh_key_resolved = args.ssh_key
