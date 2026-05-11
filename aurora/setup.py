@@ -12,7 +12,7 @@ Creates:
   - Aurora DB subnet group
   - Aurora MySQL cluster (IO-Optimized, aurora-iopt1)
   - Aurora writer DB instance
-  - EC2 client instance (c8g.24xlarge default) with sysbench + mysql-client installed
+  - EC2 client instance (c8g.4xlarge default via common.client --size small) with sysbench + mysql-client installed
 
 Snapshot workflow (avoids re-running fill phase):
   1. Provision + fill data as usual
