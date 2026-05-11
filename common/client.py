@@ -91,6 +91,8 @@ STACK_PREFIXES = {
     "aurora": "aurora-bench",
     "tidb": "tidb-loadtest",
     "valkey": "valkey-loadtest",
+    "dsql": "dsql-loadtest",
+    "aurora-pg": "aurora-pg-bench",
 }
 
 # Size presets for the client EC2 instance (Graviton4)

@@ -47,8 +47,8 @@ from common.ssh import ssh_run, ssh_capture, wait_for_ssh
 SEED = "dsqllt-001"
 
 # Client instance types
-CLIENT_INSTANCE_TYPE = "c7g.2xlarge"        # 8 vCPU, 16GB -- sysbench client
-PRODUCTION_CLIENT_TYPE = "c7g.4xlarge"      # 16 vCPU, 32GB
+CLIENT_INSTANCE_TYPE = "c8g.4xlarge"        # 16 vCPU, 32GB -- sysbench client
+PRODUCTION_CLIENT_TYPE = "c8g.4xlarge"      # 16 vCPU, 32GB
 
 # Network
 VPC_CIDR = "10.44.0.0/16"
