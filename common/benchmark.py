@@ -4171,8 +4171,6 @@ def _main_tidb(args):
 
     if args.ssh_key:
         ssh_key_resolved = args.ssh_key
-    elif client_state.get("key_path"):
-        ssh_key_resolved = client_state["key_path"]
     else:
         ssh_key_resolved = str(DEFAULT_SSH_KEY_PATH)
     key_path = Path(ssh_key_resolved).expanduser().resolve()

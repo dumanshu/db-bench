@@ -101,6 +101,14 @@ SIZE_PRESETS = {
     "heavy": "c8g.24xlarge",   # 96 vCPU, 192 GB
 }
 
+CLIENT_DB_PORTS = {
+    "aurora": [3306],
+    "aurora-pg": [5432],
+    "dsql": [5432],
+    "tidb": [30400],
+    "valkey": [6379],
+}
+
 # AL2023 ARM64 AMI SSM parameter (all client sizes are Graviton)
 AL2023_SSM_ARM64 = "/aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-arm64"
 
@@ -286,6 +294,39 @@ def _ensure_client_sg(ec2_client, vpc_id, server_stack, vpc_cidr, ssh_cidr):
                 raise
 
     return sg_id
+
+
+def _authorize_client_db_access(ec2_client, server_stack, client_sg_id,
+                                server_type):
+    """Allow the benchmark client SG to reach server DB ports."""
+    ports = CLIENT_DB_PORTS.get(server_type, [])
+    if not ports:
+        return
+    resp = ec2_client.describe_security_groups(
+        Filters=[{"Name": "tag:Project", "Values": [server_stack]}]
+    )
+    for sg in resp.get("SecurityGroups", []):
+        sg_id = sg["GroupId"]
+        if sg_id == client_sg_id or sg.get("GroupName") == "default":
+            continue
+        for port in ports:
+            try:
+                ec2_client.authorize_security_group_ingress(
+                    GroupId=sg_id,
+                    IpPermissions=[{
+                        "IpProtocol": "tcp",
+                        "FromPort": port,
+                        "ToPort": port,
+                        "UserIdGroupPairs": [{
+                            "GroupId": client_sg_id,
+                            "Description": "db-bench-client",
+                        }],
+                    }],
+                )
+                log(f"  Allowed client SG {client_sg_id} -> {sg_id}:{port}")
+            except ec2_client.exceptions.ClientError as e:
+                if "InvalidPermission.Duplicate" not in str(e):
+                    raise
 
 
 def _find_instance(ec2_client, name, server_stack):
@@ -648,6 +689,7 @@ def main():
 
     # Security group
     sg_id = _ensure_client_sg(ec2_client, vpc_id, server_stack, vpc_cidr, ssh_cidr)
+    _authorize_client_db_access(ec2_client, server_stack, sg_id, server_type)
 
     # Key pair
     key_name = f"{KEY_NAME_PREFIX}-{seed}"
