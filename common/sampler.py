@@ -3,7 +3,7 @@
 Merges aurora/ec2_sampler.py (runs on EC2) and aurora/parse_window.py
 (local post-processing) into a single module parameterized by server type.
 
-Server types: aurora, tidb, valkey
+Server types: aurora, aurora-pg, tidb, dsql, valkey
 
 Sampler (EC2-side):
   Collects /proc/stat CPU jiffies, /proc/meminfo, plus DB-specific counters.

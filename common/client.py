@@ -4,8 +4,9 @@ Unified client VM provisioning for db-bench.
 
 Provides a single EC2 client instance with all benchmark tools installed:
   - Base OS packages + sysctl tuning (all server types)
-  - sysbench (tidb, aurora)
+  - sysbench with MySQL and PostgreSQL drivers (tidb, aurora, aurora-pg, dsql)
   - mysql-client / mariadb (tidb, aurora)
+  - PostgreSQL client/development libraries (aurora-pg, dsql)
   - memtier_benchmark (valkey)
   - valkey-cli (valkey)
   - docker (valkey)

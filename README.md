@@ -5,11 +5,12 @@ Monorepo for database benchmarking tools on AWS. Each subdirectory contains scri
 ## Structure
 
 ```
-common/          Shared AWS, SSH, and utility modules
+common/          Shared AWS, SSH, client, sampler, reporting, and utility modules
 tidb/            TiDB on k3s + TiDB Operator (multi-AZ, TiCDC replication)
 valkey/          Valkey with Envoy proxy (standalone and cluster modes)
 dsql/            Amazon Aurora DSQL (serverless, PostgreSQL-compatible)
-aurora/          Aurora benchmarking (planned)
+aurora/          Aurora MySQL provisioning, validation, and benchmarking
+aurora-pg/       Aurora PostgreSQL benchmark wrapper
 ```
 
 ## Common Library
@@ -23,13 +24,13 @@ aurora/          Aurora benchmarking (planned)
 
 ## Prerequisites
 
-- Python 3.9+ with `boto3`
+- Python 3.10+ with `boto3` and `botocore`
 - AWS CLI v2 configured with a profile pointing at the target account (default profile: `sandbox`)
 - `ssh` and `scp` in PATH
 
 ### SSH Key Setup
 
-All modules share a single EC2 key pair (`dbbench-key`) stored at `common/dbbench-key.pem`. The setup scripts create it automatically on first run, but you can also generate and import it manually:
+Most module setup scripts create or reuse a shared EC2 key pair (`dbbench-key`) stored at `common/dbbench-key.pem`. TiDB expects that key file to exist before provisioning, so the safest bootstrap is to generate and import it explicitly once:
 
 ```bash
 ssh-keygen -t ed25519 -f common/dbbench-key.pem -N "" -C "dbbench"
@@ -53,6 +54,18 @@ python3 -m tidb.validate --help
 python3 -m valkey.setup --help
 python3 -m valkey.benchmark --help
 python3 -m valkey.validate --help
+
+python3 -m dsql.setup --help
+python3 -m dsql.benchmark --help
+python3 -m dsql.validate --help
+
+python3 -m aurora.setup --help
+python3 -m aurora.benchmark --help
+python3 -m aurora.validate --help
+
+python3 -m aurora-pg.benchmark --help
+python3 -m common.client --help
+python3 -m common.benchmark --help
 ```
 
 ## TiDB
@@ -66,7 +79,7 @@ Provisions a multi-AZ TiDB cluster on EC2 via k3s and TiDB Operator, with option
 - **Instance tiers**: `--production` (default, PingCAP-recommended) or `--benchmark-mode` (cost-optimized)
 - **Dedicated VMs**: Each TiKV pod consumes the entire EC2 instance
 - **TiCDC replication**: Deploys upstream + downstream clusters with changefeed lag measurement
-- **Benchmark profiles**: quick, light, medium, heavy, standard, stress, scaling
+- **Benchmark profiles**: quick, light, standard, heavy, stress, scaling
 - **Workloads**: oltp_read_write, oltp_read_only, oltp_write_only, oltp_point_select, oltp_insert, oltp_delete, oltp_update_index, oltp_update_non_index
 
 ### Quick Start
@@ -152,7 +165,7 @@ Benchmarks Amazon Aurora DSQL, a serverless PostgreSQL-compatible database, usin
 ### Features
 
 - **Serverless**: No server EC2 to provision -- only a client VM and a DSQL cluster via AWS API
-- **sysbench (unified)**: Same sysbench pipeline as TiDB/Aurora MySQL/Aurora PG (`--db-driver=pgsql`), with custom lua workloads ported to Postgres and OCC retry handled inside the workloads for fair cross-engine comparison (see commit a348732)
+- **sysbench (unified)**: Same sysbench pipeline as TiDB/Aurora MySQL/Aurora PG (`--db-driver=pgsql`), with custom Lua workloads ported to PostgreSQL-compatible engines for cross-engine comparison
 - **IAM auth tokens**: Automatic token generation and refresh for runs exceeding 15 minutes
 - **CloudWatch metrics**: Captures DSQL-specific server-side metrics (DPU, OCC conflicts, commit latency, storage)
 - **Cost estimation**: Estimates DSQL costs from DPU consumption during the benchmark
@@ -167,11 +180,29 @@ AWS_PROFILE=sandbox python3 -m dsql.setup --seed dsqllt-001
 # Validate
 AWS_PROFILE=sandbox python3 -m dsql.validate --seed dsqllt-001
 
-# Benchmark (standard profile, 15 minutes)
-AWS_PROFILE=sandbox python3 -m dsql.benchmark --profile standard
+# Benchmark (standard profile; 10 minutes for the default write-heavy workload)
+AWS_PROFILE=sandbox DB_PROFILE=sandbox-storage python3 -m dsql.benchmark \
+  --action run \
+  --seed dsqllt-001 \
+  --host <CLIENT_PUBLIC_IP> \
+  --dsql-cluster-id <DSQL_CLUSTER_ID> \
+  --dsql-cluster-endpoint <DSQL_ENDPOINT> \
+  --dsql-region us-east-1 \
+  --dsql-db-profile sandbox-storage \
+  --aws-profile sandbox \
+  --profile standard
 
 # Benchmark (quick smoke test, 1 minute)
-AWS_PROFILE=sandbox python3 -m dsql.benchmark --profile quick
+AWS_PROFILE=sandbox DB_PROFILE=sandbox-storage python3 -m dsql.benchmark \
+  --action run \
+  --seed dsqllt-001 \
+  --host <CLIENT_PUBLIC_IP> \
+  --dsql-cluster-id <DSQL_CLUSTER_ID> \
+  --dsql-cluster-endpoint <DSQL_ENDPOINT> \
+  --dsql-region us-east-1 \
+  --dsql-db-profile sandbox-storage \
+  --aws-profile sandbox \
+  --profile quick
 
 # Cleanup
 python3 -m dsql.setup --seed dsqllt-001 --cleanup --aws-profile sandbox
@@ -180,8 +211,8 @@ python3 -m dsql.setup --seed dsqllt-001 --cleanup --aws-profile sandbox
 ### DSQL Limitations
 
 - Only `postgres` database available (no custom databases)
-- No VACUUM support (sysbench PG branch prepares tables via psql without VACUUM)
-- OCC serialization: conflicts retried inside the custom lua workloads (ported for Postgres in a348732)
+- No VACUUM support (DSQL rejects PostgreSQL `VACUUM`)
+- Optimistic concurrency conflicts can happen under write-heavy loads; capture `OccConflicts` from CloudWatch and sysbench ignored-error counters in reports
 - 3000-row transaction limit
 - Auth tokens expire after 15 minutes (auto-refreshed for long runs)
 
