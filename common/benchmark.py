@@ -2758,7 +2758,7 @@ def parse_args():
 
     p.add_argument("--profile", choices=list(WORKLOAD_PROFILES.keys()),
                    default=None,
-                   help="Workload profile (quick/light/medium/heavy/stress/scaling)")
+                   help="Workload profile (quick/light/standard/heavy/stress/scaling)")
     p.add_argument("--isolation-level",
                    choices=list(ISOLATION_LEVEL_MAP.keys()),
                    default="read-committed",
@@ -2983,6 +2983,11 @@ def _build_deploy_params(args):
         }
 
     elif server_type == "dsql":
+        raise SystemExit(
+            "ERROR: DSQL remote deploy is not supported because IAM auth "
+            "tokens must be generated/refreshed during the run. Use "
+            "--action run with --dsql-cluster-endpoint and "
+            "--dsql-cluster-id.")
         endpoint = getattr(args, "dsql_cluster_endpoint", None) or ""
         if not endpoint:
             endpoint = getattr(args, "endpoint", None) or ""
@@ -3287,7 +3292,7 @@ def _main_aurora(args):
 
     if not host or not endpoint:
         log("ERROR: Could not determine host or endpoint. "
-            "Run aurora_setup.py first or pass --host/--endpoint.")
+            "Run python3 -m aurora.setup first or pass --host/--endpoint.")
         sys.exit(1)
 
     instance_type = info.get("aurora_instance_type", "")
@@ -4309,7 +4314,11 @@ def _main_tidb(args):
     duration_arg = args.duration if args.duration is not None else 120
     report_interval = (args.report_interval if args.report_interval is not None
                        else 10)
-    profile_name = args.profile or "heavy"
+    explicit_sizing = any(
+        value is not None for value in (
+            args.tables, args.table_size, args.threads, args.duration))
+    profile_name = args.profile if args.profile is not None else (
+        None if explicit_sizing else "heavy")
     disk_fill_pct = args.disk_fill_pct
     downstream_port = (args.downstream_port if args.downstream_port is not None
                        else INTERNAL_SERVICE_PORT)
@@ -4888,3 +4897,7 @@ mysql -h {db_host} -P {port} -u root -e \
                          _dt.now(_tz.utc).isoformat(),
                          summary_data=summary_data)
     log("Benchmark complete.")
+
+
+if __name__ == "__main__":
+    main()
