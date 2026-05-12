@@ -4206,6 +4206,8 @@ def _run_tidb_benchmark(
     report_interval, profile_name, disk_fill_pct, downstream_port,
 ):
     """Inner TiDB benchmark logic (matches tidb/benchmark.py _run_benchmark)."""
+    from datetime import datetime, timezone
+
     from tidb.driver import (
         DEFAULT_EBS_SIZE_GB, TIDB_MYSQL_IGNORE_ERRORS, AWS_COSTS,
         ssh_run, ssh_stream,
