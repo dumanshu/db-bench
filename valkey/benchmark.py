@@ -372,6 +372,18 @@ def main():
             flamegraph_proc.join()
 
     print("Benchmark complete.")
+
+    from common.report import finalize_benchmark_report
+    finalize_benchmark_report(
+        stack=f"valkey-loadtest-{args.seed}",
+        start_ts=start_ts,
+        end_ts=time.time(),
+        region=args.region,
+        profile=args.aws_profile,
+        sampler_csv=sampler_csv,
+        sampler_server_type="valkey",
+    )
+
     if not args.skip_flamegraph:
         if args.flamegraph_output.exists():
             print(f"Flamegraph saved to {args.flamegraph_output.resolve()}")

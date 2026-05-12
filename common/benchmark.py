@@ -3367,6 +3367,7 @@ def _main_aurora(args):
     # Start client resource sampler
     sampler_csv_path = f"/tmp/aurora_sampler_{int(time.time())}.csv"
     sampler_started = False
+    benchmark_start_ts = time.time()
     try:
         start_sampler(host, key_path, 'aurora', interval=1, user='ec2-user',
                       mysql_host=endpoint, mysql_user='admin',
@@ -3518,7 +3519,24 @@ def _main_aurora(args):
             'ec2_instance_type': info.get('ec2_instance_type', ''),
         }
         _print_client_extended_metrics([fake_result])
-        _print_resource_history([fake_result])
+        from common.report import finalize_benchmark_report
+        finalize_benchmark_report(
+            stack=info.get('stack', f'aurora-bench-{seed}'),
+            start_ts=benchmark_start_ts,
+            end_ts=time.time(),
+            region=region,
+            profile=aws_profile,
+            results=[fake_result],
+        )
+    else:
+        from common.report import finalize_benchmark_report
+        finalize_benchmark_report(
+            stack=info.get('stack', f'aurora-bench-{seed}'),
+            start_ts=benchmark_start_ts,
+            end_ts=time.time(),
+            region=region,
+            profile=aws_profile,
+        )
 
     if not args.skip_cleanup:
         sysbench_cleanup(host, key_path, endpoint, port, "admin", password,
@@ -3766,6 +3784,7 @@ def _main_dsql(args):
 
     # Start client resource sampler
     sampler_started = False
+    benchmark_start_ts = time.time()
     for sampler_attempt in range(1, 4):
         try:
             start_sampler(host, key_path, 'generic', interval=1,
@@ -3978,6 +3997,18 @@ def _main_dsql(args):
         avg_tps=combined.get("tps") or 0,
     )
     cost_tracker.print_cost_summary()
+
+    from common.report import finalize_benchmark_report
+    finalize_benchmark_report(
+        stack=f"dsql-loadtest-{seed}",
+        start_ts=benchmark_start_ts,
+        end_ts=time.time(),
+        region=region,
+        profile=aws_profile,
+        sampler_csv=sampler_csv_path if sampler_started else None,
+        sampler_server_type="generic",
+    )
+
     finalize_output_dirs(bench_output_dirs,
                          datetime.now(timezone.utc).isoformat(),
                          summary_data=combined)
@@ -4086,6 +4117,7 @@ def _main_aurora_pg(args):
     # Start client resource sampler
     sampler_started = False
     sampler_csv_path = f"/tmp/aurora_pg_sampler_{int(time.time())}.csv"
+    benchmark_start_ts = time.time()
     try:
         start_sampler(host, key_path, 'generic', interval=1, user='ec2-user')
         sampler_started = True
@@ -4202,7 +4234,24 @@ def _main_aurora_pg(args):
             'ec2_instance_type': '',
         }
         _print_client_extended_metrics([fake_result])
-        _print_resource_history([fake_result])
+        from common.report import finalize_benchmark_report
+        finalize_benchmark_report(
+            stack=f"aurora-bench-{seed}",
+            start_ts=benchmark_start_ts,
+            end_ts=time.time(),
+            region=region,
+            profile=aws_profile,
+            results=[fake_result],
+        )
+    else:
+        from common.report import finalize_benchmark_report
+        finalize_benchmark_report(
+            stack=f"aurora-bench-{seed}",
+            start_ts=benchmark_start_ts,
+            end_ts=time.time(),
+            region=region,
+            profile=aws_profile,
+        )
 
     cost_tracker.add_queries(
         query_count=result.get("total_queries") or 0,
@@ -4797,8 +4846,25 @@ mysql -h {db_host} -P {port} -u root -e \
             'ec2_instance_type': cluster_info.get('tidb_instance', ''),
         }
         _print_client_extended_metrics([fake_result])
-        _print_resource_history([fake_result],
-                                server_nodes=server_node_data)
+        from common.report import finalize_benchmark_report
+        finalize_benchmark_report(
+            stack=f"tidb-loadtest-{seed}",
+            start_ts=benchmark_start_time,
+            end_ts=time.time(),
+            region=region,
+            profile=aws_profile,
+            results=[fake_result],
+            server_nodes=server_node_data,
+        )
+    else:
+        from common.report import finalize_benchmark_report
+        finalize_benchmark_report(
+            stack=f"tidb-loadtest-{seed}",
+            start_ts=benchmark_start_time,
+            end_ts=time.time(),
+            region=region,
+            profile=aws_profile,
+        )
 
     if cdc_tracker:
         cdc_tracker.stop()
