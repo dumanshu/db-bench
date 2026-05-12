@@ -1365,8 +1365,6 @@ def resolve_profile_options(
     threads = getattr(args, "threads", None) or default_threads
     duration = getattr(args, "duration", None) or default_duration
     disk_fill_pct = getattr(args, "disk_fill_pct", None)
-    if disk_fill_pct is None:
-        disk_fill_pct = default_disk_fill_pct
     multi_phase = None
     multi_phase_name = None
 
@@ -1388,6 +1386,8 @@ def resolve_profile_options(
         multi_phase_name = profile.get("multi_phase")
         multi_phase = (MULTI_PHASE_PROFILES[multi_phase_name]["phases"]
                        if multi_phase_name else None)
+    if disk_fill_pct is None:
+        disk_fill_pct = default_disk_fill_pct
 
     return {
         "profile_name": profile_name,
@@ -4513,7 +4513,7 @@ def _run_tidb_benchmark(
         log(f"Using profile '{profile_name}': {tables} tables, "
             f"{threads} threads, {duration}s")
         if multi_phase:
-            log(f"  Multi-phase mode: {profile_name}")
+            log(f"  Multi-phase mode: {multi_phase}")
 
     try:
         print_cluster_summary(host, key_path, region, aws_profile, seed, port,
