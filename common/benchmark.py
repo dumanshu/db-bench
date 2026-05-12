@@ -4261,7 +4261,11 @@ def _run_tidb_benchmark(
         host = discover_tidb_host(region, aws_profile, seed)
     log(f"Using TiDB host: {host}")
 
-    if client_state.get("public_ip"):
+    endpoint_override = getattr(args, "endpoint", None)
+    if endpoint_override:
+        db_host = endpoint_override
+        log(f"Using TiDB endpoint: {db_host}:{port} (from --endpoint)")
+    elif client_state.get("public_ip"):
         db_host = discover_tidb_endpoint(region, aws_profile, seed)
         log(f"Using TiDB endpoint: {db_host}:{port} (from control node private IP)")
     else:
