@@ -14,6 +14,7 @@ results/
 benchmark-results*.txt
 cleanup.log
 *.log
+*report.md
 
 # DSQL local artifacts
 dsql/dsql-sysbench-*.json
