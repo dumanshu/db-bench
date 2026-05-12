@@ -147,12 +147,12 @@ AWS_PROFILE=sandbox python3 -m valkey.setup --cleanup
 
 ## DSQL
 
-Benchmarks Amazon Aurora DSQL, a serverless PostgreSQL-compatible database, using pgbench with IAM authentication.
+Benchmarks Amazon Aurora DSQL, a serverless PostgreSQL-compatible database, using sysbench (PostgreSQL driver) with IAM authentication.
 
 ### Features
 
 - **Serverless**: No server EC2 to provision -- only a client VM and a DSQL cluster via AWS API
-- **pgbench**: Standard PostgreSQL benchmarking tool with `--max-tries` for OCC retry handling
+- **sysbench (unified)**: Same sysbench pipeline as TiDB/Aurora MySQL/Aurora PG (`--db-driver=pgsql`), with custom lua workloads ported to Postgres and OCC retry handled inside the workloads for fair cross-engine comparison (see commit a348732)
 - **IAM auth tokens**: Automatic token generation and refresh for runs exceeding 15 minutes
 - **CloudWatch metrics**: Captures DSQL-specific server-side metrics (DPU, OCC conflicts, commit latency, storage)
 - **Cost estimation**: Estimates DSQL costs from DPU consumption during the benchmark
@@ -167,9 +167,6 @@ AWS_PROFILE=sandbox python3 -m dsql.setup --seed dsqllt-001
 # Validate
 AWS_PROFILE=sandbox python3 -m dsql.validate --seed dsqllt-001
 
-# Validate with quick benchmark
-AWS_PROFILE=sandbox python3 -m dsql.validate --seed dsqllt-001 --quick-bench
-
 # Benchmark (standard profile, 15 minutes)
 AWS_PROFILE=sandbox python3 -m dsql.benchmark --profile standard
 
@@ -183,10 +180,22 @@ python3 -m dsql.setup --seed dsqllt-001 --cleanup --aws-profile sandbox
 ### DSQL Limitations
 
 - Only `postgres` database available (no custom databases)
-- No VACUUM support (pgbench init uses `-I dtGp` to skip vacuum)
-- OCC serialization: conflicts are retried via `--max-tries`
+- No VACUUM support (sysbench PG branch prepares tables via psql without VACUUM)
+- OCC serialization: conflicts retried inside the custom lua workloads (ported for Postgres in a348732)
 - 3000-row transaction limit
 - Auth tokens expire after 15 minutes (auto-refreshed for long runs)
+
+### DSQL sysbench result fields
+
+The DSQL sysbench JSON includes the normal sysbench transaction metrics (`tps`, `qps`, `latency_avg_ms`, `latency_p99_ms`, query counts, and interval samples). For `custom_mixed`, it also includes:
+
+- `op_latency_ms`: client-side latency by operation category (`select`, `insert`, `update`, `delete` for the single-statement `custom_mixed` workload)
+- `query_latency_ms`: client-side latency by stable query template key, with `type`, `category`, and the raw Lua SQL template string
+- `read_qps`, `write_qps`, and `other_qps` on interval samples when sysbench emits `(r/w/o: ...)`
+
+The per-operation and per-template `p50_ms` / `p95_ms` / `p99_ms` values are derived from fixed latency buckets and represent bucket upper bounds. The top-level sysbench percentile is still the configured sysbench percentile; the default benchmark command uses `--percentile=99`, so `latency_p95_ms` can be `null` while `latency_p99_ms` is populated.
+
+DSQL does not support `pg_database_size`, so DB-size-derived storage numbers can be zero in local result JSON. Local result JSON/CSV/log artifacts are intentionally gitignored and should not be committed.
 
 ## References
 
@@ -196,4 +205,4 @@ python3 -m dsql.setup --seed dsqllt-001 --cleanup --aws-profile sandbox
 - [Valkey Documentation](https://valkey.io/docs/)
 - [Envoy Proxy](https://www.envoyproxy.io/docs/)
 - [Amazon Aurora DSQL](https://docs.aws.amazon.com/aurora-dsql/latest/userguide/)
-- [pgbench Documentation](https://www.postgresql.org/docs/current/pgbench.html)
+- [sysbench](https://github.com/akopytov/sysbench)

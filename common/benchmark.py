@@ -306,10 +306,61 @@ _LUA_DIR = _MODULE_DIR / "lua"
 _INTERVAL_RE = re.compile(
     r'\[\s*([\d.]+)s\s*\]\s+thds:\s+(\d+)\s+'
     r'tps:\s+([\d.]+)\s+qps:\s+([\d.]+)\s+'
-    r'.*?'
+    r'(?:\(r/w/o:\s*([\d.]+)/([\d.]+)/([\d.]+)\)\s+)?'
     r'lat\s+\(ms,\s*(\d+)%\):\s+([\d.]+)\s+'
     r'err/s:\s+([\d.]+)\s+'
     r'reconn/s:\s+([\d.]+)'
+)
+
+_OP_LATENCY_BUCKETS_MS = [
+    0.1, 0.25, 0.5, 1, 2, 4, 8, 16, 32, 64,
+    128, 256, 512, 1024, 2048, 4096, 8192,
+]
+
+_CUSTOM_MIXED_OP_STATS_RE = re.compile(
+    r'CUSTOM_MIXED_OP_STATS\s+tid=(?P<tid>-?\d+)\s+'
+    r'op=(?P<op>[a-z_]+)\s+count=(?P<count>\d+)\s+'
+    r'total_ms=(?P<total>[\d.]+)\s+min_ms=(?P<min>[\d.]+)\s+'
+    r'avg_ms=(?P<avg>[\d.]+)\s+max_ms=(?P<max>[\d.]+)\s+'
+    r'buckets=(?P<buckets>[\d,]+)'
+)
+
+_CUSTOM_MIXED_QUERY_STATS_RE = re.compile(
+    r'CUSTOM_MIXED_QUERY_STATS\s+tid=(?P<tid>-?\d+)\s+'
+    r'type=(?P<type>\S+)\s+category=(?P<category>\S+)\s+'
+    r'key=(?P<key>\S+)\s+template=(?P<template>.*?)\s+'
+    r'count=(?P<count>\d+)\s+total_ms=(?P<total>[\d.]+)\s+'
+    r'min_ms=(?P<min>[\d.]+)\s+avg_ms=(?P<avg>[\d.]+)\s+'
+    r'max_ms=(?P<max>[\d.]+)\s+buckets=(?P<buckets>[\d,]+)'
+)
+
+_CUSTOM_MIXED_QUERY_STATS_V1_RE = re.compile(
+    r'CUSTOM_MIXED_QUERY_STATS_V1\ttid=(?P<tid>-?\d+)\t'
+    r'type=(?P<type>[^\t]+)\tcategory=(?P<category>[^\t]+)\t'
+    r'key=(?P<key>[^\t]+)\ttemplate=(?P<template>.*?)\t'
+    r'count=(?P<count>\d+)\ttotal_ms=(?P<total>[\d.]+)\t'
+    r'min_ms=(?P<min>[\d.]+)\tavg_ms=(?P<avg>[\d.]+)\t'
+    r'max_ms=(?P<max>[\d.]+)\tbuckets=(?P<buckets>[\d,]+)'
+)
+
+_CUSTOM_MIXED_OP_INTERVAL_V1_RE = re.compile(
+    r'CUSTOM_MIXED_OP_INTERVAL_V1\ttid=(?P<tid>-?\d+)\t'
+    r'minute=(?P<minute>\d+)\tfrom_ms=(?P<from>[\d.]+)\t'
+    r'to_ms=(?P<to>[\d.]+)\top=(?P<op>[^\t]+)\t'
+    r'count=(?P<count>\d+)\ttotal_ms=(?P<total>[\d.]+)\t'
+    r'min_ms=(?P<min>[\d.]+)\tavg_ms=(?P<avg>[\d.]+)\t'
+    r'max_ms=(?P<max>[\d.]+)\tbuckets=(?P<buckets>[\d,]+)'
+)
+
+_CUSTOM_MIXED_QUERY_INTERVAL_V1_RE = re.compile(
+    r'CUSTOM_MIXED_QUERY_INTERVAL_V1\ttid=(?P<tid>-?\d+)\t'
+    r'minute=(?P<minute>\d+)\tfrom_ms=(?P<from>[\d.]+)\t'
+    r'to_ms=(?P<to>[\d.]+)\ttype=(?P<type>[^\t]+)\t'
+    r'category=(?P<category>[^\t]+)\tkey=(?P<key>[^\t]+)\t'
+    r'template=(?P<template>.*?)\tcount=(?P<count>\d+)\t'
+    r'total_ms=(?P<total>[\d.]+)\tmin_ms=(?P<min>[\d.]+)\t'
+    r'avg_ms=(?P<avg>[\d.]+)\tmax_ms=(?P<max>[\d.]+)\t'
+    r'buckets=(?P<buckets>[\d,]+)'
 )
 
 
@@ -340,6 +391,225 @@ def _empty_result() -> dict:
         "errors_total": None,
         "retries_total": None,
     }
+
+
+def _empty_op_latency() -> dict:
+    return {
+        "count": 0,
+        "total_ms": 0.0,
+        "min_ms": None,
+        "avg_ms": None,
+        "max_ms": None,
+        "p50_ms": None,
+        "p95_ms": None,
+        "p99_ms": None,
+        "buckets": [0 for _ in _OP_LATENCY_BUCKETS_MS],
+        "bucket_bounds_ms": list(_OP_LATENCY_BUCKETS_MS),
+    }
+
+
+def _merge_latency_line(dest: dict, count: int, total_ms: float,
+                        min_ms: float, max_ms: float,
+                        buckets: list[int]) -> None:
+    dest["count"] += count
+    dest["total_ms"] += total_ms
+    if count > 0:
+        if dest["min_ms"] is None or min_ms < dest["min_ms"]:
+            dest["min_ms"] = min_ms
+        if dest["max_ms"] is None or max_ms > dest["max_ms"]:
+            dest["max_ms"] = max_ms
+    for i, value in enumerate(buckets):
+        dest["buckets"][i] += value
+
+
+def _finalize_latency_stats(stats: dict) -> dict:
+    for dest in stats.values():
+        count = dest["count"]
+        if count > 0:
+            dest["total_ms"] = round(dest["total_ms"], 3)
+            dest["avg_ms"] = round(dest["total_ms"] / count, 3)
+            dest["min_ms"] = round(dest["min_ms"], 3)
+            dest["max_ms"] = round(dest["max_ms"], 3)
+            dest["p50_ms"] = _bucket_percentile(dest["buckets"], 50)
+            dest["p95_ms"] = _bucket_percentile(dest["buckets"], 95)
+            dest["p99_ms"] = _bucket_percentile(dest["buckets"], 99)
+    return stats
+
+
+def _parse_latency_buckets(raw: str) -> list[int]:
+    buckets = [int(v) for v in raw.split(",")]
+    if len(buckets) < len(_OP_LATENCY_BUCKETS_MS):
+        buckets.extend([0] * (len(_OP_LATENCY_BUCKETS_MS) - len(buckets)))
+    elif len(buckets) > len(_OP_LATENCY_BUCKETS_MS):
+        buckets = buckets[:len(_OP_LATENCY_BUCKETS_MS)]
+    return buckets
+
+
+def _bucket_percentile(buckets: list[int], percentile: float) -> Optional[float]:
+    total = sum(buckets)
+    if total <= 0:
+        return None
+    rank = max(1, int((percentile / 100.0) * total + 0.999999))
+    running = 0
+    for bound, count in zip(_OP_LATENCY_BUCKETS_MS, buckets):
+        running += count
+        if running >= rank:
+            return bound
+    return _OP_LATENCY_BUCKETS_MS[-1]
+
+
+def parse_custom_mixed_op_stats(text: str) -> dict:
+    stats: dict[str, dict] = {}
+    for m in _CUSTOM_MIXED_OP_STATS_RE.finditer(text):
+        op = m.group("op")
+        dest = stats.setdefault(op, _empty_op_latency())
+        count = int(m.group("count"))
+        total_ms = float(m.group("total"))
+        min_ms = float(m.group("min"))
+        max_ms = float(m.group("max"))
+        buckets = _parse_latency_buckets(m.group("buckets"))
+        _merge_latency_line(dest, count, total_ms, min_ms, max_ms, buckets)
+    return _finalize_latency_stats(stats)
+
+
+def parse_custom_mixed_query_stats(text: str) -> dict:
+    stats: dict[str, dict] = {}
+    records = list(_CUSTOM_MIXED_QUERY_STATS_V1_RE.finditer(text))
+    records.extend(_CUSTOM_MIXED_QUERY_STATS_RE.finditer(text))
+    for m in records:
+        key = m.group("key")
+        query_type = m.group("type")
+        category = m.group("category")
+        template = m.group("template")
+        count = int(m.group("count"))
+        total_ms = float(m.group("total"))
+        min_ms = float(m.group("min"))
+        max_ms = float(m.group("max"))
+        buckets = _parse_latency_buckets(m.group("buckets"))
+        dest = stats.setdefault(key, _empty_op_latency())
+        dest.setdefault("metadata_conflicts", [])
+        for meta_key, meta_value in (
+            ("type", query_type),
+            ("category", category),
+            ("template", template),
+        ):
+            existing = dest.get(meta_key)
+            if existing is None:
+                dest[meta_key] = meta_value
+            elif existing != meta_value:
+                dest["metadata_conflicts"].append({
+                    "field": meta_key,
+                    "existing": existing,
+                    "incoming": meta_value,
+                })
+        _merge_latency_line(dest, count, total_ms, min_ms, max_ms, buckets)
+    finalized = _finalize_latency_stats(stats)
+    for dest in finalized.values():
+        if not dest.get("metadata_conflicts"):
+            dest.pop("metadata_conflicts", None)
+    return finalized
+
+
+def parse_custom_mixed_op_interval_stats(text: str) -> dict:
+    minutes: dict[int, dict] = {}
+    for m in _CUSTOM_MIXED_OP_INTERVAL_V1_RE.finditer(text):
+        minute = int(m.group("minute"))
+        entry = minutes.setdefault(minute, {
+            "minute": minute,
+            "from_ms": float(m.group("from")),
+            "to_ms": float(m.group("to")),
+            "op_latency_ms": {},
+        })
+        entry["from_ms"] = min(entry["from_ms"], float(m.group("from")))
+        entry["to_ms"] = max(entry["to_ms"], float(m.group("to")))
+        op = m.group("op")
+        dest = entry["op_latency_ms"].setdefault(op, _empty_op_latency())
+        _merge_latency_line(
+            dest,
+            int(m.group("count")),
+            float(m.group("total")),
+            float(m.group("min")),
+            float(m.group("max")),
+            _parse_latency_buckets(m.group("buckets")),
+        )
+    for entry in minutes.values():
+        entry["op_latency_ms"] = _finalize_latency_stats(entry["op_latency_ms"])
+    return dict(sorted(minutes.items()))
+
+
+def parse_custom_mixed_query_interval_stats(text: str) -> dict:
+    minutes: dict[int, dict] = {}
+    for m in _CUSTOM_MIXED_QUERY_INTERVAL_V1_RE.finditer(text):
+        minute = int(m.group("minute"))
+        entry = minutes.setdefault(minute, {
+            "minute": minute,
+            "from_ms": float(m.group("from")),
+            "to_ms": float(m.group("to")),
+            "query_latency_ms": {},
+        })
+        entry["from_ms"] = min(entry["from_ms"], float(m.group("from")))
+        entry["to_ms"] = max(entry["to_ms"], float(m.group("to")))
+        key = m.group("key")
+        dest = entry["query_latency_ms"].setdefault(key, _empty_op_latency())
+        dest.setdefault("metadata_conflicts", [])
+        for meta_key, meta_value in (
+            ("type", m.group("type")),
+            ("category", m.group("category")),
+            ("template", m.group("template")),
+        ):
+            existing = dest.get(meta_key)
+            if existing is None:
+                dest[meta_key] = meta_value
+            elif existing != meta_value:
+                dest["metadata_conflicts"].append({
+                    "field": meta_key,
+                    "existing": existing,
+                    "incoming": meta_value,
+                })
+        _merge_latency_line(
+            dest,
+            int(m.group("count")),
+            float(m.group("total")),
+            float(m.group("min")),
+            float(m.group("max")),
+            _parse_latency_buckets(m.group("buckets")),
+        )
+    for entry in minutes.values():
+        finalized = _finalize_latency_stats(entry["query_latency_ms"])
+        for stats in finalized.values():
+            if not stats.get("metadata_conflicts"):
+                stats.pop("metadata_conflicts", None)
+        entry["query_latency_ms"] = finalized
+    return dict(sorted(minutes.items()))
+
+
+def _offset_custom_mixed_interval_minutes(text: str, minute_offset: int,
+                                          ms_offset: float) -> str:
+    """Shift custom mixed interval markers when stitching segmented runs."""
+    if minute_offset == 0 and ms_offset == 0:
+        return text
+
+    pattern = re.compile(
+        r'(CUSTOM_MIXED_(?:OP|QUERY)_INTERVAL_V1\ttid=-?\d+\tminute=)'
+        r'(\d+)'
+        r'(\tfrom_ms=)'
+        r'([\d.]+)'
+        r'(\tto_ms=)'
+        r'([\d.]+)'
+    )
+
+    def repl(match: re.Match) -> str:
+        minute = int(match.group(2)) + minute_offset
+        from_ms = float(match.group(4)) + ms_offset
+        to_ms = float(match.group(6)) + ms_offset
+        return (
+            f"{match.group(1)}{minute}"
+            f"{match.group(3)}{from_ms:.0f}"
+            f"{match.group(5)}{to_ms:.0f}"
+        )
+
+    return pattern.sub(repl, text)
+
 
 
 def _ssh_popen(host_ip: str, key_path: str, script: str,
@@ -407,6 +677,374 @@ def _combine_parallel_results(results: list[dict]) -> dict:
         combined["availability_pct"] = 100.0
 
     return combined
+
+
+def _combine_sequential_results(results: list[dict]) -> dict:
+    combined = _empty_result()
+    elapsed_values = [r.get("elapsed_s", 0) or 0 for r in results]
+    total_elapsed = sum(elapsed_values)
+
+    for key in ("reads", "writes", "other", "total_queries",
+                "total_transactions", "ignored_errors", "reconnects"):
+        vals = [r.get(key) for r in results if r.get(key) is not None]
+        if vals:
+            combined[key] = sum(vals)
+
+    if total_elapsed > 0:
+        txns = combined.get("total_transactions") or 0
+        queries = combined.get("total_queries") or 0
+        if txns:
+            combined["tps"] = round(txns / total_elapsed, 2)
+        if queries:
+            combined["qps"] = round(queries / total_elapsed, 2)
+        errs = combined.get("ignored_errors") or 0
+        combined["errors_per_sec"] = round(errs / total_elapsed, 4)
+        combined["elapsed_s"] = round(total_elapsed, 1)
+
+    lat_avg_weighted = 0.0
+    lat_avg_weight = 0
+    for r in results:
+        avg = r.get("latency_avg_ms")
+        weight = r.get("total_transactions") or 0
+        if avg is not None and weight > 0:
+            lat_avg_weighted += avg * weight
+            lat_avg_weight += weight
+    if lat_avg_weight:
+        combined["latency_avg_ms"] = round(lat_avg_weighted / lat_avg_weight, 2)
+
+    vals = [r.get("latency_min_ms") for r in results
+            if r.get("latency_min_ms") is not None]
+    if vals:
+        combined["latency_min_ms"] = min(vals)
+
+    for key in ("latency_max_ms", "latency_p95_ms", "latency_p99_ms"):
+        vals = [r.get(key) for r in results if r.get(key) is not None]
+        if vals:
+            combined[key] = max(vals)
+
+    intervals = []
+    offset = 0.0
+    for r, elapsed in zip(results, elapsed_values):
+        for iv in r.get("intervals", []) or []:
+            iv_copy = iv.copy()
+            iv_copy["elapsed_s"] = round(offset + (iv.get("elapsed_s") or 0), 1)
+            intervals.append(iv_copy)
+        offset += elapsed
+    if intervals:
+        combined["intervals"] = intervals
+
+    raw_parts = []
+    offset = 0.0
+    for r, elapsed in zip(results, elapsed_values):
+        raw_output = r.get("raw_output", "")
+        if raw_output:
+            raw_parts.append(_offset_custom_mixed_interval_minutes(
+                raw_output,
+                int(offset // 60),
+                offset * 1000,
+            ))
+        offset += elapsed
+    if raw_parts:
+        combined["raw_output"] = "\n".join(raw_parts)
+        op_latency = parse_custom_mixed_op_stats(combined["raw_output"])
+        if op_latency:
+            combined["op_latency_ms"] = op_latency
+        query_latency = parse_custom_mixed_query_stats(combined["raw_output"])
+        if query_latency:
+            combined["query_latency_ms"] = query_latency
+        op_latency_by_minute = parse_custom_mixed_op_interval_stats(combined["raw_output"])
+        if op_latency_by_minute:
+            combined["op_latency_by_minute_ms"] = op_latency_by_minute
+        query_latency_by_minute = parse_custom_mixed_query_interval_stats(combined["raw_output"])
+        if query_latency_by_minute:
+            combined["query_latency_by_minute_ms"] = query_latency_by_minute
+
+    txns = combined.get("total_transactions") or 0
+    errs = combined.get("ignored_errors") or 0
+    combined["errors_total"] = errs
+    combined["retries_total"] = combined.get("reconnects")
+    if txns + errs > 0:
+        combined["availability_pct"] = round(txns / (txns + errs) * 100, 4)
+    elif txns > 0:
+        combined["availability_pct"] = 100.0
+
+    return combined
+
+
+_CLIENT_RESOURCE_FIELDS = (
+    "client_cpu_pct",
+    "client_mem_used_mb",
+    "client_mem_total_mb",
+    "client_net_rx_mbps",
+    "client_net_tx_mbps",
+    "client_thermal_mc",
+    "client_cpufreq_avg_mhz",
+    "client_loadavg_1m",
+    "client_loadavg_5m",
+    "client_loadavg_15m",
+    "client_disk_read_iops",
+    "client_disk_write_iops",
+    "client_disk_read_mbps",
+    "client_disk_write_mbps",
+    "client_disk_util_pct",
+    "client_ctx_per_sec",
+    "client_forks_per_sec",
+)
+
+
+def _epoch_seconds(value) -> Optional[float]:
+    if value is None:
+        return None
+    if isinstance(value, (int, float)):
+        return float(value)
+    if hasattr(value, "timestamp"):
+        return float(value.timestamp())
+    if isinstance(value, str):
+        from datetime import datetime, timezone
+        try:
+            dt = datetime.fromisoformat(value.replace("Z", "+00:00"))
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=timezone.utc)
+            return float(dt.timestamp())
+        except ValueError:
+            return None
+    return None
+
+
+def _minute_for_elapsed(elapsed_s) -> int:
+    return max(1, (int(elapsed_s) - 1) // 60 + 1)
+
+
+def _closest_sample(samples: list[dict], epoch: float) -> Optional[dict]:
+    if not samples:
+        return None
+    return min(samples, key=lambda s: abs((s.get("epoch") or 0) - epoch))
+
+
+def _client_window_stats(samples: list[dict]) -> dict:
+    from common.sampler import safe_stats
+    return {key: safe_stats([s.get(key) for s in samples])
+            for key in _CLIENT_RESOURCE_FIELDS}
+
+
+def _client_resource_totals(metrics_rows: list[dict]) -> dict:
+    if len(metrics_rows) < 2:
+        return {}
+    first = metrics_rows[0]
+    last = metrics_rows[-1]
+    duration = (last.get("epoch") or 0) - (first.get("epoch") or 0)
+    totals = {"duration_s": duration, "sample_count": len(metrics_rows)}
+
+    for source_key, target_key, divisor in (
+        ("net_rx_bytes", "net_rx_mb", 1_000_000),
+        ("net_tx_bytes", "net_tx_mb", 1_000_000),
+        ("disk_sectors_read", "disk_read_mb", 1_000_000 / 512),
+        ("disk_sectors_written", "disk_written_mb", 1_000_000 / 512),
+        ("ctx_switches", "ctx_switches", 1),
+        ("processes_created", "processes_created", 1),
+    ):
+        start = first.get(source_key)
+        end = last.get(source_key)
+        if start is None or end is None:
+            continue
+        delta = end - start
+        if source_key.startswith("disk_sectors"):
+            value = delta * 512 / 1_000_000
+        else:
+            value = delta / divisor
+        totals[target_key] = round(value, 2)
+    return totals
+
+
+def _sysbench_stats_for_minute(intervals: list[dict]) -> dict:
+    from common.sampler import safe_stats
+    keys = (
+        "tps", "qps", "read_qps", "write_qps", "other_qps",
+        "latency_pct_ms", "err_per_sec", "reconn_per_sec",
+        "availability_pct",
+    )
+    return {key: safe_stats([iv.get(key) for iv in intervals])
+            for key in keys}
+
+
+def _build_common_minute_stats(result: dict, cpu_samples: list[dict],
+                               bench_start_epoch: Optional[float]) -> list[dict]:
+    interval_groups: dict[int, list[dict]] = {}
+    for iv in result.get("intervals", []) or []:
+        elapsed = iv.get("elapsed_s")
+        if elapsed is None:
+            continue
+        interval_groups.setdefault(_minute_for_elapsed(elapsed), []).append(iv)
+
+    sample_groups: dict[int, list[dict]] = {}
+    if bench_start_epoch is not None:
+        for sample in cpu_samples:
+            epoch = sample.get("epoch")
+            if epoch is None:
+                continue
+            elapsed = max(0, epoch - bench_start_epoch)
+            sample_groups.setdefault(_minute_for_elapsed(elapsed + 1), []).append(sample)
+
+    op_minutes = result.get("op_latency_by_minute_ms") or {}
+    query_minutes = result.get("query_latency_by_minute_ms") or {}
+    minute_nums = set(interval_groups) | set(sample_groups)
+    minute_nums |= {int(k) for k in op_minutes.keys()}
+    minute_nums |= {int(k) for k in query_minutes.keys()}
+
+    rows = []
+    for minute in sorted(minute_nums):
+        row = {
+            "minute": minute,
+            "from_s": (minute - 1) * 60,
+            "to_s": minute * 60,
+        }
+        if minute in interval_groups:
+            row["sysbench"] = _sysbench_stats_for_minute(interval_groups[minute])
+        if minute in sample_groups:
+            row["client"] = _client_window_stats(sample_groups[minute])
+        op_entry = op_minutes.get(minute) or op_minutes.get(str(minute))
+        if op_entry:
+            row["op_latency_ms"] = op_entry.get("op_latency_ms", {})
+        query_entry = query_minutes.get(minute) or query_minutes.get(str(minute))
+        if query_entry:
+            row["query_latency_ms"] = query_entry.get("query_latency_ms", {})
+        rows.append(row)
+    return rows
+
+
+def _attach_common_runtime_stats(result: dict, sampler_csv_path: Optional[str],
+                                 bench_start, bench_end,
+                                 sampler_server_type: str = "generic") -> None:
+    bench_start_epoch = _epoch_seconds(bench_start)
+    bench_end_epoch = _epoch_seconds(bench_end)
+    cpu_samples: list[dict] = []
+    metrics_rows: list[dict] = []
+
+    if sampler_csv_path:
+        try:
+            from common.sampler import parse_metrics_csv, derive_interval_metrics
+            metrics_rows = parse_metrics_csv(sampler_csv_path)
+            if metrics_rows:
+                start_epoch = bench_start_epoch or metrics_rows[0].get("epoch", 0)
+                end_epoch = bench_end_epoch or metrics_rows[-1].get("epoch", 0)
+                cpu_samples, _ = derive_interval_metrics(
+                    metrics_rows, start_epoch, end_epoch, sampler_server_type)
+                result["interval_data"] = [
+                    _enrich_interval_with_client_sample(iv, cpu_samples, start_epoch)
+                    for iv in (result.get("intervals", []) or [])
+                ]
+                result["window_stats"] = _client_window_stats(cpu_samples)
+                result["client_resource_totals"] = _client_resource_totals(metrics_rows)
+                result["client_sampler_csv"] = sampler_csv_path
+        except Exception as e:
+            log(f"Warning: could not attach common runtime stats: {e}")
+
+    result["minute_stats"] = _build_common_minute_stats(
+        result, cpu_samples, bench_start_epoch)
+
+
+def _enrich_interval_with_client_sample(interval: dict, cpu_samples: list[dict],
+                                        bench_start_epoch: float) -> dict:
+    row = interval.copy()
+    elapsed = interval.get("elapsed_s")
+    if elapsed is None:
+        return row
+    sample = _closest_sample(cpu_samples, bench_start_epoch + elapsed)
+    if not sample:
+        return row
+    for key in _CLIENT_RESOURCE_FIELDS:
+        if key in sample:
+            row[key] = sample[key]
+    return row
+
+
+def _parse_percent(raw: str) -> Optional[float]:
+    raw = raw.strip().rstrip("%")
+    if not raw or raw.upper() == "N/A":
+        return None
+    try:
+        return float(raw)
+    except ValueError:
+        return None
+
+
+def parse_tidb_resource_snapshot(text: str) -> dict:
+    """Parse TiDB compact resource snapshot output into JSON fields."""
+    parsed = {"client": {}, "nodes": []}
+    for raw_line in text.splitlines():
+        line = raw_line.strip()
+        if not line:
+            continue
+        client_match = re.match(r"CLIENT\s+cpu=(\S+)\s+mem=(\S+)", line)
+        if client_match:
+            parsed["client"] = {
+                "cpu_pct": _parse_percent(client_match.group(1)),
+                "mem_pct": _parse_percent(client_match.group(2)),
+            }
+            continue
+        node_match = re.match(r"NODE\s+(\S+)\s+cpu=(\S+)\s+mem=(\S+)", line)
+        if node_match:
+            name = node_match.group(1)
+            parsed["nodes"].append({
+                "name": name,
+                "role": name.rsplit("-", 1)[0] if "-" in name else name,
+                "cpu_pct": _parse_percent(node_match.group(2)),
+                "mem_pct": _parse_percent(node_match.group(3)),
+            })
+    return parsed
+
+
+def summarize_tidb_resource_snapshots(snapshots: list[dict]) -> dict:
+    """Summarize parsed TiDB resource snapshots by role and node."""
+    from common.sampler import safe_stats
+    by_role: dict[str, dict[str, list[float]]] = {}
+    by_node: dict[str, dict[str, list[float]]] = {}
+    for snapshot in snapshots:
+        for node in snapshot.get("nodes", []) or []:
+            role = node.get("role") or "unknown"
+            name = node.get("name") or role
+            role_entry = by_role.setdefault(role, {"cpu_pct": [], "mem_pct": []})
+            node_entry = by_node.setdefault(name, {"cpu_pct": [], "mem_pct": []})
+            for key in ("cpu_pct", "mem_pct"):
+                value = node.get(key)
+                if isinstance(value, (int, float)):
+                    role_entry[key].append(value)
+                    node_entry[key].append(value)
+    return {
+        "by_role": {
+            role: {key: safe_stats(values) for key, values in metrics.items()}
+            for role, metrics in sorted(by_role.items())
+        },
+        "by_node": {
+            node: {key: safe_stats(values) for key, values in metrics.items()}
+            for node, metrics in sorted(by_node.items())
+        },
+    }
+
+
+def summarize_server_node_samplers(server_nodes: list[dict]) -> dict:
+    """Summarize per-node sampler windows by TiDB component role."""
+    from common.sampler import safe_stats
+    by_role: dict[str, dict[str, list[float]]] = {}
+    for node in server_nodes:
+        role = str(node.get("label") or "unknown").lower()
+        entry = by_role.setdefault(role, {"cpu_pct": [], "mem_used_mb": [],
+                                         "net_rx_mbps": [], "net_tx_mbps": []})
+        for sample in node.get("interval_data", []) or []:
+            mappings = {
+                "cpu_pct": "client_cpu_pct",
+                "mem_used_mb": "client_mem_used_mb",
+                "net_rx_mbps": "client_net_rx_mbps",
+                "net_tx_mbps": "client_net_tx_mbps",
+            }
+            for out_key, sample_key in mappings.items():
+                value = sample.get(sample_key)
+                if isinstance(value, (int, float)):
+                    entry[out_key].append(value)
+    return {
+        role: {key: safe_stats(values) for key, values in metrics.items()}
+        for role, metrics in sorted(by_role.items())
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -927,6 +1565,19 @@ def parse_sysbench_output(text: str) -> dict:
             if m:
                 result["latency_p99_ms"] = float(m.group(1))
 
+    op_latency = parse_custom_mixed_op_stats(text)
+    if op_latency:
+        result["op_latency_ms"] = op_latency
+    query_latency = parse_custom_mixed_query_stats(text)
+    if query_latency:
+        result["query_latency_ms"] = query_latency
+    op_latency_by_minute = parse_custom_mixed_op_interval_stats(text)
+    if op_latency_by_minute:
+        result["op_latency_by_minute_ms"] = op_latency_by_minute
+    query_latency_by_minute = parse_custom_mixed_query_interval_stats(text)
+    if query_latency_by_minute:
+        result["query_latency_by_minute_ms"] = query_latency_by_minute
+
     # -- Availability ---------------------------------------------------------
     txns = result["total_transactions"] or 0
     errs = result["ignored_errors"] or 0
@@ -949,22 +1600,27 @@ def parse_interval_line(line: str) -> Optional[dict]:
     if not m:
         return None
     tps = float(m.group(3))
-    err_per_sec = float(m.group(7))
+    err_per_sec = float(m.group(10))
     if tps + err_per_sec > 0:
         avail = round(tps / (tps + err_per_sec) * 100, 4)
     else:
         avail = 100.0 if tps > 0 else None
-    return {
+    result = {
         "elapsed_s": float(m.group(1)),
         "threads": int(m.group(2)),
         "tps": tps,
         "qps": float(m.group(4)),
-        "latency_pct": int(m.group(5)),
-        "latency_pct_ms": float(m.group(6)),
+        "latency_pct": int(m.group(8)),
+        "latency_pct_ms": float(m.group(9)),
         "err_per_sec": err_per_sec,
-        "reconn_per_sec": float(m.group(8)),
+        "reconn_per_sec": float(m.group(11)),
         "availability_pct": avail,
     }
+    if m.group(5) is not None:
+        result["read_qps"] = float(m.group(5))
+        result["write_qps"] = float(m.group(6))
+        result["other_qps"] = float(m.group(7))
+    return result
 
 
 def parse_interval_lines(text: str) -> list[dict]:
@@ -1058,10 +1714,11 @@ def build_sysbench_cmd(
     lua_dir: Optional[str] = None,
     server_type: str = "aurora",
     isolation_level: str = "read-committed",
-    warmup_time: int = 10,
+    warmup_time: int = 0,
     rand_type: str = "uniform",
     skip_trx: Optional[bool] = None,
     db_ps_mode: str = "auto",
+    mysql_ignore_errors: str = MYSQL_IGNORE_ERRORS,
 ) -> str:
     """Build a sysbench command string suitable for remote SSH execution.
 
@@ -1117,7 +1774,11 @@ def build_sysbench_cmd(
     parts.append(f"--report-interval={report_interval}")
 
     parts.append("--percentile=99")
-    parts.append(f"--warmup-time={warmup_time}")
+    # --warmup-time is sysbench 1.1+; AL2023 ships 1.0.20 and rejects it.
+    # Framework runs its own explicit warmup pass before timed run, so the
+    # inline option is redundant anyway. Emit only when caller opts in.
+    if warmup_time and warmup_time > 0:
+        parts.append(f"--warmup-time={warmup_time}")
     parts.append(f"--rand-type={rand_type}")
     if db_ps_mode and db_ps_mode != "auto":
         parts.append(f"--db-ps-mode={db_ps_mode}")
@@ -1126,17 +1787,25 @@ def build_sysbench_cmd(
     if should_skip_trx:
         parts.append("--skip-trx=on")
 
-    if not pg:
-        parts.append(f"--mysql-ignore-errors={MYSQL_IGNORE_ERRORS}")
+    if not pg and mysql_ignore_errors:
+        parts.append(f"--mysql-ignore-errors={mysql_ignore_errors}")
 
     iso_sql = ISOLATION_LEVEL_MAP.get(isolation_level, "")
     if iso_sql:
         if pg:
-            parts.append(
-                f"--pgsql-options='--default_transaction_isolation={iso_sql.lower().replace(' ', '_')}'")
+            # --pgsql-options is sysbench 1.1+ only; AL2023 ships 1.0.20.
+            # PG's session default is read committed, so skip the option
+            # entirely for the (default) "read-committed" case.
+            if isolation_level != "read-committed":
+                parts.append(
+                    f"--pgsql-options='--default_transaction_isolation={iso_sql.lower().replace(' ', '_')}'")
         else:
-            parts.append(
-                f"--mysql-init-command='SET SESSION TRANSACTION ISOLATION LEVEL {iso_sql}'")
+            # AL2023 ships sysbench 1.0.20, which rejects
+            # --mysql-init-command.  TiDB's default isolation is acceptable
+            # for these benchmark runs, so skip the option there.
+            if server_type != "tidb":
+                parts.append(
+                    f"--mysql-init-command='SET SESSION TRANSACTION ISOLATION LEVEL {iso_sql}'")
 
     if micro_extra:
         parts.extend(micro_extra)
@@ -1251,6 +1920,13 @@ def run_sysbench_streaming(host_ip: str, key_path: str, cmd_str: str,
 
     elapsed = time.time() - start
     full_text = "\n".join(full_output)
+    if proc.returncode != 0:
+        log(f"ERROR: sysbench failed (exit {proc.returncode})")
+        for line in full_output[-5:]:
+            if line.strip():
+                log(f"  {line}")
+        return {"error": full_text, "intervals": all_intervals,
+                "raw_output": full_text}
     result = parse_sysbench_output(full_text)
     result["intervals"] = all_intervals
     result["elapsed_s"] = round(elapsed, 1)
@@ -1315,6 +1991,18 @@ def run_sysbench_parallel(host_ip: str, key_path: str, base_cmd_str: str,
     combined["num_processes"] = num_processes
     combined["per_process_results"] = all_results
     combined["raw_output"] = r.stdout
+    op_latency = parse_custom_mixed_op_stats(r.stdout)
+    if op_latency:
+        combined["op_latency_ms"] = op_latency
+    query_latency = parse_custom_mixed_query_stats(r.stdout)
+    if query_latency:
+        combined["query_latency_ms"] = query_latency
+    op_latency_by_minute = parse_custom_mixed_op_interval_stats(r.stdout)
+    if op_latency_by_minute:
+        combined["op_latency_by_minute_ms"] = op_latency_by_minute
+    query_latency_by_minute = parse_custom_mixed_query_interval_stats(r.stdout)
+    if query_latency_by_minute:
+        combined["query_latency_by_minute_ms"] = query_latency_by_minute
     return combined
 
 
@@ -1389,10 +2077,12 @@ def sysbench_prepare(host_ip: str, key_path: str, endpoint: str, port: int,
 
     proc = _ssh_popen(host_ip, key_path, prepare_cmd)
     tables_done = 0
+    prepare_output: list[str] = []
     start = time.time()
     try:
         for raw_line in proc.stdout:
             line = raw_line.rstrip()
+            prepare_output.append(line)
             if not line:
                 continue
             if "Creating table" in line:
@@ -1411,7 +2101,12 @@ def sysbench_prepare(host_ip: str, key_path: str, endpoint: str, port: int,
     elapsed_min = (time.time() - start) / 60
     if proc.returncode != 0:
         log(f"ERROR: sysbench prepare failed (exit {proc.returncode})")
-        return
+        tail = "\n".join(line for line in prepare_output[-20:] if line)
+        if tail:
+            log("  Last prepare output:")
+            for line in tail.splitlines():
+                log(f"    {line}")
+        raise RuntimeError(f"sysbench prepare failed (exit {proc.returncode})")
     log(f"  Prepare complete: {tables} tables, {total_rows:,} rows, "
         f"~{est_gb} GB in {elapsed_min:.1f} min")
 
@@ -1688,6 +2383,7 @@ def run_benchmark_streaming(
     current_minute = 0
     minute_intervals: list[dict] = []
     all_intervals: list[dict] = []
+    resource_snapshots: list[dict] = []
 
     for raw_line in proc.stdout:
         line = raw_line.rstrip("\n")
@@ -1700,6 +2396,11 @@ def run_benchmark_streaming(
             if minute_of > current_minute:
                 if current_minute > 0 and minute_intervals:
                     res_text = resource_fn() if resource_fn else ""
+                    if resource_fn:
+                        resource_snapshots.append({
+                            "minute": current_minute,
+                            "resource_text": res_text,
+                        })
                     if format_report_fn:
                         report = format_report_fn(current_minute, minute_intervals, res_text)
                         log(report)
@@ -1715,14 +2416,29 @@ def run_benchmark_streaming(
     # Flush last partial minute
     if minute_intervals:
         res_text = resource_fn() if resource_fn else ""
+        if resource_fn:
+            resource_snapshots.append({
+                "minute": current_minute,
+                "resource_text": res_text,
+            })
         if format_report_fn:
             report = format_report_fn(current_minute, minute_intervals, res_text)
             log(report)
             log("")
 
     full_text = "\n".join(full_output)
+    if proc.returncode != 0:
+        log(f"ERROR: sysbench failed (exit {proc.returncode})")
+        for line in full_output[-5:]:
+            if line.strip():
+                log(f"  {line}")
+        return {"error": full_text, "intervals": all_intervals,
+                "raw_output": full_text}
     result = parse_output_fn(full_text)
     result["intervals"] = all_intervals
+    result["raw_output"] = full_text
+    if resource_snapshots:
+        result["resource_snapshots"] = resource_snapshots
     return result
 
 
@@ -2668,8 +3384,7 @@ def _main_aurora(args):
     if args.parallel > 1:
         result = run_sysbench_parallel(host, key_path, cmd_str, args.parallel)
     else:
-        result = run_sysbench(host, key_path, cmd_str,
-                              timeout=duration + 120)
+        result = run_sysbench_streaming(host, key_path, cmd_str)
 
     if "error" in result:
         log("Benchmark failed.")
@@ -2730,6 +3445,14 @@ def _main_aurora(args):
     else:
         result["parallel"] = 1
         result["thread_label"] = str(threads)
+
+    _attach_common_runtime_stats(
+        result,
+        sampler_csv_path if sampler_started else None,
+        bench_start,
+        bench_end,
+        "aurora",
+    )
 
     if result.get("latency_p95_ms") and not result.get("latency_95th_pct_ms"):
         result["latency_95th_pct_ms"] = result["latency_p95_ms"]
@@ -2892,9 +3615,9 @@ def _collect_dsql_cloudwatch(cluster_id, start_time, end_time, region,
 
         try:
             kwargs = {
-                "Namespace": "AWS/DSQL",
+                "Namespace": "AWS/AuroraDSQL",
                 "MetricName": metric_name,
-                "Dimensions": [{"Name": "ResourceId", "Value": cluster_id}],
+                "Dimensions": [{"Name": "ClusterId", "Value": cluster_id}],
                 "StartTime": start_time,
                 "EndTime": end_time,
                 "Period": period,
@@ -2925,6 +3648,35 @@ def _collect_dsql_cloudwatch(cluster_id, start_time, end_time, region,
             log(f"  Warning: Could not fetch {metric_name}/{stat}: {e}")
 
     return results
+
+
+def _summarize_dsql_dpu(cw_metrics: dict) -> dict:
+    keys = {
+        "write_dpu": "WriteDPU_Sum",
+        "read_dpu": "ReadDPU_Sum",
+        "compute_dpu": "ComputeDPU_Sum",
+        "total_dpu": "TotalDPU_Sum",
+    }
+    summary = {}
+    for out_key, metric_key in keys.items():
+        value = cw_metrics.get(metric_key, {}).get("sum")
+        if value is not None:
+            summary[out_key] = value
+
+    total = summary.get("total_dpu") or 0
+    component_total = sum(summary.get(key, 0) for key in (
+        "write_dpu", "read_dpu", "compute_dpu"))
+    if component_total > 0:
+        summary["component_total_dpu"] = component_total
+    if total > 0 and component_total > 0:
+        summary["component_vs_total_delta_dpu"] = component_total - total
+
+    pct_base = component_total if component_total > 0 else total
+    if pct_base > 0:
+        for key in ("write_dpu", "read_dpu", "compute_dpu"):
+            if key in summary:
+                summary[f"{key}_pct"] = round(summary[key] / pct_base * 100, 2)
+    return summary
 
 
 def _main_dsql(args):
@@ -3008,8 +3760,13 @@ def _main_dsql(args):
 
     if not args.skip_prepare:
         token = token_mgr.get_token()
+        # DSQL prepare: force threads=1. With multi-threaded prepare,
+        # sysbench 1.0.20 (AL2023) only invokes prepare() in tid=0 against
+        # custom lua scripts, so the tid-sharded loop in custom_*.lua
+        # creates a single table when threads > 1. Forcing threads=1 means
+        # tid=0 iterates over every table sequentially. Slower but correct.
         sysbench_prepare(host, key_path, endpoint, port, "admin", token,
-                         "postgres", tables, table_size, threads,
+                         "postgres", tables, table_size, 1,
                          workload=workload,
                          lua_dir=lua_dir or "/tmp/lua",
                          server_type="dsql")
@@ -3028,11 +3785,20 @@ def _main_dsql(args):
     # Start client resource sampler
     sampler_started = False
     benchmark_start_ts = time.time()
-    try:
-        start_sampler(host, key_path, 'generic', interval=1, user='ec2-user')
-        sampler_started = True
-    except Exception as e:
-        log(f"Warning: could not start sampler: {e}")
+    for sampler_attempt in range(1, 4):
+        try:
+            start_sampler(host, key_path, 'generic', interval=1,
+                          user='ec2-user')
+            sampler_started = True
+            break
+        except Exception as e:
+            if sampler_attempt >= 3:
+                raise RuntimeError(
+                    "could not start required DSQL client sampler after "
+                    f"{sampler_attempt} attempts: {e}") from e
+            log("Warning: could not start sampler "
+                f"(attempt {sampler_attempt}/3): {e}; retrying...")
+            time.sleep(10)
 
     from common.report import CostTracker as _CT
     cost_tracker = _CT("dsql", "serverless")
@@ -3070,8 +3836,7 @@ def _main_dsql(args):
             isolation_level=isolation_level,
         )
 
-        result = run_sysbench(host, key_path, cmd_str,
-                              timeout=seg_duration + 120)
+        result = run_sysbench_streaming(host, key_path, cmd_str)
         if "error" in result:
             log(f"Benchmark segment {segment_num} failed.")
             break
@@ -3079,13 +3844,20 @@ def _main_dsql(args):
         remaining -= seg_duration
 
     if _is_write_heavy(workload):
-        compact_token = token_mgr.get_token()
-        wait_for_compaction("dsql", host, key_path, endpoint, port,
-                            "admin", compact_token, db=db, tables=tables)
-    post_size_token = token_mgr.get_token()
-    record_db_size("post-benchmark",
-                   get_db_size_postgres(host, key_path, endpoint, port,
-                                       "postgres", "admin", post_size_token))
+        try:
+            compact_token = token_mgr.get_token()
+            wait_for_compaction("dsql", host, key_path, endpoint, port,
+                                "admin", compact_token, db="postgres",
+                                tables=tables)
+        except Exception as e:
+            log(f"Warning: post-benchmark compaction wait failed: {e}")
+    try:
+        post_size_token = token_mgr.get_token()
+        record_db_size("post-benchmark",
+                       get_db_size_postgres(host, key_path, endpoint, port,
+                                           "postgres", "admin", post_size_token))
+    except Exception as e:
+        log(f"Warning: post-benchmark DB size failed: {e}")
 
     cost_tracker.stop()
     bench_end = datetime.now(timezone.utc)
@@ -3101,16 +3873,9 @@ def _main_dsql(args):
 
     # Aggregate results across segments
     if all_results:
-        combined = all_results[0].copy()
+        combined = (_combine_sequential_results(all_results)
+                    if len(all_results) > 1 else all_results[0].copy())
         if len(all_results) > 1:
-            total_tps_sum = sum(
-                r.get("tps", 0) * r.get("elapsed_s", 1)
-                for r in all_results)
-            total_elapsed = sum(r.get("elapsed_s", 0) for r in all_results)
-            combined["tps"] = round(total_tps_sum / total_elapsed, 2) if total_elapsed else 0
-            combined["elapsed_s"] = total_elapsed
-            combined["total_queries"] = sum(
-                r.get("total_queries", 0) for r in all_results)
             combined["segments"] = len(all_results)
     else:
         combined = {"error": "all segments failed"}
@@ -3120,15 +3885,67 @@ def _main_dsql(args):
     combined["duration_s"] = duration
     combined["server_type"] = "dsql"
     combined["endpoint"] = endpoint
+    combined["cluster_id"] = cluster_id
+    combined["region"] = region
+    combined["database"] = "postgres"
+    combined["tables"] = tables
+    combined["table_size"] = table_size
+    combined["client_host"] = host
+    combined["benchmark_start_utc"] = bench_start.isoformat()
+    combined["benchmark_end_utc"] = bench_end.isoformat()
+
+    _attach_common_runtime_stats(
+        combined,
+        sampler_csv_path if sampler_started else None,
+        bench_start,
+        bench_end,
+        "generic",
+    )
 
     log("")
     log("=" * 70)
     log("DSQL Sysbench Results")
     log("=" * 70)
     log(f"  TPS:              {combined.get('tps', 'N/A')}")
+    log(f"  QPS:              {combined.get('qps', 'N/A')}")
     log(f"  Latency avg:      {combined.get('latency_avg_ms', 'N/A')} ms")
     log(f"  Latency p95:      {combined.get('latency_p95_ms', 'N/A')} ms")
+    log(f"  Latency p99:      {combined.get('latency_p99_ms', 'N/A')} ms")
+    log(f"  Latency max:      {combined.get('latency_max_ms', 'N/A')} ms")
+    log(f"  Transactions:     {combined.get('total_transactions', 'N/A')}")
     log(f"  Total queries:    {combined.get('total_queries', 'N/A')}")
+    log(f"  Read queries:     {combined.get('reads', 'N/A')}")
+    log(f"  Write queries:    {combined.get('writes', 'N/A')}")
+    log(f"  Other queries:    {combined.get('other', 'N/A')}")
+    log(f"  Ignored errors:   {combined.get('ignored_errors', 'N/A')}")
+    log(f"  Availability:     {combined.get('availability_pct', 'N/A')}%")
+    op_latency = combined.get("op_latency_ms") or {}
+    if op_latency:
+        log("  Query category latency (client-side ms):")
+        for op in ("begin", "select", "insert", "update", "delete", "commit"):
+            stats = op_latency.get(op)
+            if not stats or not stats.get("count"):
+                continue
+            log(
+                f"    {op:<6} count={stats.get('count')} "
+                f"avg={stats.get('avg_ms')} p50={stats.get('p50_ms')} "
+                f"p95={stats.get('p95_ms')} p99={stats.get('p99_ms')} "
+                f"max={stats.get('max_ms')}"
+            )
+    query_latency = combined.get("query_latency_ms") or {}
+    if query_latency:
+        log("  Query template latency (client-side ms):")
+        for key in sorted(query_latency):
+            stats = query_latency[key]
+            if not stats or not stats.get("count"):
+                continue
+            log(
+                f"    {key:<18} type={stats.get('type')} "
+                f"category={stats.get('category')} count={stats.get('count')} "
+                f"avg={stats.get('avg_ms')} p50={stats.get('p50_ms')} "
+                f"p95={stats.get('p95_ms')} p99={stats.get('p99_ms')} "
+                f"max={stats.get('max_ms')} template={stats.get('template')}"
+            )
     if combined.get("segments"):
         log(f"  Segments:         {combined['segments']}")
 
@@ -3138,11 +3955,30 @@ def _main_dsql(args):
         log("")
         log("Collecting DSQL CloudWatch metrics...")
         cw_end = bench_end + timedelta(minutes=2)
+        combined["cloudwatch_window"] = {
+            "start_utc": bench_start.isoformat(),
+            "end_utc": cw_end.isoformat(),
+        }
         cw_metrics = _collect_dsql_cloudwatch(
             cluster_id, bench_start, cw_end, region, db_profile)
         if cw_metrics:
             for k, v in sorted(cw_metrics.items()):
                 log(f"  {k}: avg={v['avg']:.2f}, sum={v['sum']:.2f}")
+            dpu_usage = _summarize_dsql_dpu(cw_metrics)
+            if dpu_usage:
+                combined["dpu_usage"] = dpu_usage
+                total_dpu = dpu_usage.get("total_dpu")
+                if total_dpu is not None:
+                    log(f"  DPU total: {total_dpu:,.2f}")
+                for label, key in (
+                    ("write", "write_dpu"),
+                    ("read", "read_dpu"),
+                    ("compute", "compute_dpu"),
+                ):
+                    if key in dpu_usage:
+                        pct = dpu_usage.get(f"{key}_pct")
+                        pct_text = f", {pct:.2f}%" if pct is not None else ""
+                        log(f"  DPU {label}: {dpu_usage[key]:,.2f}{pct_text}")
         combined["cloudwatch_metrics"] = cw_metrics
     elif not cluster_id:
         log("Skipping CloudWatch (no --dsql-cluster-id provided).")
@@ -3306,8 +4142,7 @@ def _main_aurora_pg(args):
         isolation_level=isolation_level,
     )
 
-    result = run_sysbench(host, key_path, cmd_str,
-                          timeout=duration + 120)
+    result = run_sysbench_streaming(host, key_path, cmd_str)
 
     if "error" in result:
         log("Benchmark failed.")
@@ -3364,6 +4199,14 @@ def _main_aurora_pg(args):
     result["duration_s"] = duration
     result["server_type"] = "aurora-pg"
     result["endpoint"] = endpoint
+
+    _attach_common_runtime_stats(
+        result,
+        sampler_csv_path if sampler_started else None,
+        bench_start,
+        bench_end,
+        "generic",
+    )
 
     if result.get("latency_p95_ms") and not result.get("latency_95th_pct_ms"):
         result["latency_95th_pct_ms"] = result["latency_p95_ms"]
@@ -3474,13 +4317,11 @@ def _main_tidb(args):
     client_state = _load_bench_client(seed)
 
     if not args.host and client_state.get("public_ip"):
-        args.host = client_state["public_ip"]
-        log(f"Using bench-client from state file: {args.host}")
+        log("Using bench-client from state file for sysbench: "
+            f"{client_state['public_ip']}")
 
     if args.ssh_key:
         ssh_key_resolved = args.ssh_key
-    elif client_state.get("key_path"):
-        ssh_key_resolved = client_state["key_path"]
     else:
         ssh_key_resolved = str(DEFAULT_SSH_KEY_PATH)
     key_path = Path(ssh_key_resolved).expanduser().resolve()
@@ -3516,6 +4357,8 @@ def _run_tidb_benchmark(
     report_interval, profile_name, disk_fill_pct, downstream_port,
 ):
     """Inner TiDB benchmark logic (matches tidb/benchmark.py _run_benchmark)."""
+    from datetime import datetime, timezone
+
     from tidb.driver import (
         DEFAULT_EBS_SIZE_GB, TIDB_MYSQL_IGNORE_ERRORS, AWS_COSTS,
         ssh_run, ssh_stream,
@@ -3537,6 +4380,30 @@ def _run_tidb_benchmark(
         raise SystemExit(f"ERROR: SSH key not found: {key_path}")
 
     client_state = _load_bench_client(seed)
+    all_nodes_cache = None
+    if not client_state.get("public_ip"):
+        try:
+            all_nodes_cache = discover_all_nodes(region, aws_profile, seed)
+            bench_client = next(
+                (node for node in all_nodes_cache
+                 if node.get("role") == "bench-client"),
+                None,
+            )
+            if bench_client:
+                discovered_client_key = (
+                    Path(__file__).resolve().parent /
+                    f"db-bench-client-{seed}.pem"
+                )
+                client_state = {
+                    "public_ip": bench_client["public_ip"],
+                    "key_path": str(discovered_client_key
+                                    if discovered_client_key.exists()
+                                    else key_path),
+                }
+                log("Using bench-client discovered from EC2 tags: "
+                    f"{bench_client['public_ip']}")
+        except Exception as e:
+            log(f"Warning: could not discover bench-client from tags: {e}")
 
     if args.host:
         host = args.host
@@ -3545,7 +4412,11 @@ def _run_tidb_benchmark(
         host = discover_tidb_host(region, aws_profile, seed)
     log(f"Using TiDB host: {host}")
 
-    if client_state.get("public_ip"):
+    endpoint_override = getattr(args, "endpoint", None)
+    if endpoint_override:
+        db_host = endpoint_override
+        log(f"Using TiDB endpoint: {db_host}:{port} (from --endpoint)")
+    elif client_state.get("public_ip"):
         db_host = discover_tidb_endpoint(region, aws_profile, seed)
         log(f"Using TiDB endpoint: {db_host}:{port} (from control node private IP)")
     else:
@@ -3564,6 +4435,10 @@ def _run_tidb_benchmark(
 
     database = seeded_database_name(seed)
     log(f"Using seeded database name: {database} (seed={seed})")
+
+    lua_dir = None
+    if workload in ("custom_iud", "custom_mixed", "custom_kv_sql"):
+        lua_dir = upload_lua_scripts(bench_host, str(bench_key))
 
     if args.cleanup_only:
         run_sysbench_cleanup(bench_host, bench_key, tables, port, database,
@@ -3641,22 +4516,68 @@ mysql -h {db_host} -P {port} -u root -e \
     cost_tracker = CostTracker("tidb", server_type, region)
     cost_tracker.set_infrastructure(
         server_count=server_count, ebs_gb=detected_ebs_gb)
-    cost_tracker.start()
-
-    benchmark_start_time = time.time()
-
     sampler_csv_path = f"/tmp/tidb_sampler_{int(time.time())}.csv"
     sampler_started = False
-    try:
-        start_sampler(bench_host, bench_key, 'generic', interval=1,
-                      user='ec2-user')
-        sampler_started = True
-    except Exception as e:
-        log(f"Warning: could not start client sampler: {e}")
-
     server_samplers = []
+    cdc_tracker = None
+
+    # Phase 1: Bulk data load
+    load_stats = None
+    if not args.no_disk_fill and not args.skip_prepare:
+        load_stats = run_bulk_data_load(
+            host, key_path, target_disk_pct=disk_fill_pct,
+            num_tables=tables, port=port, database=database,
+            ebs_size_gb=detected_ebs_gb, db_host=db_host,
+            bench_host=bench_host, bench_key=bench_key,
+        )
+        table_size = load_stats["rows_per_table"]
+        log(f"Phase 1 complete: {load_stats['total_rows']:,} rows loaded")
+        log(f"  Actual disk: {load_stats['disk_after']['ebs_used_pct']}% "
+            f"of {load_stats['disk_after']['ebs_total_gb']}GB EBS")
+    elif not args.skip_prepare:
+        if lua_dir:
+            sysbench_prepare(
+                bench_host, str(bench_key), db_host, port, "root", "",
+                database, tables, table_size, 1, workload=workload,
+                lua_dir=lua_dir, server_type="tidb")
+        else:
+            run_sysbench_prepare(bench_host, bench_key, tables, table_size,
+                                 port, database, db_host=db_host)
+
+    if args.prepare_only:
+        log("Tables prepared. Skipping benchmark (--prepare-only).")
+        return
+
+    warmup_database(bench_host, str(bench_key), db_host, port, "root", "",
+                    database, tables, table_size, server_type="tidb",
+                    lua_dir=lua_dir)
+    phase_cooldown(60, "post-warmup")
+    record_db_size("pre-benchmark",
+                   get_db_size_mysql(bench_host, bench_key, db_host, port,
+                                     database, "root", ""))
+
+    cost_tracker.start()
+    benchmark_start_time = time.time()
+    benchmark_start_utc = datetime.now(timezone.utc)
+
+    for sampler_attempt in range(1, 4):
+        try:
+            start_sampler(bench_host, bench_key, 'generic', interval=1,
+                          user='ec2-user')
+            sampler_started = True
+            break
+        except Exception as e:
+            if sampler_attempt >= 3:
+                raise RuntimeError(
+                    "could not start required TiDB client sampler after "
+                    f"{sampler_attempt} attempts: {e}") from e
+            log("Warning: could not start client sampler "
+                f"(attempt {sampler_attempt}/3): {e}; retrying...")
+            time.sleep(10)
+
     try:
-        all_nodes = discover_all_nodes(region, aws_profile, seed)
+        all_nodes = (all_nodes_cache if all_nodes_cache is not None
+                     else discover_all_nodes(region, aws_profile, seed))
     except Exception as e:
         log(f"Warning: could not discover cluster nodes: {e}")
         all_nodes = []
@@ -3678,38 +4599,11 @@ mysql -h {db_host} -P {port} -u root -e \
         except Exception as e:
             log(f"Warning: could not start sampler on {label} ({node['public_ip']}): {e}")
 
-    cdc_tracker = None
     if args.ticdc:
         cdc_tracker = CdcLagTracker(
             host=host, key_path=key_path,
             downstream_port=downstream_port)
         cdc_tracker.start()
-
-    # Phase 1: Bulk data load
-    load_stats = None
-    if not args.no_disk_fill and not args.skip_prepare:
-        load_stats = run_bulk_data_load(
-            host, key_path, target_disk_pct=disk_fill_pct,
-            num_tables=tables, port=port, database=database,
-            ebs_size_gb=detected_ebs_gb, db_host=db_host,
-            bench_host=bench_host, bench_key=bench_key,
-        )
-        table_size = load_stats["rows_per_table"]
-        log(f"Phase 1 complete: {load_stats['total_rows']:,} rows loaded")
-        log(f"  Actual disk: {load_stats['disk_after']['ebs_used_pct']}% "
-            f"of {load_stats['disk_after']['ebs_total_gb']}GB EBS")
-    elif not args.skip_prepare:
-        run_sysbench_prepare(bench_host, bench_key, tables, table_size, port,
-                             database, db_host=db_host)
-
-    if args.prepare_only:
-        log("Tables prepared. Skipping benchmark (--prepare-only).")
-        return
-
-    phase_cooldown(120, "post-data-load")
-    record_db_size("pre-benchmark",
-                   get_db_size_mysql(bench_host, bench_key, db_host, port,
-                                    database, "root", ""))
 
     # Phase 2: Benchmark
     log("")
@@ -3734,7 +4628,7 @@ mysql -h {db_host} -P {port} -u root -e \
     skip_trx = workload in ("oltp_read_only", "oltp_point_select")
 
     def _build_cmd(w_threads, w_duration):
-        extra = [f"--mysql-ignore-errors={TIDB_MYSQL_IGNORE_ERRORS}"]
+        extra = []
         if skip_trx:
             extra.append("--skip_trx=true")
         return build_sysbench_cmd(
@@ -3743,6 +4637,8 @@ mysql -h {db_host} -P {port} -u root -e \
             table_size=table_size, endpoint=db_host, port=port,
             user="root", password="", db=database,
             report_interval=report_interval, extra_args=extra,
+            lua_dir=lua_dir, server_type="tidb",
+            mysql_ignore_errors=TIDB_MYSQL_IGNORE_ERRORS,
         )
 
     def _run_capture(cmd_str):
@@ -3796,6 +4692,7 @@ mysql -h {db_host} -P {port} -u root -e \
             avg_tps = weighted_tps / total_duration
     else:
         benchmark_metrics = _run_streaming(threads, duration)
+        benchmark_end_utc = datetime.now(timezone.utc)
         print_summary(benchmark_metrics, "tidb")
         total_queries = benchmark_metrics.get("total_queries", 0) or 0
         total_transactions = (benchmark_metrics.get("total_transactions", 0)
@@ -3805,7 +4702,7 @@ mysql -h {db_host} -P {port} -u root -e \
 
     if _is_write_heavy(workload):
         wait_for_compaction("tidb", bench_host, bench_key, db_host, port,
-                            "root", "", db=db, tables=tables)
+                            "root", "", db=database, tables=tables)
     record_db_size("post-benchmark",
                    get_db_size_mysql(bench_host, bench_key, db_host, port,
                                     database, "root", ""))
@@ -3881,6 +4778,44 @@ mysql -h {db_host} -P {port} -u root -e \
         except Exception as e:
             log(f"Warning: could not collect client sampler metrics: {e}")
 
+    if not multi_phase and 'benchmark_metrics' in locals():
+        benchmark_end_utc = locals().get(
+            "benchmark_end_utc", datetime.now(timezone.utc))
+        _attach_common_runtime_stats(
+            benchmark_metrics,
+            sampler_csv_path if sampler_started else None,
+            benchmark_start_time,
+            time.time(),
+            'generic',
+        )
+        benchmark_metrics.setdefault("workload", workload)
+        benchmark_metrics.setdefault("threads", threads)
+        benchmark_metrics["duration_s"] = duration
+        benchmark_metrics["server_type"] = "tidb"
+        benchmark_metrics["endpoint"] = db_host
+        benchmark_metrics["database"] = database
+        benchmark_metrics["tables"] = tables
+        benchmark_metrics["table_size"] = table_size
+        benchmark_metrics["client_host"] = bench_host
+        benchmark_metrics["control_host"] = host
+        benchmark_metrics["profile"] = profile_name
+        benchmark_metrics["cluster_info"] = cluster_info
+        benchmark_metrics["benchmark_start_utc"] = benchmark_start_utc.isoformat()
+        benchmark_metrics["benchmark_end_utc"] = benchmark_end_utc.isoformat()
+        resource_snapshots = benchmark_metrics.get("resource_snapshots") or []
+        if resource_snapshots:
+            parsed_snapshots = []
+            for snapshot in resource_snapshots:
+                parsed = parse_tidb_resource_snapshot(
+                    snapshot.get("resource_text", ""))
+                parsed["minute"] = snapshot.get("minute")
+                parsed_snapshots.append(parsed)
+            benchmark_metrics["tidb_resource_snapshots"] = parsed_snapshots
+            benchmark_metrics["tidb_resource_summary"] = (
+                summarize_tidb_resource_snapshots(parsed_snapshots))
+        interval_data = benchmark_metrics.get('interval_data', interval_data)
+        sampler_ws = benchmark_metrics.get('window_stats', sampler_ws)
+
     server_node_data = []
     for ss in server_samplers:
         try:
@@ -3893,10 +4828,16 @@ mysql -h {db_host} -P {port} -u root -e \
                 server_node_data.append({
                     "label": ss["label"],
                     "interval_data": cpu_s,
+                    "window_stats": _client_window_stats(cpu_s),
                     "instance_type": ss["instance_type"],
                 })
         except Exception as e:
             log(f"Warning: could not collect sampler from {ss['label']}: {e}")
+
+    if server_node_data and not multi_phase and 'benchmark_metrics' in locals():
+        benchmark_metrics["server_node_samplers"] = server_node_data
+        benchmark_metrics["server_node_summary"] = (
+            summarize_server_node_samplers(server_node_data))
 
     if sampler_ws or interval_data:
         fake_result = {
@@ -3934,6 +4875,16 @@ mysql -h {db_host} -P {port} -u root -e \
                              db_host=db_host)
 
     from datetime import datetime as _dt, timezone as _tz
+    summary_data = benchmark_metrics if not multi_phase and 'benchmark_metrics' in locals() else None
+    if summary_data is not None:
+        import json as _json
+        output_path = (Path(__file__).resolve().parent.parent / "tidb" /
+                       f"tidb-sysbench-{_dt.now().strftime('%Y%m%d-%H%M%S')}.json")
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        output_path.write_text(_json.dumps(summary_data, indent=2, default=str))
+        log(f"\nResults saved to: {output_path}")
+
     finalize_output_dirs(bench_output_dirs,
-                         _dt.now(_tz.utc).isoformat())
+                         _dt.now(_tz.utc).isoformat(),
+                         summary_data=summary_data)
     log("Benchmark complete.")

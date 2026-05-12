@@ -27,8 +27,6 @@ function event()
     local pad_val = sysbench.rand.string(string.rep("@", 60))
     local r = sysbench.rand.uniform(1, 100)
 
-    con:query("BEGIN")
-
     if r <= 68 then
         con:query(string.format(
             "INSERT INTO %s (k, c, pad) VALUES (%d, '%s', '%s')",
@@ -41,14 +39,12 @@ function event()
         local driver = drv:name()
         if driver == "pgsql" then
             con:query(string.format(
-                "DELETE FROM %s WHERE ctid = (SELECT ctid FROM %s WHERE id = %d LIMIT 1)",
-                table_name, table_name, id))
+                "DELETE FROM %s WHERE id = %d",
+                table_name, id))
         else
             con:query(string.format(
                 "DELETE FROM %s WHERE id = %d LIMIT 1",
                 table_name, id))
         end
     end
-
-    con:query("COMMIT")
 end

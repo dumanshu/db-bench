@@ -1,1 +1,32 @@
 __pycache__/
+
+# Secrets and local AWS/SSH material
+*.pem
+*.pem.pub
+*.key
+id_*
+*-keypair*
+
+# Local benchmark outputs and state
+logs/
+results/
+*/results/
+benchmark-results*.txt
+cleanup.log
+*.log
+*report.md
+
+# DSQL local artifacts
+dsql/dsql-sysbench-*.json
+dsql/dsql-results-*.json
+dsql/dsql-sampler-*.csv
+dsql/dsql-state.json
+
+# TiDB local artifacts
+tidb/tidb-sysbench-*.json
+tidb/tidb-results-*.json
+tidb/tidb-sampler-*.csv
+
+# Local generated client state
+common/client-*-state.json
+common/client-*-state.json.bak

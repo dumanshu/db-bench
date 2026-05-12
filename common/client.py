@@ -84,19 +84,29 @@ LIMEOF
 # Constants
 # ---------------------------------------------------------------------------
 
-SERVER_TYPES = ("tidb", "aurora", "valkey")
+SERVER_TYPES = ("tidb", "aurora", "valkey", "dsql", "aurora-pg")
 
 # Stack name prefixes used by each server type's setup.py
 STACK_PREFIXES = {
     "aurora": "aurora-bench",
     "tidb": "tidb-loadtest",
     "valkey": "valkey-loadtest",
+    "dsql": "dsql-loadtest",
+    "aurora-pg": "aurora-pg-bench",
 }
 
 # Size presets for the client EC2 instance (Graviton4)
 SIZE_PRESETS = {
     "small": "c8g.4xlarge",    # 16 vCPU, 32 GB
     "heavy": "c8g.24xlarge",   # 96 vCPU, 192 GB
+}
+
+CLIENT_DB_PORTS = {
+    "aurora": [3306],
+    "aurora-pg": [5432],
+    "dsql": [5432],
+    "tidb": [30400],
+    "valkey": [6379],
 }
 
 # AL2023 ARM64 AMI SSM parameter (all client sizes are Graviton)
@@ -284,6 +294,39 @@ def _ensure_client_sg(ec2_client, vpc_id, server_stack, vpc_cidr, ssh_cidr):
                 raise
 
     return sg_id
+
+
+def _authorize_client_db_access(ec2_client, server_stack, client_sg_id,
+                                server_type):
+    """Allow the benchmark client SG to reach server DB ports."""
+    ports = CLIENT_DB_PORTS.get(server_type, [])
+    if not ports:
+        return
+    resp = ec2_client.describe_security_groups(
+        Filters=[{"Name": "tag:Project", "Values": [server_stack]}]
+    )
+    for sg in resp.get("SecurityGroups", []):
+        sg_id = sg["GroupId"]
+        if sg_id == client_sg_id or sg.get("GroupName") == "default":
+            continue
+        for port in ports:
+            try:
+                ec2_client.authorize_security_group_ingress(
+                    GroupId=sg_id,
+                    IpPermissions=[{
+                        "IpProtocol": "tcp",
+                        "FromPort": port,
+                        "ToPort": port,
+                        "UserIdGroupPairs": [{
+                            "GroupId": client_sg_id,
+                            "Description": "db-bench-client",
+                        }],
+                    }],
+                )
+                log(f"  Allowed client SG {client_sg_id} -> {sg_id}:{port}")
+            except ec2_client.exceptions.ClientError as e:
+                if "InvalidPermission.Duplicate" not in str(e):
+                    raise
 
 
 def _find_instance(ec2_client, name, server_stack):
@@ -484,25 +527,44 @@ def _install_mysql_client(host_ip, key_path, timeout=300):
 
 def _install_sysbench(host_ip, key_path, timeout=600):
     log(f"  Installing sysbench on {host_ip}")
+    # Build with BOTH MySQL and PostgreSQL drivers so the same binary
+    # benchmarks Aurora MySQL/TiDB (mysql) and Aurora PG/DSQL (pgsql).
     ssh_run_simple(host_ip, key_path, """
+        # Idempotent: skip only if existing binary already has both drivers.
         if command -v sysbench >/dev/null 2>&1; then
-            echo "sysbench already installed"
-            sysbench --version
-            exit 0
+            BIN=$(command -v sysbench)
+            HAS_PG=$(ldd "$BIN" 2>/dev/null | grep -ci 'libpq\\.' || true)
+            HAS_MY=$(ldd "$BIN" 2>/dev/null | grep -ciE 'libmysqlclient\\.|libmariadb\\.' || true)
+            if [ "$HAS_PG" -gt 0 ] && [ "$HAS_MY" -gt 0 ]; then
+                echo "sysbench already installed (mysql + pgsql)"
+                sysbench --version
+                exit 0
+            fi
+            echo "sysbench present but missing driver(s); rebuilding..."
         fi
         set -euo pipefail
+        # libpq for pgsql driver; mariadb-devel/mysql-devel for mysql driver.
+        if command -v dnf >/dev/null 2>&1; then
+            sudo dnf -y install postgresql-devel mariadb105-devel \
+                || sudo dnf -y install postgresql-devel mysql-devel \
+                || sudo dnf -y install postgresql-devel
+        else
+            sudo yum -y install postgresql-devel mysql-devel || true
+        fi
         cd /tmp
         if [ ! -d sysbench ]; then
             git clone https://github.com/akopytov/sysbench.git
         fi
         cd sysbench
         git checkout 1.0.20
+        make distclean >/dev/null 2>&1 || true
         ./autogen.sh
-        ./configure --with-mysql
+        ./configure --with-mysql --with-pgsql
         make -j$(nproc)
         sudo make install
         sudo ldconfig
         sysbench --version
+        ldd "$(command -v sysbench)" | grep -Ei 'libpq|mysql|mariadb' || true
     """, timeout=timeout)
 
 
@@ -627,6 +689,7 @@ def main():
 
     # Security group
     sg_id = _ensure_client_sg(ec2_client, vpc_id, server_stack, vpc_cidr, ssh_cidr)
+    _authorize_client_db_access(ec2_client, server_stack, sg_id, server_type)
 
     # Key pair
     key_name = f"{KEY_NAME_PREFIX}-{seed}"

@@ -6,20 +6,20 @@ DSQL Stack Validator
 
 Verifies that the DSQL load test stack is healthy:
 - Client VM reachable via SSH
-- psql / pgbench installed
+- psql / sysbench installed
 - DSQL cluster reachable (IAM auth)
-- Optional quick benchmark to confirm end-to-end
 
 Usage:
     python3 -m dsql.validate --seed dsqllt-001
-    python3 -m dsql.validate --seed dsqllt-001 --quick-bench
+
+For an end-to-end smoke test, use the unified benchmark runner:
+    python3 -m dsql.benchmark --profile quick
 """
 
 import argparse
 import datetime
 import json
 import os
-import re
 import subprocess
 import sys
 from pathlib import Path
@@ -176,10 +176,10 @@ def check_ssh(client_ip, key_path):
     return c
 
 
-def check_pgbench(client_ip, key_path):
-    c = Check("pgbench installed")
-    output, rc = ssh_capture(client_ip, "pgbench --version", key_path)
-    if rc == 0 and "pgbench" in output.lower():
+def check_sysbench(client_ip, key_path):
+    c = Check("sysbench installed")
+    output, rc = ssh_capture(client_ip, "sysbench --version", key_path)
+    if rc == 0 and "sysbench" in output.lower():
         version = output.strip().split("\n")[0]
         c.ok(version)
     else:
@@ -219,58 +219,6 @@ echo "PSQL_EXIT:$?"
     return c
 
 
-def check_quick_benchmark(client_ip, key_path, endpoint, region, profile):
-    c = Check("Quick benchmark (10s)")
-    try:
-        token = generate_auth_token(endpoint, region, profile)
-    except Exception as e:
-        c.fail(f"Auth token generation failed: {e}")
-        return c
-
-    # DSQL rejects fillfactor, TRUNCATE, and caps writes at ~3500 rows/txn
-    init_script = f"""\
-export PGPASSWORD='{token}'
-PSQL="psql -h {endpoint} -p {DSQL_PORT} -U admin -d postgres -v ON_ERROR_STOP=1"
-$PSQL <<'EOSQL'
-DROP TABLE IF EXISTS pgbench_history, pgbench_tellers, pgbench_accounts, pgbench_branches;
-CREATE TABLE pgbench_branches (bid int NOT NULL PRIMARY KEY, bbalance int, filler char(88));
-CREATE TABLE pgbench_tellers  (tid int NOT NULL PRIMARY KEY, bid int, tbalance int, filler char(84));
-CREATE TABLE pgbench_accounts (aid int NOT NULL PRIMARY KEY, bid int, abalance int, filler char(84));
-CREATE TABLE pgbench_history  (tid int, bid int, aid int, delta int, mtime timestamp, filler char(22));
-INSERT INTO pgbench_branches SELECT g, 0, '' FROM generate_series(1, 1) g;
-INSERT INTO pgbench_tellers  SELECT g, (g-1)/10+1, 0, '' FROM generate_series(1, 10) g;
-EOSQL
-if [ $? -ne 0 ]; then echo "INIT_EXIT:1"; exit 0; fi
-BATCH=2000; TOTAL=100000
-for i in $(seq 0 $(( (TOTAL + BATCH - 1) / BATCH - 1 )) ); do
-    s=$(($i * BATCH + 1)); e=$((($i + 1) * BATCH))
-    [ $e -gt $TOTAL ] && e=$TOTAL
-    echo "INSERT INTO pgbench_accounts SELECT g, (g-1)/100000+1, 0, '' FROM generate_series($s, $e) g;"
-done | $PSQL 2>&1
-echo "INIT_EXIT:${{PIPESTATUS[1]:-$?}}"
-"""
-    init_output, init_rc = ssh_capture(client_ip, init_script, key_path, timeout=180)
-    if "INIT_EXIT:0" not in init_output:
-        c.fail(f"pgbench init failed: {init_output[-300:]}")
-        return c
-
-    script = f"""\
-export PGPASSWORD='{token}'
-pgbench -h {endpoint} -p {DSQL_PORT} -U admin -d postgres \\
-    -c 2 -j 2 -T 10 -n --max-tries=3 2>&1
-echo "RUN_EXIT:$?"
-"""
-    output, rc = ssh_capture(client_ip, script, key_path, timeout=60)
-    tps_match = re.search(r"tps\s*=\s*([\d.]+)\s*\(without", output)
-    if tps_match:
-        c.ok(f"{tps_match.group(1)} TPS")
-    elif "RUN_EXIT:0" in output:
-        c.ok("completed (TPS not parsed)")
-    else:
-        c.fail(f"rc={rc}, output={output[-300:]}")
-    return c
-
-
 # ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
@@ -286,10 +234,6 @@ def parse_args():
     parser.add_argument(
         "--ssh-key", default=str(SSH_KEY_PATH),
         help=f"SSH private key path (default: {SSH_KEY_PATH}).",
-    )
-    parser.add_argument(
-        "--quick-bench", action="store_true",
-        help="Run a quick 10-second pgbench benchmark as validation.",
     )
     return parser.parse_args()
 
@@ -336,16 +280,11 @@ def main():
 
         ssh_ok = checks[-1].passed
         if ssh_ok:
-            checks.append(check_pgbench(client_ip, key_path))
+            checks.append(check_sysbench(client_ip, key_path))
             checks.append(check_psql(client_ip, key_path))
 
             if endpoint:
                 checks.append(check_dsql_connectivity(client_ip, key_path, endpoint, region, db_prof))
-
-                if args.quick_bench:
-                    checks.append(check_quick_benchmark(
-                        client_ip, key_path, endpoint, region, db_prof,
-                    ))
 
     log("")
     log("=" * 70)
