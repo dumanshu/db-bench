@@ -958,6 +958,95 @@ def _enrich_interval_with_client_sample(interval: dict, cpu_samples: list[dict],
     return row
 
 
+def _parse_percent(raw: str) -> Optional[float]:
+    raw = raw.strip().rstrip("%")
+    if not raw or raw.upper() == "N/A":
+        return None
+    try:
+        return float(raw)
+    except ValueError:
+        return None
+
+
+def parse_tidb_resource_snapshot(text: str) -> dict:
+    """Parse TiDB compact resource snapshot output into JSON fields."""
+    parsed = {"client": {}, "nodes": []}
+    for raw_line in text.splitlines():
+        line = raw_line.strip()
+        if not line:
+            continue
+        client_match = re.match(r"CLIENT\s+cpu=(\S+)\s+mem=(\S+)", line)
+        if client_match:
+            parsed["client"] = {
+                "cpu_pct": _parse_percent(client_match.group(1)),
+                "mem_pct": _parse_percent(client_match.group(2)),
+            }
+            continue
+        node_match = re.match(r"NODE\s+(\S+)\s+cpu=(\S+)\s+mem=(\S+)", line)
+        if node_match:
+            name = node_match.group(1)
+            parsed["nodes"].append({
+                "name": name,
+                "role": name.rsplit("-", 1)[0] if "-" in name else name,
+                "cpu_pct": _parse_percent(node_match.group(2)),
+                "mem_pct": _parse_percent(node_match.group(3)),
+            })
+    return parsed
+
+
+def summarize_tidb_resource_snapshots(snapshots: list[dict]) -> dict:
+    """Summarize parsed TiDB resource snapshots by role and node."""
+    from common.sampler import safe_stats
+    by_role: dict[str, dict[str, list[float]]] = {}
+    by_node: dict[str, dict[str, list[float]]] = {}
+    for snapshot in snapshots:
+        for node in snapshot.get("nodes", []) or []:
+            role = node.get("role") or "unknown"
+            name = node.get("name") or role
+            role_entry = by_role.setdefault(role, {"cpu_pct": [], "mem_pct": []})
+            node_entry = by_node.setdefault(name, {"cpu_pct": [], "mem_pct": []})
+            for key in ("cpu_pct", "mem_pct"):
+                value = node.get(key)
+                if isinstance(value, (int, float)):
+                    role_entry[key].append(value)
+                    node_entry[key].append(value)
+    return {
+        "by_role": {
+            role: {key: safe_stats(values) for key, values in metrics.items()}
+            for role, metrics in sorted(by_role.items())
+        },
+        "by_node": {
+            node: {key: safe_stats(values) for key, values in metrics.items()}
+            for node, metrics in sorted(by_node.items())
+        },
+    }
+
+
+def summarize_server_node_samplers(server_nodes: list[dict]) -> dict:
+    """Summarize per-node sampler windows by TiDB component role."""
+    from common.sampler import safe_stats
+    by_role: dict[str, dict[str, list[float]]] = {}
+    for node in server_nodes:
+        role = str(node.get("label") or "unknown").lower()
+        entry = by_role.setdefault(role, {"cpu_pct": [], "mem_used_mb": [],
+                                         "net_rx_mbps": [], "net_tx_mbps": []})
+        for sample in node.get("interval_data", []) or []:
+            mappings = {
+                "cpu_pct": "client_cpu_pct",
+                "mem_used_mb": "client_mem_used_mb",
+                "net_rx_mbps": "client_net_rx_mbps",
+                "net_tx_mbps": "client_net_tx_mbps",
+            }
+            for out_key, sample_key in mappings.items():
+                value = sample.get(sample_key)
+                if isinstance(value, (int, float)):
+                    entry[out_key].append(value)
+    return {
+        role: {key: safe_stats(values) for key, values in metrics.items()}
+        for role, metrics in sorted(by_role.items())
+    }
+
+
 # ---------------------------------------------------------------------------
 # Naming helpers
 # ---------------------------------------------------------------------------
@@ -2294,6 +2383,7 @@ def run_benchmark_streaming(
     current_minute = 0
     minute_intervals: list[dict] = []
     all_intervals: list[dict] = []
+    resource_snapshots: list[dict] = []
 
     for raw_line in proc.stdout:
         line = raw_line.rstrip("\n")
@@ -2306,6 +2396,11 @@ def run_benchmark_streaming(
             if minute_of > current_minute:
                 if current_minute > 0 and minute_intervals:
                     res_text = resource_fn() if resource_fn else ""
+                    if resource_fn:
+                        resource_snapshots.append({
+                            "minute": current_minute,
+                            "resource_text": res_text,
+                        })
                     if format_report_fn:
                         report = format_report_fn(current_minute, minute_intervals, res_text)
                         log(report)
@@ -2321,6 +2416,11 @@ def run_benchmark_streaming(
     # Flush last partial minute
     if minute_intervals:
         res_text = resource_fn() if resource_fn else ""
+        if resource_fn:
+            resource_snapshots.append({
+                "minute": current_minute,
+                "resource_text": res_text,
+            })
         if format_report_fn:
             report = format_report_fn(current_minute, minute_intervals, res_text)
             log(report)
@@ -2337,6 +2437,8 @@ def run_benchmark_streaming(
     result = parse_output_fn(full_text)
     result["intervals"] = all_intervals
     result["raw_output"] = full_text
+    if resource_snapshots:
+        result["resource_snapshots"] = resource_snapshots
     return result
 
 
@@ -4651,6 +4753,17 @@ mysql -h {db_host} -P {port} -u root -e \
         benchmark_metrics["cluster_info"] = cluster_info
         benchmark_metrics["benchmark_start_utc"] = benchmark_start_utc.isoformat()
         benchmark_metrics["benchmark_end_utc"] = benchmark_end_utc.isoformat()
+        resource_snapshots = benchmark_metrics.get("resource_snapshots") or []
+        if resource_snapshots:
+            parsed_snapshots = []
+            for snapshot in resource_snapshots:
+                parsed = parse_tidb_resource_snapshot(
+                    snapshot.get("resource_text", ""))
+                parsed["minute"] = snapshot.get("minute")
+                parsed_snapshots.append(parsed)
+            benchmark_metrics["tidb_resource_snapshots"] = parsed_snapshots
+            benchmark_metrics["tidb_resource_summary"] = (
+                summarize_tidb_resource_snapshots(parsed_snapshots))
         interval_data = benchmark_metrics.get('interval_data', interval_data)
         sampler_ws = benchmark_metrics.get('window_stats', sampler_ws)
 
@@ -4666,10 +4779,16 @@ mysql -h {db_host} -P {port} -u root -e \
                 server_node_data.append({
                     "label": ss["label"],
                     "interval_data": cpu_s,
+                    "window_stats": _client_window_stats(cpu_s),
                     "instance_type": ss["instance_type"],
                 })
         except Exception as e:
             log(f"Warning: could not collect sampler from {ss['label']}: {e}")
+
+    if server_node_data and not multi_phase and 'benchmark_metrics' in locals():
+        benchmark_metrics["server_node_samplers"] = server_node_data
+        benchmark_metrics["server_node_summary"] = (
+            summarize_server_node_samplers(server_node_data))
 
     if sampler_ws or interval_data:
         fake_result = {
