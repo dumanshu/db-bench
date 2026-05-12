@@ -97,14 +97,14 @@ AWS_PROFILE=sandbox python3 -m tidb.setup --ticdc
 # Validate cluster health
 AWS_PROFILE=sandbox python3 -m tidb.validate
 
-# Benchmark (standard profile, oltp_read_write)
-AWS_PROFILE=sandbox python3 -m tidb.benchmark --profile standard
+# Benchmark (quick profile, oltp_read_write)
+AWS_PROFILE=sandbox python3 -m tidb.benchmark --profile quick
 
 # Benchmark specific workload
 AWS_PROFILE=sandbox python3 -m tidb.benchmark --profile quick --workload oltp_point_select
 
 # Benchmark with TiCDC lag measurement
-AWS_PROFILE=sandbox python3 -m tidb.benchmark --profile standard --ticdc
+AWS_PROFILE=sandbox python3 -m tidb.benchmark --profile quick --ticdc
 
 # Cleanup all resources
 AWS_PROFILE=sandbox python3 -m tidb.setup --cleanup
@@ -180,7 +180,7 @@ AWS_PROFILE=sandbox python3 -m dsql.setup --seed dsqllt-001
 # Validate
 AWS_PROFILE=sandbox python3 -m dsql.validate --seed dsqllt-001
 
-# Benchmark (standard profile; 10 minutes for the default write-heavy workload)
+# Benchmark (quick profile)
 AWS_PROFILE=sandbox DB_PROFILE=sandbox-storage python3 -m dsql.benchmark \
   --action run \
   --seed dsqllt-001 \
@@ -190,7 +190,7 @@ AWS_PROFILE=sandbox DB_PROFILE=sandbox-storage python3 -m dsql.benchmark \
   --dsql-region us-east-1 \
   --dsql-db-profile sandbox-storage \
   --aws-profile sandbox \
-  --profile standard
+  --profile quick
 
 # Benchmark (quick smoke test, 1 minute)
 AWS_PROFILE=sandbox DB_PROFILE=sandbox-storage python3 -m dsql.benchmark \
