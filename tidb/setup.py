@@ -171,6 +171,16 @@ def parse_args():
     parser.add_argument("--skip-bootstrap", action="store_true", help="Provision infrastructure only.")
     parser.add_argument("--cleanup", action="store_true", help="Tear down stack resources.")
     parser.add_argument(
+        "--bench-client-seed",
+        default=None,
+        help="Benchmark client seed to clean up (default: --seed).",
+    )
+    parser.add_argument(
+        "--keep-client",
+        action="store_true",
+        help="Do not clean the benchmark client during --cleanup.",
+    )
+    parser.add_argument(
         "--tidb-version",
         default=TIDB_VERSION,
         help=f"TiDB version to deploy (default: {TIDB_VERSION}).",
@@ -1290,6 +1300,9 @@ def main():
     configure_from_args(args)
 
     if args.cleanup:
+        if not args.keep_client:
+            from common.client import cleanup_client
+            cleanup_client(ec2(), args.bench_client_seed or args.seed, _cu.STACK)
         cleanup_stack()
         return
 

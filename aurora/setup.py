@@ -679,15 +679,7 @@ def cleanup_stack(session: boto3.Session, region: str, stack: str,
         ec2_client.delete_vpc(VpcId=vpc["VpcId"])
         log(f"  Deleted VPC: {vpc['VpcId']}")
 
-    # 11. Delete key pair from AWS (keep local .pem)
-    log(f"Deleting key pair '{KEY_NAME}' from AWS...")
-    try:
-        ec2_client.delete_key_pair(KeyName=KEY_NAME)
-        log("  Deleted")
-    except ClientError:
-        pass
-
-    # 12. Delete snapshots (if requested)
+    # 11. Delete snapshots (if requested)
     if delete_snapshots:
         log("Deleting aurora-bench snapshots...")
         delete_all_snapshots(rds)
@@ -697,7 +689,7 @@ def cleanup_stack(session: boto3.Session, region: str, stack: str,
             log(f"  Keeping {len(snaps)} snapshot(s). "
                 f"Use --delete-snapshots to remove them.")
 
-    # 13. Remove state file
+    # 12. Remove state file
     script_dir = Path(__file__).resolve().parent
     state_path = script_dir / STATE_FILE
     if state_path.exists():
@@ -733,6 +725,10 @@ def parse_args() -> argparse.Namespace:
                    help="List available aurora-bench snapshots and exit")
     p.add_argument("--seed", default=DEFAULT_SEED,
                    help=f"Stack seed identifier (default: {DEFAULT_SEED})")
+    p.add_argument("--bench-client-seed", default=None,
+                   help="Benchmark client seed to clean up (default: --seed)")
+    p.add_argument("--keep-client", action="store_true",
+                   help="Do not clean the benchmark client during --cleanup")
     p.add_argument("--region", default=DEFAULT_REGION,
                    help=f"AWS region (default: {DEFAULT_REGION})")
     p.add_argument("--aws-profile", default=DEFAULT_PROFILE,
@@ -783,6 +779,9 @@ def main() -> None:
 
     if args.cleanup:
         log(f"Cleaning up stack '{stack}' in {args.region}...")
+        if not args.keep_client:
+            from common.client import cleanup_client
+            cleanup_client(session.client("ec2"), args.bench_client_seed or args.seed, stack)
         cleanup_stack(session, args.region, stack, rds_session,
                       delete_snapshots=args.delete_snapshots)
         return
@@ -892,7 +891,6 @@ def main() -> None:
     print()
     print("Cleanup (server only -- client cleaned separately):")
     print(f"  python3 -m aurora.setup --cleanup --seed {args.seed}")
-    print(f"  python3 -m common.client --cleanup --seed {args.seed} --server-type aurora")
     print()
 
 
