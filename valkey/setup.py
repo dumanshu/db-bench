@@ -121,6 +121,16 @@ def parse_args():
     parser.add_argument("--skip-bootstrap", action="store_true", help="Provision infrastructure only, skip remote bootstrap.")
     parser.add_argument("--cleanup", action="store_true", help="Tear down stack resources (keeps the S3 bucket).")
     parser.add_argument(
+        "--bench-client-seed",
+        default=None,
+        help="Benchmark client seed to clean up (default: --seed).",
+    )
+    parser.add_argument(
+        "--keep-client",
+        action="store_true",
+        help="Do not clean the benchmark client during --cleanup.",
+    )
+    parser.add_argument(
         "--valkey-nodes",
         type=int,
         default=DEFAULT_VALKEY_NODES,
@@ -625,34 +635,58 @@ def delete_stack_route_tables():
 
 
 def delete_stack_network_interfaces(vpc_id):
-    nis = ec2().describe_network_interfaces(
-        Filters=[{"Name": "vpc-id", "Values": [vpc_id]}]
-    ).get("NetworkInterfaces", [])
-    for eni in nis:
-        eni_id = eni["NetworkInterfaceId"]
-        status = eni.get("Status")
-        attachment = eni.get("Attachment")
-        if attachment and attachment.get("AttachmentId"):
-            att_id = attachment["AttachmentId"]
-            log(f"DETACHING network interface {eni_id} ({status})")
-            try:
-                ec2().detach_network_interface(AttachmentId=att_id, Force=True)
-            except botocore.exceptions.ClientError as e:
-                if e.response["Error"]["Code"] not in ("InvalidAttachmentID.NotFound", "OperationNotPermitted"):
-                    raise
-        log(f"DELETING network interface: {eni_id}")
-        for attempt in range(5):
+    deadline = time.time() + 600
+    attempt = 0
+    while time.time() < deadline:
+        nis = ec2().describe_network_interfaces(
+            Filters=[{"Name": "vpc-id", "Values": [vpc_id]}]
+        ).get("NetworkInterfaces", [])
+        if not nis:
+            return
+        attempt += 1
+        remaining = []
+        for eni in nis:
+            eni_id = eni["NetworkInterfaceId"]
+            status = eni.get("Status")
+            attachment = eni.get("Attachment")
+            if attachment and attachment.get("AttachmentId"):
+                att_id = attachment["AttachmentId"]
+                log(f"DETACHING network interface {eni_id} ({status})")
+                try:
+                    ec2().detach_network_interface(AttachmentId=att_id, Force=True)
+                except botocore.exceptions.ClientError as e:
+                    code = e.response["Error"]["Code"]
+                    if code not in (
+                        "InvalidAttachmentID.NotFound", "OperationNotPermitted",
+                        "UnsupportedOperation",
+                    ):
+                        raise
+            log(f"DELETING network interface: {eni_id}")
             try:
                 ec2().delete_network_interface(NetworkInterfaceId=eni_id)
-                break
             except botocore.exceptions.ClientError as e:
                 code = e.response["Error"]["Code"]
                 if code in ("InvalidNetworkInterfaceID.NotFound",):
-                    break
-                if code in ("InvalidParameterValue", "IncorrectState") and attempt < 4:
-                    time.sleep(3)
+                    continue
+                if code in (
+                    "InvalidParameterValue", "IncorrectState",
+                    "InvalidNetworkInterface.InUse", "DependencyViolation",
+                ):
+                    remaining.append(eni_id)
                     continue
                 raise
+        if not remaining:
+            return
+        delay = min(5 * attempt, 30)
+        log(f"Waiting {delay}s for network interfaces to detach: {', '.join(remaining)}")
+        time.sleep(delay)
+
+    leftover = ec2().describe_network_interfaces(
+        Filters=[{"Name": "vpc-id", "Values": [vpc_id]}]
+    ).get("NetworkInterfaces", [])
+    if leftover:
+        ids = ", ".join(eni["NetworkInterfaceId"] for eni in leftover)
+        raise RuntimeError(f"Timed out deleting network interfaces: {ids}")
 
 
 def release_stack_eip():
@@ -666,13 +700,14 @@ def release_stack_eip():
                 raise
 
 
-def wait_for_nat_deletion():
-    for attempt in range(60):
+def wait_for_nat_deletion(max_attempts=120):
+    for attempt in range(max_attempts):
         remaining, _ = get_nat()
         if remaining is None:
             return True
-        log("NAT gateway still deleting; waiting 10s...")
-        time.sleep(10)
+        delay = min(5 + attempt, 30)
+        log(f"NAT gateway still deleting; waiting {delay}s...")
+        time.sleep(delay)
     log("Warning: NAT gateway still present after waiting.")
     return False
 
@@ -1523,6 +1558,9 @@ def ensure_keypair_accessible():
 
 def main(args):
     if args.cleanup:
+        if not args.keep_client:
+            from common.client import cleanup_client
+            cleanup_client(ec2(), args.bench_client_seed or args.seed, STACK)
         cleanup_stack()
         return
     log(f"Starting (apply) for stack: {STACK} in {REGION}")
@@ -1627,9 +1665,8 @@ def main(args):
     log("Done.")
     print(f"\nNext: provision a benchmark client in this VPC:")
     print(f"  python3 -m common.client --seed {SEED} --server-type valkey --size small")
-    print(f"\nCleanup (server only -- client cleaned separately):")
+    print(f"\nCleanup (server + matching benchmark client):")
     print(f"  python3 valkey/setup.py --cleanup --seed {SEED}")
-    print(f"  python3 -m common.client --cleanup --seed {SEED} --server-type valkey")
 
 
 if __name__ == "__main__":
