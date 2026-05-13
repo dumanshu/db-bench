@@ -146,6 +146,20 @@ def generate_sysbench_script(params: dict) -> tuple[str, str]:
             echo ">>> Phase cleanup completed with exit code $?"
         """)
 
+    preflight_block = ""
+    if server_type == "tidb":
+        pw_mysql = f"-p'{password}'" if password else ""
+        preflight_block = dedent(f"""\
+            update_status "preflight" "" ""
+            echo ">>> TiDB preflight: disabling 1PC and async commit"
+            mysql -h '{endpoint}' -P {port} -u {user} {pw_mysql} -e "
+            SET GLOBAL tidb_enable_1pc = OFF;
+            SET GLOBAL tidb_enable_async_commit = OFF;
+            SET GLOBAL tidb_enable_resource_control = OFF;
+            SELECT @@GLOBAL.tidb_enable_1pc, @@GLOBAL.tidb_enable_async_commit;
+            " 2>&1
+        """)
+
     script = f"""#!/usr/bin/env bash
 # Auto-generated benchmark runner -- do not edit
 # Server type : {server_type}
@@ -206,6 +220,7 @@ echo "============================================================"
 echo ""
 
 # --- prepare -------------------------------------------------------
+{preflight_block}
 {prepare_block}
 # --- run -----------------------------------------------------------
 {run_block}

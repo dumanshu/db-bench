@@ -79,6 +79,7 @@ Provisions a multi-AZ TiDB cluster on EC2 via k3s and TiDB Operator, with option
 - **Instance tiers**: `--production` (default, PingCAP-recommended) or `--benchmark-mode` (cost-optimized)
 - **Dedicated VMs**: Each TiKV pod consumes the entire EC2 instance
 - **TiCDC replication**: Deploys upstream + downstream clusters with changefeed lag measurement
+- **Synchronous commit path for benchmarks**: TiDB 1PC and async commit are disabled by setup and benchmark preflight so default benchmark runs do not use those commit-latency optimizations
 - **Benchmark profiles**: quick, light, standard, heavy, stress, scaling
 - **Workloads**: oltp_read_write, oltp_read_only, oltp_write_only, oltp_point_select, oltp_insert, oltp_delete, oltp_update_index, oltp_update_non_index
 
@@ -224,7 +225,9 @@ The DSQL sysbench JSON includes the normal sysbench transaction metrics (`tps`, 
 - `query_latency_ms`: client-side latency by stable query template key, with `type`, `category`, and the raw Lua SQL template string
 - `read_qps`, `write_qps`, and `other_qps` on interval samples when sysbench emits `(r/w/o: ...)`
 
-The per-operation and per-template `p50_ms` / `p95_ms` / `p99_ms` values are derived from fixed latency buckets and represent bucket upper bounds. The top-level sysbench percentile is still the configured sysbench percentile; the default benchmark command uses `--percentile=99`, so `latency_p95_ms` can be `null` while `latency_p99_ms` is populated.
+The per-operation and per-template `custom_mixed` stats include counts plus client-side min/avg/max statement latencies by operation category and stable query template. Percentile fields (`latency_p95_ms`, `latency_p99_ms`) come from sysbench's overall event latency reporting; the custom per-template stats no longer emit bucketed percentile estimates. The default benchmark command uses `--percentile=99`, so top-level `latency_p95_ms` can be `null` while `latency_p99_ms` is populated.
+
+Aurora DSQL commit acknowledgement is synchronous to the DSQL journal quorum: the client sees commit success after the transaction is durably recorded in the replicated journal. Storage-node materialization follows the journal after commit, but that post-commit propagation does not weaken the commit acknowledgement boundary.
 
 DSQL does not support `pg_database_size`, so DB-size-derived storage numbers can be zero in local result JSON. Local result JSON/CSV/log artifacts are intentionally gitignored and should not be committed.
 

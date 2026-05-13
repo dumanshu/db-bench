@@ -1249,9 +1249,16 @@ done
 mysql -h "$TIDB_HOST" -P "$TIDB_PORT" -u root -e "CREATE DATABASE IF NOT EXISTS sbtest;"
 mysql -h "$TIDB_HOST" -P "$TIDB_PORT" -u root -e "SHOW DATABASES;"
 
+# Disable TiDB 1PC and async commit so benchmark defaults use the
+# synchronous 2PC commit path. Runs can explicitly change these globals when
+# measuring TiDB commit-latency optimizations.
+mysql -h "$TIDB_HOST" -P "$TIDB_PORT" -u root -e "SET GLOBAL tidb_enable_1pc = OFF;" 2>/dev/null || true
+mysql -h "$TIDB_HOST" -P "$TIDB_PORT" -u root -e "SET GLOBAL tidb_enable_async_commit = OFF;" 2>/dev/null || true
+
 # Disable resource control to avoid error 8249 (Unknown resource group 'default')
 # Resource control is not needed for benchmarking and causes sysbench FATAL errors
 mysql -h "$TIDB_HOST" -P "$TIDB_PORT" -u root -e "SET GLOBAL tidb_enable_resource_control = OFF;" 2>/dev/null || true
+mysql -h "$TIDB_HOST" -P "$TIDB_PORT" -u root -N -e "SELECT @@GLOBAL.tidb_enable_1pc, @@GLOBAL.tidb_enable_async_commit;" 2>/dev/null || true
 echo "Resource control disabled"
 """, ctx)
 
