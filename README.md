@@ -144,14 +144,17 @@ AWS_PROFILE=sandbox python3 -m valkey.setup --valkey-nodes 3
 # Validate cluster health
 AWS_PROFILE=sandbox python3 -m valkey.validate
 
-# Benchmark (requires client public IP from setup output)
+# Provision reusable benchmark client in the Valkey VPC
+AWS_PROFILE=sandbox python3 -m common.client --seed vlklt-001 --server-type valkey --size small
+
+# Benchmark through Envoy/NLB (client auto-discovered by tags)
 AWS_PROFILE=sandbox python3 -m valkey.benchmark \
-  --ssh-host <CLIENT_PUBLIC_IP> \
+  --seed vlklt-001 \
   --mode proxy
 
 # Benchmark directly against Valkey (bypassing Envoy)
 AWS_PROFILE=sandbox python3 -m valkey.benchmark \
-  --ssh-host <CLIENT_PUBLIC_IP> \
+  --seed vlklt-001 \
   --target-host <VALKEY_PRIVATE_IP> \
   --mode valkey
 
@@ -159,13 +162,15 @@ AWS_PROFILE=sandbox python3 -m valkey.benchmark \
 AWS_PROFILE=sandbox python3 -m valkey.setup --cleanup
 ```
 
+Benchmark clients are discovered from AWS tags (`ClientSeed`, `Role=bench-client`), not local client state JSON. `--bench-client-seed` defaults to `--seed`; use it when intentionally driving a public endpoint such as DSQL from a client created for another stack. Server-stack cleanup removes the benchmark client for `--bench-client-seed` unless `--keep-client` is passed.
+
 ## DSQL
 
 Benchmarks Amazon Aurora DSQL, a serverless PostgreSQL-compatible database, using sysbench (PostgreSQL driver) with IAM authentication.
 
 ### Features
 
-- **Serverless**: No server EC2 to provision -- only a client VM and a DSQL cluster via AWS API
+- **Serverless**: No server EC2 to provision -- DSQL setup creates the cluster and optional client VPC; benchmark clients are managed by `common.client`
 - **sysbench (unified)**: Same sysbench pipeline as TiDB/Aurora MySQL/Aurora PG (`--db-driver=pgsql`), with custom Lua workloads ported to PostgreSQL-compatible engines for cross-engine comparison
 - **IAM auth tokens**: Automatic token generation and refresh for runs exceeding 15 minutes
 - **CloudWatch metrics**: Captures DSQL-specific server-side metrics (DPU, OCC conflicts, commit latency, storage)
@@ -175,8 +180,11 @@ Benchmarks Amazon Aurora DSQL, a serverless PostgreSQL-compatible database, usin
 ### Quick Start
 
 ```bash
-# Provision (client VM + DSQL cluster)
+# Provision DSQL cluster and client VPC
 AWS_PROFILE=sandbox python3 -m dsql.setup --seed dsqllt-001
+
+# Provision reusable benchmark client
+AWS_PROFILE=sandbox python3 -m common.client --seed dsqllt-001 --server-type dsql --size small
 
 # Validate
 AWS_PROFILE=sandbox python3 -m dsql.validate --seed dsqllt-001
@@ -185,9 +193,6 @@ AWS_PROFILE=sandbox python3 -m dsql.validate --seed dsqllt-001
 AWS_PROFILE=sandbox DB_PROFILE=sandbox-storage python3 -m dsql.benchmark \
   --action run \
   --seed dsqllt-001 \
-  --host <CLIENT_PUBLIC_IP> \
-  --dsql-cluster-id <DSQL_CLUSTER_ID> \
-  --dsql-cluster-endpoint <DSQL_ENDPOINT> \
   --dsql-region us-east-1 \
   --dsql-db-profile sandbox-storage \
   --aws-profile sandbox \
@@ -197,9 +202,6 @@ AWS_PROFILE=sandbox DB_PROFILE=sandbox-storage python3 -m dsql.benchmark \
 AWS_PROFILE=sandbox DB_PROFILE=sandbox-storage python3 -m dsql.benchmark \
   --action run \
   --seed dsqllt-001 \
-  --host <CLIENT_PUBLIC_IP> \
-  --dsql-cluster-id <DSQL_CLUSTER_ID> \
-  --dsql-cluster-endpoint <DSQL_ENDPOINT> \
   --dsql-region us-east-1 \
   --dsql-db-profile sandbox-storage \
   --aws-profile sandbox \
