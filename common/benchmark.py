@@ -17,22 +17,86 @@ from typing import Optional, Callable
 
 from common.aws import DEFAULT_SSH_KEY_PATH
 from common.ssh import ssh_run_simple, ssh_capture_simple, scp_put_simple
-from common.util import log
+from common.util import BOTO_CONFIG, log
 
 # ---------------------------------------------------------------------------
-# Bench-client state discovery
+# Bench-client discovery
 # ---------------------------------------------------------------------------
 
-def _load_bench_client(seed):
-    """Try to load bench-client state from common/client-{seed}-state.json.
+PRIVATE_CLIENT_SERVER_TYPES = {"aurora", "aurora-pg", "tidb", "valkey"}
 
-    Returns dict with ``public_ip`` and ``key_path`` keys, or empty dict.
+
+def _bench_client_seed(args, default_seed):
+    return (getattr(args, "bench_client_seed", None)
+            or os.environ.get("BENCH_CLIENT_SEED")
+            or default_seed)
+
+
+def _load_bench_client_for_args(args, default_seed):
+    """Discover benchmark client from AWS tags.
+
+    No local JSON state is used.  ``default_seed`` is the server seed;
+    ``--bench-client-seed`` may override it for public-endpoint cases such as
+    DSQL.
     """
-    from common.client import load_state
-    state = load_state(seed)
-    if state and state.get("public_ip") and state.get("key_path"):
-        return state
+    seed = _bench_client_seed(args, default_seed)
+    if not seed:
+        return {}
+
+    server_type = getattr(args, "server_type", "")
+    if (server_type in PRIVATE_CLIENT_SERVER_TYPES and default_seed and
+            seed != default_seed and not getattr(args, "host", None)):
+        raise SystemExit(
+            f"ERROR: --bench-client-seed must match --seed for {server_type}; "
+            "its benchmark endpoint is private to the server VPC."
+        )
+
+    import boto3
+    from common.client import _compute_server_stack, discover_client
+
+    region = (getattr(args, "region", None) or
+              getattr(args, "dsql_region", None) or "us-east-1")
+    profile = getattr(args, "aws_profile", None) or "sandbox"
+    session = boto3.Session(profile_name=profile, region_name=region)
+    ec2_client = session.client("ec2", config=BOTO_CONFIG)
+    server_stack = None
+    if server_type and default_seed:
+        try:
+            server_stack = _compute_server_stack(server_type, default_seed)
+        except ValueError:
+            server_stack = None
+    client = discover_client(ec2_client, seed, server_stack=server_stack)
+    if client and client.get("public_ip") and client.get("key_path"):
+        return client
     return {}
+
+
+def _discover_dsql_cluster(region, profile, seed):
+    if not seed:
+        return "", ""
+    import boto3
+
+    session = boto3.Session(profile_name=profile, region_name=region)
+    client = session.client("dsql", config=BOTO_CONFIG)
+    expected_project = f"dsql-loadtest-{seed}"
+    token = None
+    while True:
+        kwargs = {"maxResults": 100}
+        if token:
+            kwargs["nextToken"] = token
+        resp = client.list_clusters(**kwargs)
+        for cluster in resp.get("clusters", []):
+            cluster_id = cluster.get("identifier", "")
+            if not cluster_id:
+                continue
+            info = client.get_cluster(identifier=cluster_id)
+            tags = info.get("tags", {}) or {}
+            if tags.get("Project") == expected_project:
+                return cluster_id, info.get("endpoint", "")
+        token = resp.get("nextToken")
+        if not token:
+            break
+    return "", ""
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -71,13 +135,6 @@ ISOLATION_LEVEL_MAP = {
     "read-committed": "READ COMMITTED",
     "repeatable-read": "REPEATABLE READ",
     "serializable": "SERIALIZABLE",
-}
-
-# DSQL pricing (us-east-1, per-million request processing units)
-DSQL_PRICING = {
-    "write_rpu_per_million": 2.25,
-    "read_rpu_per_million": 0.45,
-    "storage_per_gb_month": 0.25,
 }
 
 # Aurora I/O-Optimized pricing: no per-I/O charge, ~30% higher instance cost.
@@ -312,17 +369,11 @@ _INTERVAL_RE = re.compile(
     r'reconn/s:\s+([\d.]+)'
 )
 
-_OP_LATENCY_BUCKETS_MS = [
-    0.1, 0.25, 0.5, 1, 2, 4, 8, 16, 32, 64,
-    128, 256, 512, 1024, 2048, 4096, 8192,
-]
-
 _CUSTOM_MIXED_OP_STATS_RE = re.compile(
     r'CUSTOM_MIXED_OP_STATS\s+tid=(?P<tid>-?\d+)\s+'
     r'op=(?P<op>[a-z_]+)\s+count=(?P<count>\d+)\s+'
     r'total_ms=(?P<total>[\d.]+)\s+min_ms=(?P<min>[\d.]+)\s+'
-    r'avg_ms=(?P<avg>[\d.]+)\s+max_ms=(?P<max>[\d.]+)\s+'
-    r'buckets=(?P<buckets>[\d,]+)'
+    r'avg_ms=(?P<avg>[\d.]+)\s+max_ms=(?P<max>[\d.]+)'
 )
 
 _CUSTOM_MIXED_QUERY_STATS_RE = re.compile(
@@ -331,36 +382,35 @@ _CUSTOM_MIXED_QUERY_STATS_RE = re.compile(
     r'key=(?P<key>\S+)\s+template=(?P<template>.*?)\s+'
     r'count=(?P<count>\d+)\s+total_ms=(?P<total>[\d.]+)\s+'
     r'min_ms=(?P<min>[\d.]+)\s+avg_ms=(?P<avg>[\d.]+)\s+'
-    r'max_ms=(?P<max>[\d.]+)\s+buckets=(?P<buckets>[\d,]+)'
+    r'max_ms=(?P<max>[\d.]+)'
 )
 
 _CUSTOM_MIXED_QUERY_STATS_V1_RE = re.compile(
-    r'CUSTOM_MIXED_QUERY_STATS_V1\ttid=(?P<tid>-?\d+)\t'
+    r'CUSTOM_MIXED_QUERY_STATS_V[12]\ttid=(?P<tid>-?\d+)\t'
     r'type=(?P<type>[^\t]+)\tcategory=(?P<category>[^\t]+)\t'
     r'key=(?P<key>[^\t]+)\ttemplate=(?P<template>.*?)\t'
     r'count=(?P<count>\d+)\ttotal_ms=(?P<total>[\d.]+)\t'
     r'min_ms=(?P<min>[\d.]+)\tavg_ms=(?P<avg>[\d.]+)\t'
-    r'max_ms=(?P<max>[\d.]+)\tbuckets=(?P<buckets>[\d,]+)'
+    r'max_ms=(?P<max>[\d.]+)'
 )
 
 _CUSTOM_MIXED_OP_INTERVAL_V1_RE = re.compile(
-    r'CUSTOM_MIXED_OP_INTERVAL_V1\ttid=(?P<tid>-?\d+)\t'
+    r'CUSTOM_MIXED_OP_INTERVAL_V[12]\ttid=(?P<tid>-?\d+)\t'
     r'minute=(?P<minute>\d+)\tfrom_ms=(?P<from>[\d.]+)\t'
     r'to_ms=(?P<to>[\d.]+)\top=(?P<op>[^\t]+)\t'
     r'count=(?P<count>\d+)\ttotal_ms=(?P<total>[\d.]+)\t'
     r'min_ms=(?P<min>[\d.]+)\tavg_ms=(?P<avg>[\d.]+)\t'
-    r'max_ms=(?P<max>[\d.]+)\tbuckets=(?P<buckets>[\d,]+)'
+    r'max_ms=(?P<max>[\d.]+)'
 )
 
 _CUSTOM_MIXED_QUERY_INTERVAL_V1_RE = re.compile(
-    r'CUSTOM_MIXED_QUERY_INTERVAL_V1\ttid=(?P<tid>-?\d+)\t'
+    r'CUSTOM_MIXED_QUERY_INTERVAL_V[12]\ttid=(?P<tid>-?\d+)\t'
     r'minute=(?P<minute>\d+)\tfrom_ms=(?P<from>[\d.]+)\t'
     r'to_ms=(?P<to>[\d.]+)\ttype=(?P<type>[^\t]+)\t'
     r'category=(?P<category>[^\t]+)\tkey=(?P<key>[^\t]+)\t'
     r'template=(?P<template>.*?)\tcount=(?P<count>\d+)\t'
     r'total_ms=(?P<total>[\d.]+)\tmin_ms=(?P<min>[\d.]+)\t'
-    r'avg_ms=(?P<avg>[\d.]+)\tmax_ms=(?P<max>[\d.]+)\t'
-    r'buckets=(?P<buckets>[\d,]+)'
+    r'avg_ms=(?P<avg>[\d.]+)\tmax_ms=(?P<max>[\d.]+)'
 )
 
 
@@ -400,17 +450,11 @@ def _empty_op_latency() -> dict:
         "min_ms": None,
         "avg_ms": None,
         "max_ms": None,
-        "p50_ms": None,
-        "p95_ms": None,
-        "p99_ms": None,
-        "buckets": [0 for _ in _OP_LATENCY_BUCKETS_MS],
-        "bucket_bounds_ms": list(_OP_LATENCY_BUCKETS_MS),
     }
 
 
 def _merge_latency_line(dest: dict, count: int, total_ms: float,
-                        min_ms: float, max_ms: float,
-                        buckets: list[int]) -> None:
+                        min_ms: float, max_ms: float) -> None:
     dest["count"] += count
     dest["total_ms"] += total_ms
     if count > 0:
@@ -418,8 +462,6 @@ def _merge_latency_line(dest: dict, count: int, total_ms: float,
             dest["min_ms"] = min_ms
         if dest["max_ms"] is None or max_ms > dest["max_ms"]:
             dest["max_ms"] = max_ms
-    for i, value in enumerate(buckets):
-        dest["buckets"][i] += value
 
 
 def _finalize_latency_stats(stats: dict) -> dict:
@@ -430,32 +472,7 @@ def _finalize_latency_stats(stats: dict) -> dict:
             dest["avg_ms"] = round(dest["total_ms"] / count, 3)
             dest["min_ms"] = round(dest["min_ms"], 3)
             dest["max_ms"] = round(dest["max_ms"], 3)
-            dest["p50_ms"] = _bucket_percentile(dest["buckets"], 50)
-            dest["p95_ms"] = _bucket_percentile(dest["buckets"], 95)
-            dest["p99_ms"] = _bucket_percentile(dest["buckets"], 99)
     return stats
-
-
-def _parse_latency_buckets(raw: str) -> list[int]:
-    buckets = [int(v) for v in raw.split(",")]
-    if len(buckets) < len(_OP_LATENCY_BUCKETS_MS):
-        buckets.extend([0] * (len(_OP_LATENCY_BUCKETS_MS) - len(buckets)))
-    elif len(buckets) > len(_OP_LATENCY_BUCKETS_MS):
-        buckets = buckets[:len(_OP_LATENCY_BUCKETS_MS)]
-    return buckets
-
-
-def _bucket_percentile(buckets: list[int], percentile: float) -> Optional[float]:
-    total = sum(buckets)
-    if total <= 0:
-        return None
-    rank = max(1, int((percentile / 100.0) * total + 0.999999))
-    running = 0
-    for bound, count in zip(_OP_LATENCY_BUCKETS_MS, buckets):
-        running += count
-        if running >= rank:
-            return bound
-    return _OP_LATENCY_BUCKETS_MS[-1]
 
 
 def parse_custom_mixed_op_stats(text: str) -> dict:
@@ -467,8 +484,7 @@ def parse_custom_mixed_op_stats(text: str) -> dict:
         total_ms = float(m.group("total"))
         min_ms = float(m.group("min"))
         max_ms = float(m.group("max"))
-        buckets = _parse_latency_buckets(m.group("buckets"))
-        _merge_latency_line(dest, count, total_ms, min_ms, max_ms, buckets)
+        _merge_latency_line(dest, count, total_ms, min_ms, max_ms)
     return _finalize_latency_stats(stats)
 
 
@@ -485,7 +501,6 @@ def parse_custom_mixed_query_stats(text: str) -> dict:
         total_ms = float(m.group("total"))
         min_ms = float(m.group("min"))
         max_ms = float(m.group("max"))
-        buckets = _parse_latency_buckets(m.group("buckets"))
         dest = stats.setdefault(key, _empty_op_latency())
         dest.setdefault("metadata_conflicts", [])
         for meta_key, meta_value in (
@@ -502,7 +517,7 @@ def parse_custom_mixed_query_stats(text: str) -> dict:
                     "existing": existing,
                     "incoming": meta_value,
                 })
-        _merge_latency_line(dest, count, total_ms, min_ms, max_ms, buckets)
+        _merge_latency_line(dest, count, total_ms, min_ms, max_ms)
     finalized = _finalize_latency_stats(stats)
     for dest in finalized.values():
         if not dest.get("metadata_conflicts"):
@@ -530,7 +545,6 @@ def parse_custom_mixed_op_interval_stats(text: str) -> dict:
             float(m.group("total")),
             float(m.group("min")),
             float(m.group("max")),
-            _parse_latency_buckets(m.group("buckets")),
         )
     for entry in minutes.values():
         entry["op_latency_ms"] = _finalize_latency_stats(entry["op_latency_ms"])
@@ -572,7 +586,6 @@ def parse_custom_mixed_query_interval_stats(text: str) -> dict:
             float(m.group("total")),
             float(m.group("min")),
             float(m.group("max")),
-            _parse_latency_buckets(m.group("buckets")),
         )
     for entry in minutes.values():
         finalized = _finalize_latency_stats(entry["query_latency_ms"])
@@ -2767,6 +2780,9 @@ def parse_args():
                    help="AWS profile (default: env AWS_PROFILE or sandbox)")
     p.add_argument("--ssh-key", default=None,
                    help="Path to SSH private key")
+    p.add_argument("--bench-client-seed", default=None,
+                   help="Seed for a reusable common.client benchmark VM "
+                        "(default: same as --seed or BENCH_CLIENT_SEED)")
 
     p.add_argument("--workload", default=None,
                    help="Sysbench workload type (default: server-specific)")
@@ -2903,14 +2919,13 @@ def main():
 # ---------------------------------------------------------------------------
 
 
-def _resolve_host_and_key(args):
-    """Resolve host IP and SSH key path from args and client state."""
+def _resolve_host_and_key(args, default_seed=None):
+    """Resolve host IP and SSH key path from args and AWS tags."""
     import sys
 
-    seed = args.seed
-    server_type = args.server_type
+    seed = args.seed or default_seed
 
-    client_state = _load_bench_client(seed) if seed else {}
+    client_state = _load_bench_client_for_args(args, seed)
 
     if args.host:
         host = args.host
@@ -2928,7 +2943,8 @@ def _resolve_host_and_key(args):
 
     if not host:
         log("ERROR: Could not determine host IP. "
-            "Use --host or ensure client state exists (--seed).")
+            "Use --host or provision a common client with the requested "
+            "--bench-client-seed.")
         sys.exit(1)
 
     return host, key_path
@@ -2947,7 +2963,7 @@ def _build_deploy_params(args):
         password = ""
         workload = args.workload or "oltp_read_write"
 
-        client_state = _load_bench_client(seed)
+        client_state = _load_bench_client_for_args(args, seed)
         if client_state.get("public_ip"):
             from tidb.driver import discover_tidb_endpoint, DEFAULT_REGION, DEFAULT_PROFILE
             region = args.region or DEFAULT_REGION
@@ -3319,7 +3335,7 @@ def _main_aurora(args):
                 or os.environ.get("AURORA_MASTER_PASSWORD", "BenchMark2024!"))
     script_dir = Path(__file__).resolve().parent.parent / "aurora"
 
-    client_state = _load_bench_client(seed)
+    client_state = _load_bench_client_for_args(args, seed)
 
     if args.ssh_key:
         key_path = args.ssh_key
@@ -3743,8 +3759,17 @@ def _main_dsql(args):
     region = args.dsql_region or args.region or "us-east-1"
     aws_profile = args.aws_profile or "sandbox"
     db_profile = args.dsql_db_profile or aws_profile
+    seed = args.seed or "default"
     cluster_id = args.dsql_cluster_id or ""
     endpoint = args.dsql_cluster_endpoint or args.endpoint or ""
+    if not endpoint:
+        try:
+            discovered_id, discovered_endpoint = _discover_dsql_cluster(
+                region, db_profile, seed)
+            cluster_id = cluster_id or discovered_id
+            endpoint = discovered_endpoint
+        except Exception as exc:
+            log(f"WARNING: Could not discover DSQL cluster by tags: {exc}")
 
     if not endpoint:
         raise SystemExit(
@@ -3770,21 +3795,7 @@ def _main_dsql(args):
     threads = resolved["threads"]
     duration = resolved["duration"]
 
-    seed = args.seed or "default"
-    client_state = _load_bench_client(seed)
-
-    if args.ssh_key:
-        key_path = args.ssh_key
-    elif client_state.get("key_path"):
-        key_path = client_state["key_path"]
-    else:
-        key_path = str(DEFAULT_SSH_KEY_PATH)
-
-    host = args.host or client_state.get("public_ip", "")
-    if not host:
-        log("ERROR: Could not determine host IP. "
-            "Use --host or ensure client state exists (--seed).")
-        sys.exit(1)
+    host, key_path = _resolve_host_and_key(args, seed)
 
     token_mgr = _DsqlTokenManager(endpoint=endpoint, region=region,
                                    profile=db_profile)
@@ -3977,9 +3988,7 @@ def _main_dsql(args):
                 continue
             log(
                 f"    {op:<6} count={stats.get('count')} "
-                f"avg={stats.get('avg_ms')} p50={stats.get('p50_ms')} "
-                f"p95={stats.get('p95_ms')} p99={stats.get('p99_ms')} "
-                f"max={stats.get('max_ms')}"
+                f"avg={stats.get('avg_ms')} max={stats.get('max_ms')}"
             )
     query_latency = combined.get("query_latency_ms") or {}
     if query_latency:
@@ -3991,9 +4000,8 @@ def _main_dsql(args):
             log(
                 f"    {key:<18} type={stats.get('type')} "
                 f"category={stats.get('category')} count={stats.get('count')} "
-                f"avg={stats.get('avg_ms')} p50={stats.get('p50_ms')} "
-                f"p95={stats.get('p95_ms')} p99={stats.get('p99_ms')} "
-                f"max={stats.get('max_ms')} template={stats.get('template')}"
+                f"avg={stats.get('avg_ms')} max={stats.get('max_ms')} "
+                f"template={stats.get('template')}"
             )
     if combined.get("segments"):
         log(f"  Segments:         {combined['segments']}")
@@ -4003,7 +4011,7 @@ def _main_dsql(args):
     if not args.skip_cloudwatch and cluster_id:
         log("")
         log("Collecting DSQL CloudWatch metrics...")
-        cw_end = bench_end + timedelta(minutes=2)
+        cw_end = bench_end
         combined["cloudwatch_window"] = {
             "start_utc": bench_start.isoformat(),
             "end_utc": cw_end.isoformat(),
@@ -4110,20 +4118,7 @@ def _main_aurora_pg(args):
             "ERROR: Aurora PG endpoint required. Use --endpoint.")
 
     seed = args.seed or "default"
-    client_state = _load_bench_client(seed)
-
-    if args.ssh_key:
-        key_path = args.ssh_key
-    elif client_state.get("key_path"):
-        key_path = client_state["key_path"]
-    else:
-        key_path = str(DEFAULT_SSH_KEY_PATH)
-
-    host = args.host or client_state.get("public_ip", "")
-    if not host:
-        log("ERROR: Could not determine host IP. "
-            "Use --host or ensure client state exists (--seed).")
-        sys.exit(1)
+    host, key_path = _resolve_host_and_key(args, seed)
 
     log("=" * 70)
     log("Aurora PostgreSQL Sysbench Benchmark")
@@ -4364,10 +4359,10 @@ def _main_tidb(args):
     downstream_port = (args.downstream_port if args.downstream_port is not None
                        else INTERNAL_SERVICE_PORT)
 
-    client_state = _load_bench_client(seed)
+    client_state = _load_bench_client_for_args(args, seed)
 
     if not args.host and client_state.get("public_ip"):
-        log("Using bench-client from state file for sysbench: "
+        log("Using bench-client discovered by AWS tags for sysbench: "
             f"{client_state['public_ip']}")
 
     if args.ssh_key:
@@ -4429,7 +4424,7 @@ def _run_tidb_benchmark(
     if not key_path.exists():
         raise SystemExit(f"ERROR: SSH key not found: {key_path}")
 
-    client_state = _load_bench_client(seed)
+    client_state = _load_bench_client_for_args(args, seed)
     all_nodes_cache = None
     if not client_state.get("public_ip"):
         try:
@@ -4526,7 +4521,10 @@ def _run_tidb_benchmark(
     log("Disabling TiDB resource control (avoids error 8249)...")
     ssh_run(host, f"""
 mysql -h {db_host} -P {port} -u root -e \
-"SET GLOBAL tidb_enable_resource_control = OFF;" 2>/dev/null || true
+"SET GLOBAL tidb_enable_1pc = OFF;
+ SET GLOBAL tidb_enable_async_commit = OFF;
+ SET GLOBAL tidb_enable_resource_control = OFF;
+ SELECT @@GLOBAL.tidb_enable_1pc, @@GLOBAL.tidb_enable_async_commit;" 2>/dev/null || true
 """, key_path, strict=False)
 
     # Initialize cost tracker

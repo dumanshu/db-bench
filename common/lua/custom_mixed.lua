@@ -29,7 +29,6 @@ int clock_gettime(int clk_id, struct timespec *tp);
 
 local CLOCK_MONOTONIC = 1
 local ts = ffi.new("struct timespec[1]")
-local latency_buckets_ms = {0.1, 0.25, 0.5, 1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096, 8192}
 local op_stats = nil
 local query_stats = nil
 local interval_op_stats = nil
@@ -43,9 +42,8 @@ local query_templates = {
     insert_row = {type = "write", category = "insert", template = "INSERT INTO %s (k, c, pad) VALUES (%d, '%s', '%s')"},
     update_by_id = {type = "write", category = "update", template = "UPDATE %s SET k = k + 1 WHERE id = %d"},
     delete_by_id = {type = "write", category = "delete", template = "DELETE FROM %s WHERE id = %d"},
-    delete_by_id_limit = {type = "write", category = "delete", template = "DELETE FROM %s WHERE id = %d LIMIT 1"},
 }
-local query_order = {"select_by_id", "insert_row", "update_by_id", "delete_by_id", "delete_by_id_limit"}
+local query_order = {"select_by_id", "insert_row", "update_by_id", "delete_by_id"}
 local category_order = {"select", "insert", "update", "delete"}
 
 local function now_ms()
@@ -54,11 +52,7 @@ local function now_ms()
 end
 
 local function new_stats()
-    local buckets = {}
-    for i = 1, #latency_buckets_ms do
-        buckets[i] = 0
-    end
-    return {count = 0, total_ms = 0, min_ms = nil, max_ms = 0, buckets = buckets}
+    return {count = 0, total_ms = 0, min_ms = nil, max_ms = 0}
 end
 
 local function init_op_stats()
@@ -97,13 +91,6 @@ local function update_stats(stats, latency_ms)
     if latency_ms > stats.max_ms then
         stats.max_ms = latency_ms
     end
-    for i = 1, #latency_buckets_ms do
-        if latency_ms <= latency_buckets_ms[i] then
-            stats.buckets[i] = stats.buckets[i] + 1
-            return
-        end
-    end
-    stats.buckets[#stats.buckets] = stats.buckets[#stats.buckets] + 1
 end
 
 local function record_latency(category, query_key, latency_ms)
@@ -126,9 +113,8 @@ local function print_stats_line(prefix, tid, stats, extra)
         avg_ms = stats.total_ms / stats.count
     end
     print(string.format(
-        "%s tid=%d %s count=%d total_ms=%.3f min_ms=%.3f avg_ms=%.3f max_ms=%.3f buckets=%s",
-        prefix, tid, extra, stats.count, stats.total_ms, min_ms, avg_ms, stats.max_ms,
-        table.concat(stats.buckets, ",")))
+        "%s tid=%d %s count=%d total_ms=%.3f min_ms=%.3f avg_ms=%.3f max_ms=%.3f",
+        prefix, tid, extra, stats.count, stats.total_ms, min_ms, avg_ms, stats.max_ms))
 end
 
 local function print_query_stats_line(tid, key)
@@ -140,10 +126,9 @@ local function print_query_stats_line(tid, key)
         avg_ms = stats.total_ms / stats.count
     end
     print(string.format(
-        "CUSTOM_MIXED_QUERY_STATS_V1\ttid=%d\ttype=%s\tcategory=%s\tkey=%s\ttemplate=%s\tcount=%d\ttotal_ms=%.3f\tmin_ms=%.3f\tavg_ms=%.3f\tmax_ms=%.3f\tbuckets=%s",
+        "CUSTOM_MIXED_QUERY_STATS_V2\ttid=%d\ttype=%s\tcategory=%s\tkey=%s\ttemplate=%s\tcount=%d\ttotal_ms=%.3f\tmin_ms=%.3f\tavg_ms=%.3f\tmax_ms=%.3f",
         tid, spec.type, spec.category, key, spec.template, stats.count,
-        stats.total_ms, min_ms, avg_ms, stats.max_ms,
-        table.concat(stats.buckets, ",")))
+        stats.total_ms, min_ms, avg_ms, stats.max_ms))
 end
 
 local function print_interval_op_stats_line(tid, minute, from_ms, to_ms, category)
@@ -153,9 +138,9 @@ local function print_interval_op_stats_line(tid, minute, from_ms, to_ms, categor
     end
     local avg_ms = stats.total_ms / stats.count
     print(string.format(
-        "CUSTOM_MIXED_OP_INTERVAL_V1\ttid=%d\tminute=%d\tfrom_ms=%.0f\tto_ms=%.0f\top=%s\tcount=%d\ttotal_ms=%.3f\tmin_ms=%.3f\tavg_ms=%.3f\tmax_ms=%.3f\tbuckets=%s",
+        "CUSTOM_MIXED_OP_INTERVAL_V2\ttid=%d\tminute=%d\tfrom_ms=%.0f\tto_ms=%.0f\top=%s\tcount=%d\ttotal_ms=%.3f\tmin_ms=%.3f\tavg_ms=%.3f\tmax_ms=%.3f",
         tid, minute, from_ms, to_ms, category, stats.count, stats.total_ms,
-        stats.min_ms or 0, avg_ms, stats.max_ms, table.concat(stats.buckets, ",")))
+        stats.min_ms or 0, avg_ms, stats.max_ms))
 end
 
 local function print_interval_query_stats_line(tid, minute, from_ms, to_ms, key)
@@ -166,10 +151,10 @@ local function print_interval_query_stats_line(tid, minute, from_ms, to_ms, key)
     local spec = query_templates[key]
     local avg_ms = stats.total_ms / stats.count
     print(string.format(
-        "CUSTOM_MIXED_QUERY_INTERVAL_V1\ttid=%d\tminute=%d\tfrom_ms=%.0f\tto_ms=%.0f\ttype=%s\tcategory=%s\tkey=%s\ttemplate=%s\tcount=%d\ttotal_ms=%.3f\tmin_ms=%.3f\tavg_ms=%.3f\tmax_ms=%.3f\tbuckets=%s",
+        "CUSTOM_MIXED_QUERY_INTERVAL_V2\ttid=%d\tminute=%d\tfrom_ms=%.0f\tto_ms=%.0f\ttype=%s\tcategory=%s\tkey=%s\ttemplate=%s\tcount=%d\ttotal_ms=%.3f\tmin_ms=%.3f\tavg_ms=%.3f\tmax_ms=%.3f",
         tid, minute, from_ms, to_ms, spec.type, spec.category, key,
         spec.template, stats.count, stats.total_ms, stats.min_ms or 0,
-        avg_ms, stats.max_ms, table.concat(stats.buckets, ",")))
+        avg_ms, stats.max_ms))
 end
 
 local function reset_interval_stats()
@@ -258,14 +243,8 @@ function event()
         timed_query("update", "update_by_id",
             string.format(query_templates.update_by_id.template, table_name, id))
     else
-        local driver = drv:name()
-        if driver == "pgsql" then
-            timed_query("delete", "delete_by_id",
-                string.format(query_templates.delete_by_id.template, table_name, id))
-        else
-            timed_query("delete", "delete_by_id_limit",
-                string.format(query_templates.delete_by_id_limit.template, table_name, id))
-        end
+        timed_query("delete", "delete_by_id",
+            string.format(query_templates.delete_by_id.template, table_name, id))
     end
 
     maybe_print_interval_stats()

@@ -124,6 +124,25 @@ def discover_valkey_ip(region: str, profile: Optional[str], seed: str) -> str:
     return candidates[0][1]
 
 
+def discover_valkey_endpoint(region: str, profile: Optional[str], seed: str) -> str:
+    session = boto3.session.Session(profile_name=profile, region_name=region)
+    client = session.client("elbv2")
+    expected_name = f"valkey-loadtest-{seed}-nlb"
+    resp = client.describe_load_balancers()
+    for lb in resp.get("LoadBalancers", []):
+        if lb.get("LoadBalancerName") == expected_name:
+            return lb.get("DNSName", "")
+    raise SystemExit(
+        f"ERROR: Unable to discover Valkey NLB {expected_name}; specify --target-host."
+    )
+
+
+def load_bench_client(seed: str, region: str, profile: Optional[str]):
+    from common.client import discover_client
+    client = discover_client(ec2_client(profile, region), seed)
+    return client or {}
+
+
 def scp_from(
     host: str,
     user: str,
@@ -182,7 +201,7 @@ def stream_process_output(proc: subprocess.Popen, log_path: Path):
 
 def parse_args():
     parser = argparse.ArgumentParser(description="Run valkey-benchmark and capture a flamegraph.")
-    parser.add_argument("--target-host", default=DEFAULT_TARGET, help="Host/IP to benchmark. Required for proxy mode; auto-discovered for valkey mode when omitted.")
+    parser.add_argument("--target-host", default=DEFAULT_TARGET, help="Host/IP to benchmark. Auto-discovers the NLB in proxy mode or a node in valkey mode when omitted.")
     parser.add_argument("--target-port", type=int, default=DEFAULT_PORT, help="Valkey/Envoy TCP port (default: 6379)")
     parser.add_argument(
         "--mode",
@@ -198,9 +217,10 @@ def parse_args():
     parser.add_argument("--random-range", type=int, default=3_000_000, help="Key range (-r).")
     parser.add_argument("--threads", type=int, default=6, help="valkey-benchmark --threads value.")
     parser.add_argument("--data-size", type=int, default=1024, help="Payload size (-d).")
-    parser.add_argument("--ssh-host", required=True, help="Host where valkey-benchmark should be executed (e.g., client bastion).")
+    parser.add_argument("--ssh-host", help="Host where valkey-benchmark should be executed (default: discover common.client VM by AWS tags).")
     parser.add_argument("--ssh-user", default="ec2-user", help="SSH user for benchmark host (default: ec2-user).")
     parser.add_argument("--ssh-key", type=Path, help="Path to SSH private key for benchmark host.")
+    parser.add_argument("--bench-client-seed", default=None, help="Seed for a reusable common.client benchmark VM (default: --seed or BENCH_CLIENT_SEED).")
     parser.add_argument("--log-file", type=Path, default=Path("valkey-benchmark.log"), help="Local file to store benchmark output.")
     parser.add_argument("--profile-delay", type=int, default=60, help="Seconds to wait before capturing perf data.")
     parser.add_argument("--profile-duration", type=int, default=30, help="Duration (seconds) of perf capture.")
@@ -285,14 +305,36 @@ def upload_flamegraph_to_s3(local_path: Path, bucket: str, prefix: str, profile:
 
 def main():
     args = parse_args()
+    bench_client_seed = args.bench_client_seed or os.environ.get("BENCH_CLIENT_SEED") or args.seed
+    if bench_client_seed != args.seed and not args.target_host:
+        raise SystemExit(
+            "ERROR: --bench-client-seed must match --seed for Valkey "
+            "auto-discovery because the NLB/node endpoint is private to the "
+            "server VPC. Pass --target-host only if you have configured "
+            "network reachability yourself."
+        )
+    client_state = load_bench_client(bench_client_seed, args.region, args.aws_profile)
+    if not args.ssh_host and client_state.get("public_ip"):
+        args.ssh_host = client_state["public_ip"]
+        print(f"Using benchmark client discovered by AWS tags: {args.ssh_host}")
+    if not args.ssh_key and client_state.get("key_path"):
+        args.ssh_key = Path(client_state["key_path"])
+
     if args.mode == "valkey" and not args.target_host:
         print("Discovering Valkey node IP via AWS tags...")
         args.target_host = discover_valkey_ip(args.region, args.aws_profile, args.seed)
         print(f"Discovered Valkey host: {args.target_host}")
+    elif not args.target_host:
+        print("Discovering Valkey NLB endpoint via AWS tags...")
+        args.target_host = discover_valkey_endpoint(args.region, args.aws_profile, args.seed)
+        print(f"Discovered Valkey endpoint: {args.target_host}")
     if not args.target_host:
         raise SystemExit(
-            "ERROR: --target-host is required for proxy mode. Use --mode "
-            "valkey to auto-discover a Valkey node by --seed.")
+            "ERROR: --target-host is required; auto-discovery did not find a target.")
+    if not args.ssh_host:
+        raise SystemExit(
+            "ERROR: --ssh-host is required. Pass --ssh-host or provision "
+            "python3 -m common.client --server-type valkey --seed <seed>.")
     target_cmd = build_benchmark_command(args)
     print(f"Executing benchmark command: {target_cmd}")
 

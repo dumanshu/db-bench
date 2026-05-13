@@ -5,69 +5,37 @@ _sys.path.insert(0, _os.path.join(_os.path.dirname(__file__), ".."))
 DSQL Load Test Stack Provisioner
 
 Provisions AWS infrastructure for benchmarking Amazon Aurora DSQL:
-- 1 client EC2 (sysbench runner, Amazon Linux 2023 ARM64)
 - 1 DSQL cluster (managed serverless, created via AWS API)
-- VPC/subnet/SG for the client VM
-- Security group rules for SSH access and DSQL connectivity (port 5432)
+- VPC/subnet/SG where an optional common benchmark client can be provisioned
 
 DSQL is a fully managed serverless database -- there are no server EC2 instances
-to provision.  The client VM runs sysbench (PostgreSQL driver) against the DSQL
-endpoint using IAM authentication tokens, via the unified sysbench pipeline in
-``common.benchmark`` (see commit a348732).
+to provision.  Benchmark clients are provisioned through ``common.client`` and
+discovered by AWS tags, not local state files.
 """
 
 import argparse
 import botocore
-import json
 import os
-import time
-from dataclasses import dataclass
-from pathlib import Path
 
 import common.util as _cu
 import common.aws as _caws
 from common.util import (
-    ts, log, need_cmd, my_public_cidr, aws_session, db_session, ec2, ssm,
-    tags_common,
+    log, my_public_cidr, db_session, ec2, tags_common,
     configure_from_args as _common_configure_from_args,
     BOTO_CONFIG,
 )
-from common.types import InstanceInfo
 from common.aws import (
     ensure_vpc as _common_ensure_vpc,
     ensure_igw, ensure_subnet, ensure_public_rtb,
-    ensure_sg, ensure_ingress_tcp_cidr, refresh_ssh_rule,
-    ensure_instance as _common_ensure_instance,
-    ensure_keypair as _common_ensure_keypair,
-    instance_info_from_id,
+    ensure_sg, refresh_ssh_rule,
     cleanup_stack as _common_cleanup_stack,
 )
-from common.ssh import ssh_run, ssh_capture, wait_for_ssh
 
 SEED = "dsqllt-001"
-
-# Client instance types
-CLIENT_INSTANCE_TYPE = "c8g.4xlarge"        # 16 vCPU, 32GB -- sysbench client
-PRODUCTION_CLIENT_TYPE = "c8g.4xlarge"      # 16 vCPU, 32GB
 
 # Network
 VPC_CIDR = "10.44.0.0/16"
 PUB_CIDR = "10.44.1.0/24"
-DSQL_PORT = 5432
-
-# AMI
-AMI_OVERRIDE = os.environ.get("DSQL_AMI_ID")
-AMI_SSM_PARAM = os.environ.get(
-    "DSQL_AMI_PARAM",
-    "/aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-arm64",
-)
-_RESOLVED_AMI_ID = None
-
-from common.aws import KEY_NAME, DEFAULT_SSH_KEY_PATH
-
-# State file -- persists cluster info between setup / benchmark / validate
-STATE_FILE = Path(__file__).resolve().with_name("dsql-state.json")
-
 
 # ---------------------------------------------------------------------------
 # CLI
@@ -75,27 +43,25 @@ STATE_FILE = Path(__file__).resolve().with_name("dsql-state.json")
 
 def parse_args():
     parser = argparse.ArgumentParser(
-        description="Provision DSQL load test stack (client VM + DSQL cluster)."
+        description="Provision DSQL load test stack (DSQL cluster plus optional client VM)."
     )
     parser.add_argument("--region", default=_cu.REGION, help="AWS region (default: us-east-1)")
     parser.add_argument("--seed", default=SEED, help="Unique seed used in stack name.")
     parser.add_argument("--owner", default=os.environ.get("OWNER", ""), help="Owner tag value.")
-    parser.add_argument(
-        "--ssh-private-key-path",
-        dest="ssh_key_path",
-        default=str(DEFAULT_SSH_KEY_PATH),
-        help=f"Path to SSH private key (.pem) (default: {DEFAULT_SSH_KEY_PATH}).",
-    )
     parser.add_argument("--ssh-cidr", help="CIDR allowed for SSH (default: detected public IP /32).")
     parser.add_argument("--aws-profile", help="AWS profile for infrastructure (EC2/VPC).")
     parser.add_argument("--db-profile", help="AWS profile for database service APIs (default: sandbox-storage).")
-    parser.add_argument("--skip-bootstrap", action="store_true", help="Provision infrastructure only.")
-    parser.add_argument("--cleanup", action="store_true", help="Tear down stack resources.")
     parser.add_argument(
-        "--production",
-        action="store_true",
-        help="Use larger client instance type for production benchmarks.",
+        "--bench-client-seed",
+        default=None,
+        help="Benchmark client seed to clean up (default: --seed).",
     )
+    parser.add_argument(
+        "--keep-client",
+        action="store_true",
+        help="Do not clean the benchmark client during --cleanup.",
+    )
+    parser.add_argument("--cleanup", action="store_true", help="Tear down stack resources.")
     parser.add_argument(
         "--deletion-protection",
         action="store_true",
@@ -115,67 +81,8 @@ def configure_from_args(args):
     _caws.REGION = _cu.REGION
 
 
-# ---------------------------------------------------------------------------
-# AMI / Key pair
-# ---------------------------------------------------------------------------
-
-def resolved_ami_id():
-    global _RESOLVED_AMI_ID
-    if AMI_OVERRIDE:
-        return AMI_OVERRIDE
-    if _RESOLVED_AMI_ID:
-        return _RESOLVED_AMI_ID
-    try:
-        param = ssm().get_parameter(Name=AMI_SSM_PARAM)
-        value = param["Parameter"]["Value"]
-        _RESOLVED_AMI_ID = value
-        log(f"Using Amazon Linux 2023 AMI via {AMI_SSM_PARAM}: {value}")
-        return value
-    except botocore.exceptions.ClientError as exc:
-        msg = exc.response.get("Error", {}).get("Message", str(exc))
-        raise SystemExit(
-            f"ERROR: Unable to resolve AMI from SSM ({AMI_SSM_PARAM}): {msg}. "
-            "Set DSQL_AMI_ID to override."
-        )
-
-
-def ensure_keypair_accessible():
-    _common_ensure_keypair(KEY_NAME, DEFAULT_SSH_KEY_PATH)
-
-
-# ---------------------------------------------------------------------------
-# Data classes
-# ---------------------------------------------------------------------------
-
-@dataclass
-class BootstrapContext:
-    ssh_key_path: Path
-    self_cidr: str
-    client: InstanceInfo
-    jump_host: InstanceInfo = None  # No jump host for DSQL; set to client
-    dsql_cluster_id: str = ""
-    dsql_endpoint: str = ""
-
-    def __post_init__(self):
-        if self.jump_host is None:
-            self.jump_host = self.client
-
-
-# ---------------------------------------------------------------------------
-# EC2
-# ---------------------------------------------------------------------------
-
 def ensure_vpc():
     return _common_ensure_vpc(VPC_CIDR)
-
-
-def ensure_instance(name, role, itype, subnet_id, sg_id, root_volume_size=100):
-    """Wrapper: delegate to common ensure_instance with dsql-specific AMI/key."""
-    return _common_ensure_instance(
-        name, role, itype, subnet_id, sg_id,
-        resolved_ami_id, KEY_NAME, ensure_keypair_accessible,
-        root_volume_size,
-    )
 
 
 # ---------------------------------------------------------------------------
@@ -245,100 +152,30 @@ def delete_dsql_cluster(cluster_id):
 
 
 def find_dsql_cluster():
-    """Try to find an existing DSQL cluster from state file or by listing."""
-    if STATE_FILE.exists():
-        try:
-            state = json.loads(STATE_FILE.read_text())
-            cid = state.get("cluster_id", "")
-            ep = state.get("endpoint", "")
-            if cid:
-                # Verify it still exists
-                try:
-                    info = dsql_client().get_cluster(identifier=cid)
-                    status = info.get("status", "")
-                    ep = info.get("endpoint", ep)
-                    if status in ("ACTIVE", "CREATING", "UPDATING"):
-                        log(f"REUSED  DSQL cluster from state: {cid} (status: {status})")
-                        return cid, ep
-                except botocore.exceptions.ClientError:
-                    pass
-        except (json.JSONDecodeError, OSError):
-            pass
-    return None, None
-
-
-def generate_auth_token(endpoint):
-    """Generate an IAM auth token for DSQL admin access."""
+    """Try to find an existing DSQL cluster by AWS tags."""
     client = dsql_client()
-    token = client.generate_db_connect_admin_auth_token(
-        Hostname=endpoint,
-        Region=_cu.REGION,
-        ExpiresIn=900,
-    )
-    return token
-
-
-# ---------------------------------------------------------------------------
-# State persistence
-# ---------------------------------------------------------------------------
-
-def save_state(cluster_id, endpoint, client_instance_id, client_ip):
-    state = {
-        "stack": _cu.STACK,
-        "region": _cu.REGION,
-        "cluster_id": cluster_id,
-        "endpoint": endpoint,
-        "client_instance_id": client_instance_id,
-        "client_ip": client_ip,
-        "created_at": ts(),
-    }
-    STATE_FILE.write_text(json.dumps(state, indent=2))
-    log(f"State saved to {STATE_FILE}")
-
-
-def load_state():
-    if not STATE_FILE.exists():
-        return None
-    try:
-        return json.loads(STATE_FILE.read_text())
-    except (json.JSONDecodeError, OSError):
-        return None
-
-
-# ---------------------------------------------------------------------------
-# Client VM bootstrap
-# ---------------------------------------------------------------------------
-
-def bootstrap_client(ctx: BootstrapContext):
-    log("Bootstrapping client VM...")
-
-    from common.client import install_client_tools
-    install_client_tools(
-        ctx.client.public_ip,
-        str(ctx.ssh_key_path),
-        "dsql",
-    )
-
-    # psql is needed for DSQL IAM-token DDL (sysbench_prepare PG branch).
-    ssh_run(ctx.client, """
-sudo dnf -y install postgresql16 postgresql16-contrib || true
-psql --version
-""", ctx)
-
-    # Verify connectivity to DSQL endpoint
-    if ctx.dsql_endpoint:
-        log("Verifying DSQL endpoint connectivity from client VM...")
-        result = ssh_capture(ctx.client, f"""
-timeout 10 bash -c 'echo | openssl s_client -connect {ctx.dsql_endpoint}:{DSQL_PORT} -servername {ctx.dsql_endpoint} 2>/dev/null | head -5'
-echo "EXIT:$?"
-""", ctx, strict=False)
-        if "EXIT:0" in result.stdout or "CONNECTED" in result.stdout:
-            log("  DSQL endpoint reachable from client VM.")
-        else:
-            log("  WARNING: Could not verify DSQL endpoint connectivity. "
-                "This may resolve once the cluster is fully active.")
-
-    log("Client VM bootstrap complete.")
+    token = None
+    while True:
+        kwargs = {"maxResults": 100}
+        if token:
+            kwargs["nextToken"] = token
+        resp = client.list_clusters(**kwargs)
+        for cluster in resp.get("clusters", []):
+            cid = cluster.get("identifier", "")
+            if not cid:
+                continue
+            info = client.get_cluster(identifier=cid)
+            tags = info.get("tags", {}) or {}
+            status = info.get("status", "")
+            if (tags.get("Project") == _cu.STACK and
+                    status in ("ACTIVE", "CREATING", "UPDATING")):
+                endpoint = info.get("endpoint", "")
+                log(f"REUSED  DSQL cluster by tags: {cid} (status: {status})")
+                return cid, endpoint
+        token = resp.get("nextToken")
+        if not token:
+            break
+    return None, None
 
 
 # ---------------------------------------------------------------------------
@@ -349,24 +186,19 @@ def cleanup(args):
     """Full cleanup: DSQL cluster + EC2 infrastructure."""
     log(f"Cleanup requested for stack: {_cu.STACK} in {_cu.REGION}")
 
-    # Delete DSQL cluster first
-    state = load_state()
-    cluster_id = None
-    if state:
-        cluster_id = state.get("cluster_id")
+    if not args.keep_client:
+        from common.client import cleanup_client
+        client_seed = args.bench_client_seed or args.seed
+        cleanup_client(ec2(), client_seed, _cu.STACK)
 
+    cluster_id, _endpoint = find_dsql_cluster()
     if cluster_id:
         delete_dsql_cluster(cluster_id)
     else:
-        log("No DSQL cluster found in state file; skipping cluster deletion.")
+        log("No DSQL cluster found by tags; skipping cluster deletion.")
 
     # Clean up EC2 infrastructure (VPC, subnet, SG, instances) via common
     _common_cleanup_stack()
-
-    # Remove state file
-    if STATE_FILE.exists():
-        STATE_FILE.unlink()
-        log("Removed state file.")
 
     log("Cleanup complete.")
 
@@ -383,11 +215,6 @@ def main():
     if args.cleanup:
         cleanup(args)
         return
-
-    ssh_key_path = Path(args.ssh_key_path).expanduser().resolve()
-    ensure_keypair_accessible()
-    if not ssh_key_path.exists():
-        raise SystemExit(f"ERROR: SSH key not found: {ssh_key_path}")
 
     self_cidr = args.ssh_cidr or my_public_cidr()
     log(f"Stack: {_cu.STACK} | Region: {_cu.REGION} | SSH CIDR: {self_cidr}")
@@ -408,16 +235,6 @@ def main():
 
     sg_id = ensure_sg(vpc_id, f"{_cu.STACK}-sg", "DSQL bench security group")
     refresh_ssh_rule(sg_id, self_cidr)
-    # Allow outbound to DSQL (port 5432) -- default SG egress allows all,
-    # but explicitly document the requirement
-    ensure_ingress_tcp_cidr(sg_id, DSQL_PORT, "0.0.0.0/0")
-
-    client_type = PRODUCTION_CLIENT_TYPE if args.production else CLIENT_INSTANCE_TYPE
-    client_iid = ensure_instance(
-        f"{_cu.STACK}-client", "client", client_type, subnet_id, sg_id,
-    )
-    client_info = instance_info_from_id(client_iid, "client")
-    log(f"Client: {client_info.public_ip} ({client_type})")
 
     # ── PHASE 2: DSQL Cluster ────────────────────────────────────────────
     log("")
@@ -431,30 +248,6 @@ def main():
             deletion_protection=args.deletion_protection,
         )
 
-    # Save state immediately so benchmark/validate can find the cluster
-    save_state(cluster_id, endpoint, client_iid, client_info.public_ip)
-
-    # ── PHASE 3: Bootstrap ───────────────────────────────────────────────
-    if not args.skip_bootstrap:
-        log("")
-        log("=" * 70)
-        log("PHASE 3: Client VM Bootstrap")
-        log("=" * 70)
-
-        ctx = BootstrapContext(
-            ssh_key_path=ssh_key_path,
-            self_cidr=self_cidr,
-            client=client_info,
-            dsql_cluster_id=cluster_id,
-            dsql_endpoint=endpoint,
-        )
-
-        log("Waiting for SSH connectivity...")
-        if not wait_for_ssh(client_info, ctx):
-            raise SystemExit("ERROR: Client VM not reachable via SSH.")
-
-        bootstrap_client(ctx)
-
     # ── Summary ──────────────────────────────────────────────────────────
     log("")
     log("=" * 70)
@@ -462,17 +255,21 @@ def main():
     log("=" * 70)
     log(f"  Stack:           {_cu.STACK}")
     log(f"  Region:          {_cu.REGION}")
-    log(f"  Client VM:       {client_info.public_ip} ({client_type})")
+    log("  Client VM:       provision separately with common.client")
     log(f"  DSQL Cluster:    {cluster_id}")
     log(f"  DSQL Endpoint:   {endpoint}")
-    log(f"  State file:      {STATE_FILE}")
     log("")
     log("Next steps:")
+    client_seed = args.bench_client_seed or args.seed
+    log(
+        "  Client:    python3 -m common.client "
+        f"--seed {args.seed} --bench-client-seed {client_seed} "
+        f"--server-type dsql --size small --region {_cu.REGION} "
+        f"--aws-profile {_cu.AWS_PROFILE}"
+    )
     log(
         "  Benchmark: python3 -m dsql.benchmark --action run "
-        f"--seed {args.seed} --host {client_info.public_ip} "
-        f"--dsql-cluster-id {cluster_id} "
-        f"--dsql-cluster-endpoint {endpoint} "
+        f"--seed {args.seed} --bench-client-seed {client_seed} "
         f"--dsql-region {_cu.REGION} --dsql-db-profile {_cu.DB_PROFILE} "
         f"--aws-profile {_cu.AWS_PROFILE}"
     )

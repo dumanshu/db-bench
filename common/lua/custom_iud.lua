@@ -43,7 +43,7 @@ function event()
                 table_name, id))
         else
             con:query(string.format(
-                "DELETE FROM %s WHERE id = %d LIMIT 1",
+                "DELETE FROM %s WHERE id = %d",
                 table_name, id))
         end
     end
