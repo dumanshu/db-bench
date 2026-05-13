@@ -14,7 +14,7 @@ Provides a single EC2 client instance with all benchmark tools installed:
 Standalone CLI:
     python3 -m common.client --seed foo --server-type aurora --size small
     python3 -m common.client --seed foo --server-type tidb --size heavy
-    python3 -m common.client --cleanup --seed foo --server-type aurora
+    python3 -m common.client --cleanup --seed foo
 
 Library usage from module setup.py files:
     from common.client import install_client_tools
@@ -22,7 +22,6 @@ Library usage from module setup.py files:
 """
 
 import argparse
-import json
 import os
 import sys
 from pathlib import Path
@@ -121,29 +120,82 @@ MEMTIER_SRC_URL = (
     f"refs/tags/{MEMTIER_VERSION}.tar.gz"
 )
 
+VALKEY_VERSION = os.environ.get("VALKEY_VERSION", "9.0.3")
+VALKEY_BIN_URL = os.environ.get(
+    "VALKEY_BIN_URL",
+    f"https://github.com/valkey-io/valkey/releases/download/"
+    f"valkey-{VALKEY_VERSION}/valkey-{VALKEY_VERSION}-linux-arm64.tar.gz",
+)
+
 
 # ---------------------------------------------------------------------------
-# State file helpers
+# Client discovery helpers
 # ---------------------------------------------------------------------------
 
-def _state_path(seed):
-    """Return path to client state file, relative to repo root."""
-    return Path(__file__).resolve().parent / f"client-{seed}-state.json"
+def client_key_path(client_seed):
+    """Return the deterministic local SSH key path for a client seed."""
+    return Path(__file__).resolve().parent / f"{KEY_NAME_PREFIX}-{client_seed}.pem"
 
 
-def save_state(state, seed):
-    path = _state_path(seed)
-    with open(path, "w") as f:
-        json.dump(state, f, indent=2, default=str)
-    log(f"Client state saved to {path}")
+def discover_client(ec2_client, client_seed, server_stack=None,
+                    states=("pending", "running")):
+    """Discover a benchmark client from AWS tags.
+
+    Local JSON state is intentionally not part of this contract.  Client
+    identity is the ``ClientSeed`` tag; ``server_stack`` is accepted only for
+    legacy clients created before that tag existed.
+    """
+    if not client_seed:
+        return None
+
+    filters = [
+        {"Name": "tag:ManagedBy", "Values": ["db-bench-client"]},
+        {"Name": "tag:Role", "Values": ["bench-client"]},
+        {"Name": "tag:ClientSeed", "Values": [client_seed]},
+        {"Name": "instance-state-name", "Values": list(states)},
+    ]
+    matches = _discover_client_instances(ec2_client, filters, client_seed)
+
+    if not matches and server_stack:
+        legacy_filters = [
+            {"Name": "tag:Project", "Values": [server_stack]},
+            {"Name": "tag:Role", "Values": ["bench-client"]},
+            {"Name": "tag:ManagedBy", "Values": ["db-bench-client"]},
+            {"Name": "instance-state-name", "Values": list(states)},
+        ]
+        matches = _discover_client_instances(ec2_client, legacy_filters, client_seed)
+
+    if not matches:
+        return None
+    matches.sort(key=lambda item: (
+        item["state"] != "running",
+        str(item.get("launch_time") or ""),
+    ))
+    if len(matches) > 1:
+        log(f"WARNING: multiple bench clients found for seed {client_seed}; using {matches[0]['instance_id']}")
+    return matches[0]
 
 
-def load_state(seed):
-    path = _state_path(seed)
-    if path.exists():
-        with open(path) as f:
-            return json.load(f)
-    return {}
+def _discover_client_instances(ec2_client, filters, client_seed):
+    resp = ec2_client.describe_instances(Filters=filters)
+    matches = []
+    for res in resp.get("Reservations", []):
+        for inst in res.get("Instances", []):
+            tags = {t["Key"]: t["Value"] for t in inst.get("Tags", [])}
+            sg_ids = [sg.get("GroupId", "") for sg in inst.get("SecurityGroups", [])]
+            matches.append({
+                "instance_id": inst["InstanceId"],
+                "public_ip": inst.get("PublicIpAddress", ""),
+                "private_ip": inst.get("PrivateIpAddress", ""),
+                "vpc_id": inst.get("VpcId", ""),
+                "subnet_id": inst.get("SubnetId", ""),
+                "sg_ids": [sg_id for sg_id in sg_ids if sg_id],
+                "key_path": str(client_key_path(client_seed)),
+                "state": inst.get("State", {}).get("Name", "unknown"),
+                "launch_time": inst.get("LaunchTime"),
+                "tags": tags,
+            })
+    return matches
 
 
 # ---------------------------------------------------------------------------
@@ -218,7 +270,7 @@ def _resolve_ami(ssm_client):
     return ami_id
 
 
-def _ensure_key_pair(ec2_client, key_name, key_dir):
+def _ensure_key_pair(ec2_client, key_name, key_dir, client_seed=None):
     """Create or reuse an EC2 key pair; save PEM locally."""
     key_file = key_dir / f"{key_name}.pem"
 
@@ -237,7 +289,12 @@ def _ensure_key_pair(ec2_client, key_name, key_dir):
         pass
 
     log(f"Creating key pair '{key_name}'...")
-    tags = [{"Key": "Name", "Value": key_name}, {"Key": "ManagedBy", "Value": "db-bench-client"}]
+    tags = [
+        {"Key": "Name", "Value": key_name},
+        {"Key": "ManagedBy", "Value": "db-bench-client"},
+    ]
+    if client_seed:
+        tags.append({"Key": "ClientSeed", "Value": client_seed})
     kp = ec2_client.create_key_pair(
         KeyName=key_name,
         KeyType="rsa",
@@ -252,9 +309,10 @@ def _ensure_key_pair(ec2_client, key_name, key_dir):
     return str(key_file)
 
 
-def _ensure_client_sg(ec2_client, vpc_id, server_stack, vpc_cidr, ssh_cidr):
+def _ensure_client_sg(ec2_client, vpc_id, server_stack, vpc_cidr, ssh_cidr,
+                      server_type=None, client_seed=None):
     """Create or reuse client SG allowing SSH from user + all outbound."""
-    sg_name = f"{server_stack}-bench-client"
+    sg_name = f"db-bench-client-{client_seed}" if client_seed else f"{server_stack}-bench-client"
     resp = ec2_client.describe_security_groups(
         Filters=[{"Name": "group-name", "Values": [sg_name]},
                  {"Name": "vpc-id", "Values": [vpc_id]}]
@@ -274,6 +332,8 @@ def _ensure_client_sg(ec2_client, vpc_id, server_stack, vpc_cidr, ssh_cidr):
                     {"Key": "Project", "Value": server_stack},
                     {"Key": "Name", "Value": sg_name},
                     {"Key": "ManagedBy", "Value": "db-bench-client"},
+                    {"Key": "ServerType", "Value": server_type or ""},
+                    {"Key": "ClientSeed", "Value": client_seed or ""},
                 ],
             }],
         )
@@ -330,8 +390,16 @@ def _authorize_client_db_access(ec2_client, server_stack, client_sg_id,
                     raise
 
 
-def _find_instance(ec2_client, name, server_stack):
+def _find_instance(ec2_client, name, server_stack, client_seed=None):
     """Find a running/pending client instance by Name + Project tags."""
+    if client_seed:
+        client = discover_client(
+            ec2_client, client_seed, server_stack,
+            states=("pending", "running", "stopping", "stopped"),
+        )
+        if client:
+            return client["instance_id"]
+
     resp = ec2_client.describe_instances(
         Filters=[
             {"Name": "tag:Name", "Values": [name]},
@@ -346,15 +414,25 @@ def _find_instance(ec2_client, name, server_stack):
 
 
 def provision_client(ec2_client, ssm_client, server_stack, vpc_id, vpc_cidr,
-                     subnet_id, sg_id, instance_type, key_name, key_path):
+                     subnet_id, sg_id, instance_type, key_name, key_path,
+                     server_type=None, client_seed=None):
     """Launch the client EC2 instance (idempotent)."""
-    instance_name = f"{server_stack}-bench-client"
+    instance_name = f"db-bench-client-{client_seed}" if client_seed else f"{server_stack}-bench-client"
 
-    existing = _find_instance(ec2_client, instance_name, server_stack)
+    existing = _find_instance(ec2_client, instance_name, server_stack, client_seed)
     if existing:
         log(f"REUSED  client instance: {existing}")
         ec2_client.get_waiter("instance_running").wait(InstanceIds=[existing])
         inst = _describe_instance(ec2_client, existing)
+        existing_vpc = inst.get("VpcId", "")
+        if (existing_vpc and existing_vpc != vpc_id and
+                server_type in ("aurora", "aurora-pg", "tidb", "valkey")):
+            raise SystemExit(
+                f"ERROR: Client seed {client_seed} already exists in VPC "
+                f"{existing_vpc}, but {server_type} requires a client in "
+                f"server VPC {vpc_id}. Use a client seed tied to this server "
+                "stack or clean/recreate the client."
+            )
         return existing, inst.get("PublicIpAddress", ""), inst.get("PrivateIpAddress", "")
 
     ami_id = _resolve_ami(ssm_client)
@@ -380,6 +458,8 @@ def provision_client(ec2_client, ssm_client, server_stack, vpc_id, vpc_cidr,
                 {"Key": "Name", "Value": instance_name},
                 {"Key": "Role", "Value": "bench-client"},
                 {"Key": "ManagedBy", "Value": "db-bench-client"},
+                {"Key": "ServerType", "Value": server_type or ""},
+                {"Key": "ClientSeed", "Value": client_seed or ""},
             ],
         }],
         MinCount=1, MaxCount=1,
@@ -407,11 +487,14 @@ def _describe_instance(ec2_client, iid):
 # Cleanup
 # ---------------------------------------------------------------------------
 
-def cleanup_client(ec2_client, server_stack, seed):
-    """Terminate client instance and delete its SG."""
-    instance_name = f"{server_stack}-bench-client"
-    iid = _find_instance(ec2_client, instance_name, server_stack)
-    if iid:
+def cleanup_client(ec2_client, client_seed, server_stack=None):
+    """Terminate benchmark client resources by client seed."""
+    client = discover_client(
+        ec2_client, client_seed, server_stack,
+        states=("pending", "running", "stopping", "stopped"),
+    )
+    if client:
+        iid = client["instance_id"]
         log(f"TERMINATING client instance: {iid}")
         ec2_client.terminate_instances(InstanceIds=[iid])
         try:
@@ -419,29 +502,98 @@ def cleanup_client(ec2_client, server_stack, seed):
         except Exception:
             log("  Warning: timeout waiting for termination; continuing")
     else:
-        log("No client instance found to terminate.")
+        log(f"No client instance found for client seed {client_seed}.")
 
-    # Delete client SG
-    sg_name = f"{server_stack}-bench-client"
-    resp = ec2_client.describe_security_groups(
-        Filters=[{"Name": "group-name", "Values": [sg_name]},
-                 {"Name": "tag:Project", "Values": [server_stack]}]
-    )
-    for sg in resp.get("SecurityGroups", []):
+    sg_filters = [
+        {"Name": "tag:ManagedBy", "Values": ["db-bench-client"]},
+        {"Name": "tag:ClientSeed", "Values": [client_seed]},
+    ]
+    resp = ec2_client.describe_security_groups(Filters=sg_filters)
+    legacy_groups = []
+    if server_stack:
+        legacy_resp = ec2_client.describe_security_groups(
+            Filters=[{"Name": "group-name", "Values": [f"{server_stack}-bench-client"]},
+                     {"Name": "tag:Project", "Values": [server_stack]}]
+        )
+        legacy_groups = legacy_resp.get("SecurityGroups", [])
+
+    seen = set()
+    groups = list(resp.get("SecurityGroups", [])) + legacy_groups
+    group_ids = [sg["GroupId"] for sg in groups]
+    _remove_group_references(ec2_client, group_ids)
+    for sg in groups:
         sg_id = sg["GroupId"]
+        if sg_id in seen:
+            continue
+        seen.add(sg_id)
         log(f"DELETING client SG: {sg_id}")
         try:
             ec2_client.delete_security_group(GroupId=sg_id)
         except Exception as e:
             log(f"  Warning: could not delete SG {sg_id}: {e}")
 
-    # Remove state file
-    state_file = _state_path(seed)
-    if state_file.exists():
-        state_file.unlink()
-        log(f"Removed state file: {state_file}")
+    key_name = f"{KEY_NAME_PREFIX}-{client_seed}"
+    try:
+        ec2_client.delete_key_pair(KeyName=key_name)
+        log(f"Deleted key pair: {key_name}")
+    except Exception:
+        pass
+    pem_path = client_key_path(client_seed)
+    if pem_path.exists():
+        os.chmod(pem_path, 0o600)
+        pem_path.unlink()
+        log(f"Removed SSH key: {pem_path}")
 
     log("Client cleanup complete.")
+
+
+def _remove_group_references(ec2_client, group_ids):
+    if not group_ids:
+        return
+    resp = ec2_client.describe_security_groups()
+    for sg in resp.get("SecurityGroups", []):
+        sg_id = sg["GroupId"]
+        ingress_revoke = []
+        for perm in sg.get("IpPermissions", []):
+            matching = [
+                pair for pair in perm.get("UserIdGroupPairs", [])
+                if pair.get("GroupId") in group_ids
+            ]
+            if matching:
+                entry = {"IpProtocol": perm.get("IpProtocol", "-1"),
+                         "UserIdGroupPairs": matching}
+                if "FromPort" in perm:
+                    entry["FromPort"] = perm["FromPort"]
+                if "ToPort" in perm:
+                    entry["ToPort"] = perm["ToPort"]
+                ingress_revoke.append(entry)
+        if ingress_revoke:
+            try:
+                ec2_client.revoke_security_group_ingress(
+                    GroupId=sg_id, IpPermissions=ingress_revoke)
+            except Exception as e:
+                log(f"  Warning: could not revoke ingress refs from {sg_id}: {e}")
+
+        egress_revoke = []
+        for perm in sg.get("IpPermissionsEgress", []):
+            matching = [
+                pair for pair in perm.get("UserIdGroupPairs", [])
+                if pair.get("GroupId") in group_ids
+            ]
+            if matching:
+                entry = {"IpProtocol": perm.get("IpProtocol", "-1"),
+                         "UserIdGroupPairs": matching}
+                if "FromPort" in perm:
+                    entry["FromPort"] = perm["FromPort"]
+                if "ToPort" in perm:
+                    entry["ToPort"] = perm["ToPort"]
+                egress_revoke.append(entry)
+        if egress_revoke:
+            try:
+                ec2_client.revoke_security_group_egress(
+                    GroupId=sg_id, IpPermissions=egress_revoke)
+            except Exception as e:
+                log(f"  Warning: could not revoke egress refs from {sg_id}: {e}")
 
 
 # ---------------------------------------------------------------------------
@@ -465,7 +617,9 @@ def install_client_tools(host_ip, key_path, server_type, timeout=600):
 
     # Always install everything so client works with any DB
     _install_mysql_client(host_ip, key_path, timeout=timeout)
+    _install_psql_client(host_ip, key_path, timeout=timeout)
     _install_sysbench(host_ip, key_path, timeout=timeout)
+    _install_valkey_tools(host_ip, key_path, timeout=timeout)
     _install_memtier(host_ip, key_path, timeout=timeout)
     _install_docker(host_ip, key_path)
 
@@ -488,11 +642,11 @@ def _install_base_packages(host_ip, key_path, timeout=300):
         sudo $PKG -y install epel-release || true
 
         sudo $PKG -y install \\
-            gcc make automake libtool git jq htop sysstat mtr \\
+            gcc gcc-c++ make automake autoconf libtool git jq htop sysstat mtr \\
             openssl-devel pkg-config binutils iproute \\
-            tar xz perf ethtool iperf3 tmux \\
-            jemalloc-devel || true
-    """, timeout=timeout)
+            tar xz ethtool iperf3 tmux jemalloc-devel
+        sudo $PKG -y install perf || true
+    """, timeout=timeout, strict=True)
 
 
 def _tune_sysctl(host_ip, key_path):
@@ -504,7 +658,7 @@ kernel.perf_event_paranoid = -1
 kernel.kptr_restrict = 0"""
     ssh_run_simple(host_ip, key_path, system_tuning_script(
         extra_sysctl=extra, conf_name="db-bench",
-    ))
+    ), strict=True)
 
 
 def _install_mysql_client(host_ip, key_path, timeout=300):
@@ -522,8 +676,26 @@ def _install_mysql_client(host_ip, key_path, timeout=300):
             sudo yum -y install mariadb mariadb-devel 2>/dev/null || \
             sudo yum -y install mysql mysql-devel 2>/dev/null || true
         fi
-        mysql --version || echo "WARNING: mysql client not found after install"
-    """, timeout=timeout)
+        mysql --version
+    """, timeout=timeout, strict=True)
+
+
+def _install_psql_client(host_ip, key_path, timeout=300):
+    log(f"  Installing psql client on {host_ip}")
+    ssh_run_simple(host_ip, key_path, """
+        if command -v psql >/dev/null 2>&1; then
+            psql --version
+            exit 0
+        fi
+        if command -v dnf >/dev/null 2>&1; then
+            sudo dnf -y install postgresql16 postgresql16-contrib 2>/dev/null || \
+            sudo dnf -y install postgresql15 postgresql15-contrib 2>/dev/null || \
+            sudo dnf -y install postgresql postgresql-contrib 2>/dev/null || true
+        else
+            sudo yum -y install postgresql postgresql-contrib 2>/dev/null || true
+        fi
+        psql --version
+    """, timeout=timeout, strict=True)
 
 
 def _install_sysbench(host_ip, key_path, timeout=600):
@@ -566,7 +738,43 @@ def _install_sysbench(host_ip, key_path, timeout=600):
         sudo ldconfig
         sysbench --version
         ldd "$(command -v sysbench)" | grep -Ei 'libpq|mysql|mariadb' || true
-    """, timeout=timeout)
+    """, timeout=timeout, strict=True)
+
+
+def _install_valkey_tools(host_ip, key_path, timeout=600):
+    log(f"  Installing valkey tools on {host_ip}")
+    ssh_run_simple(host_ip, key_path, f"""
+        if command -v valkey-cli >/dev/null 2>&1 && \
+           command -v valkey-benchmark >/dev/null 2>&1; then
+            echo "valkey tools already installed"
+            exit 0
+        fi
+        if command -v dnf >/dev/null 2>&1; then
+            sudo dnf -y install valkey 2>/dev/null || true
+        else
+            sudo yum -y install valkey 2>/dev/null || true
+        fi
+        if command -v valkey-cli >/dev/null 2>&1 && \
+           command -v valkey-benchmark >/dev/null 2>&1; then
+            exit 0
+        fi
+        set -euo pipefail
+        WORK=$(mktemp -d /tmp/valkey-tools.XXXX)
+        trap 'rm -rf "$WORK"' EXIT
+        cd "$WORK"
+        curl -fL -o valkey-bin.tgz '{VALKEY_BIN_URL}'
+        tar -xzf valkey-bin.tgz
+        CLI=$(find . -type f -name valkey-cli | head -n 1)
+        BENCH=$(find . -type f -name valkey-benchmark | head -n 1)
+        if [ -z "$CLI" ] || [ -z "$BENCH" ]; then
+            echo "ERROR: valkey archive missing valkey-cli/valkey-benchmark" >&2
+            exit 1
+        fi
+        sudo install -m 0755 "$CLI" /usr/local/bin/valkey-cli
+        sudo install -m 0755 "$BENCH" /usr/local/bin/valkey-benchmark
+        valkey-cli --version || true
+        valkey-benchmark --help >/dev/null
+    """, timeout=timeout, strict=True)
 
 
 def _install_memtier(host_ip, key_path, timeout=600):
@@ -602,7 +810,7 @@ def _install_memtier(host_ip, key_path, timeout=600):
             make -j $(nproc)
         fi
         sudo make install
-    """, timeout=timeout)
+    """, timeout=timeout, strict=True)
 
 
 def _install_docker(host_ip, key_path):
@@ -634,12 +842,15 @@ def parse_args():
 Examples:
   python3 -m common.client --seed foo --server-type aurora --size small
   python3 -m common.client --seed foo --server-type tidb --size heavy
-  python3 -m common.client --cleanup --seed foo --server-type aurora
+  python3 -m common.client --cleanup --seed foo
 """,
     )
-    p.add_argument("--seed", required=True, help="Same seed used when provisioning the server.")
-    p.add_argument("--server-type", required=True, choices=SERVER_TYPES,
-                   help="Type of database server (determines VPC discovery).")
+    p.add_argument("--seed", required=True,
+                   help="Server seed for provisioning; client seed for cleanup unless --bench-client-seed is set.")
+    p.add_argument("--bench-client-seed", default=None,
+                   help="Reusable client seed (default: --seed).")
+    p.add_argument("--server-type", choices=SERVER_TYPES,
+                   help="Type of database server (required unless --cleanup).")
     p.add_argument("--size", default="small", choices=list(SIZE_PRESETS.keys()),
                    help="Client instance size preset (default: small).")
     p.add_argument("--region", default="us-east-1", help="AWS region (default: us-east-1).")
@@ -654,7 +865,8 @@ def main():
     from botocore.config import Config as BotoConfig
 
     args = parse_args()
-    seed = args.seed
+    server_seed = args.seed
+    client_seed = args.bench_client_seed or server_seed
     server_type = args.server_type
     region = args.region
     profile = args.aws_profile
@@ -668,15 +880,20 @@ def main():
     ec2_client = session.client("ec2", config=boto_config)
     ssm_client = session.client("ssm", config=boto_config)
 
-    server_stack = _compute_server_stack(server_type, seed)
-
     if args.cleanup:
-        log(f"Cleaning up client for {server_stack}...")
-        cleanup_client(ec2_client, server_stack, seed)
+        server_stack = (_compute_server_stack(server_type, server_seed)
+                        if server_type else None)
+        log(f"Cleaning up client seed {client_seed}...")
+        cleanup_client(ec2_client, client_seed, server_stack)
         return
 
+    if not server_type:
+        raise SystemExit("ERROR: --server-type is required when provisioning a client.")
+
+    server_stack = _compute_server_stack(server_type, server_seed)
+
     # Discover server VPC
-    vpc_id, vpc_cidr, server_stack = discover_server_vpc(ec2_client, server_type, seed)
+    vpc_id, vpc_cidr, server_stack = discover_server_vpc(ec2_client, server_type, server_seed)
 
     # Find public subnet in server VPC
     subnet_id, az = _find_public_subnet(ec2_client, vpc_id, server_stack)
@@ -685,17 +902,23 @@ def main():
     from common.util import my_public_cidr
     try:
         ssh_cidr = my_public_cidr()
-    except Exception:
-        ssh_cidr = "0.0.0.0/0"
+    except Exception as exc:
+        raise SystemExit(
+            "ERROR: Could not detect your public IP for the client SSH "
+            "security-group rule. Pass a working network environment and retry; "
+            "refusing to open SSH to 0.0.0.0/0."
+        ) from exc
 
     # Security group
-    sg_id = _ensure_client_sg(ec2_client, vpc_id, server_stack, vpc_cidr, ssh_cidr)
+    sg_id = _ensure_client_sg(
+        ec2_client, vpc_id, server_stack, vpc_cidr, ssh_cidr,
+        server_type, client_seed)
     _authorize_client_db_access(ec2_client, server_stack, sg_id, server_type)
 
     # Key pair
-    key_name = f"{KEY_NAME_PREFIX}-{seed}"
+    key_name = f"{KEY_NAME_PREFIX}-{client_seed}"
     key_dir = Path(__file__).resolve().parent
-    key_path = _ensure_key_pair(ec2_client, key_name, key_dir)
+    key_path = _ensure_key_pair(ec2_client, key_name, key_dir, client_seed)
 
     # Instance type from size preset
     instance_type = SIZE_PRESETS[args.size]
@@ -704,29 +927,11 @@ def main():
     iid, pub_ip, priv_ip = provision_client(
         ec2_client, ssm_client, server_stack, vpc_id, vpc_cidr,
         subnet_id, sg_id, instance_type, key_name, key_path,
+        server_type, client_seed,
     )
 
     # Install tools (superset)
     install_client_tools(pub_ip, key_path, server_type)
-
-    # Save state
-    state = {
-        "seed": seed,
-        "server_type": server_type,
-        "server_stack": server_stack,
-        "region": region,
-        "vpc_id": vpc_id,
-        "subnet_id": subnet_id,
-        "sg_id": sg_id,
-        "instance_id": iid,
-        "instance_type": instance_type,
-        "public_ip": pub_ip,
-        "private_ip": priv_ip,
-        "key_name": key_name,
-        "key_path": key_path,
-        "created_at": ts(),
-    }
-    save_state(state, seed)
 
     # Summary
     print()
@@ -734,6 +939,8 @@ def main():
     print("Benchmark Client Ready")
     print("=" * 60)
     print(f"  Server type:     {server_type}")
+    print(f"  Server seed:     {server_seed}")
+    print(f"  Client seed:     {client_seed}")
     print(f"  Server stack:    {server_stack}")
     print(f"  Instance type:   {instance_type} ({args.size})")
     print(f"  Public IP:       {pub_ip}")
@@ -744,10 +951,10 @@ def main():
     print(f"  ssh -i {key_path} ec2-user@{pub_ip}")
     print()
     print(f"Run benchmark:")
-    print(f"  python3 -m common.benchmark --server-type {server_type} --seed {seed} ...")
+    print(f"  python3 -m common.benchmark --server-type {server_type} --seed {server_seed} --bench-client-seed {client_seed} ...")
     print()
     print(f"Cleanup:")
-    print(f"  python3 -m common.client --cleanup --seed {seed} --server-type {server_type}")
+    print(f"  python3 -m common.client --cleanup --seed {server_seed} --bench-client-seed {client_seed}")
     print()
 
 
