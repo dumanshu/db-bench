@@ -73,13 +73,6 @@ ISOLATION_LEVEL_MAP = {
     "serializable": "SERIALIZABLE",
 }
 
-# DSQL pricing (us-east-1, per-million request processing units)
-DSQL_PRICING = {
-    "write_rpu_per_million": 2.25,
-    "read_rpu_per_million": 0.45,
-    "storage_per_gb_month": 0.25,
-}
-
 # Aurora I/O-Optimized pricing: no per-I/O charge, ~30% higher instance cost.
 # We default to I/O-Optimized because it is the recommended production
 # configuration and avoids the per-I/O variance that makes cost comparison
@@ -312,17 +305,11 @@ _INTERVAL_RE = re.compile(
     r'reconn/s:\s+([\d.]+)'
 )
 
-_OP_LATENCY_BUCKETS_MS = [
-    0.1, 0.25, 0.5, 1, 2, 4, 8, 16, 32, 64,
-    128, 256, 512, 1024, 2048, 4096, 8192,
-]
-
 _CUSTOM_MIXED_OP_STATS_RE = re.compile(
     r'CUSTOM_MIXED_OP_STATS\s+tid=(?P<tid>-?\d+)\s+'
     r'op=(?P<op>[a-z_]+)\s+count=(?P<count>\d+)\s+'
     r'total_ms=(?P<total>[\d.]+)\s+min_ms=(?P<min>[\d.]+)\s+'
-    r'avg_ms=(?P<avg>[\d.]+)\s+max_ms=(?P<max>[\d.]+)\s+'
-    r'buckets=(?P<buckets>[\d,]+)'
+    r'avg_ms=(?P<avg>[\d.]+)\s+max_ms=(?P<max>[\d.]+)'
 )
 
 _CUSTOM_MIXED_QUERY_STATS_RE = re.compile(
@@ -331,36 +318,35 @@ _CUSTOM_MIXED_QUERY_STATS_RE = re.compile(
     r'key=(?P<key>\S+)\s+template=(?P<template>.*?)\s+'
     r'count=(?P<count>\d+)\s+total_ms=(?P<total>[\d.]+)\s+'
     r'min_ms=(?P<min>[\d.]+)\s+avg_ms=(?P<avg>[\d.]+)\s+'
-    r'max_ms=(?P<max>[\d.]+)\s+buckets=(?P<buckets>[\d,]+)'
+    r'max_ms=(?P<max>[\d.]+)'
 )
 
 _CUSTOM_MIXED_QUERY_STATS_V1_RE = re.compile(
-    r'CUSTOM_MIXED_QUERY_STATS_V1\ttid=(?P<tid>-?\d+)\t'
+    r'CUSTOM_MIXED_QUERY_STATS_V[12]\ttid=(?P<tid>-?\d+)\t'
     r'type=(?P<type>[^\t]+)\tcategory=(?P<category>[^\t]+)\t'
     r'key=(?P<key>[^\t]+)\ttemplate=(?P<template>.*?)\t'
     r'count=(?P<count>\d+)\ttotal_ms=(?P<total>[\d.]+)\t'
     r'min_ms=(?P<min>[\d.]+)\tavg_ms=(?P<avg>[\d.]+)\t'
-    r'max_ms=(?P<max>[\d.]+)\tbuckets=(?P<buckets>[\d,]+)'
+    r'max_ms=(?P<max>[\d.]+)'
 )
 
 _CUSTOM_MIXED_OP_INTERVAL_V1_RE = re.compile(
-    r'CUSTOM_MIXED_OP_INTERVAL_V1\ttid=(?P<tid>-?\d+)\t'
+    r'CUSTOM_MIXED_OP_INTERVAL_V[12]\ttid=(?P<tid>-?\d+)\t'
     r'minute=(?P<minute>\d+)\tfrom_ms=(?P<from>[\d.]+)\t'
     r'to_ms=(?P<to>[\d.]+)\top=(?P<op>[^\t]+)\t'
     r'count=(?P<count>\d+)\ttotal_ms=(?P<total>[\d.]+)\t'
     r'min_ms=(?P<min>[\d.]+)\tavg_ms=(?P<avg>[\d.]+)\t'
-    r'max_ms=(?P<max>[\d.]+)\tbuckets=(?P<buckets>[\d,]+)'
+    r'max_ms=(?P<max>[\d.]+)'
 )
 
 _CUSTOM_MIXED_QUERY_INTERVAL_V1_RE = re.compile(
-    r'CUSTOM_MIXED_QUERY_INTERVAL_V1\ttid=(?P<tid>-?\d+)\t'
+    r'CUSTOM_MIXED_QUERY_INTERVAL_V[12]\ttid=(?P<tid>-?\d+)\t'
     r'minute=(?P<minute>\d+)\tfrom_ms=(?P<from>[\d.]+)\t'
     r'to_ms=(?P<to>[\d.]+)\ttype=(?P<type>[^\t]+)\t'
     r'category=(?P<category>[^\t]+)\tkey=(?P<key>[^\t]+)\t'
     r'template=(?P<template>.*?)\tcount=(?P<count>\d+)\t'
     r'total_ms=(?P<total>[\d.]+)\tmin_ms=(?P<min>[\d.]+)\t'
-    r'avg_ms=(?P<avg>[\d.]+)\tmax_ms=(?P<max>[\d.]+)\t'
-    r'buckets=(?P<buckets>[\d,]+)'
+    r'avg_ms=(?P<avg>[\d.]+)\tmax_ms=(?P<max>[\d.]+)'
 )
 
 
@@ -400,17 +386,11 @@ def _empty_op_latency() -> dict:
         "min_ms": None,
         "avg_ms": None,
         "max_ms": None,
-        "p50_ms": None,
-        "p95_ms": None,
-        "p99_ms": None,
-        "buckets": [0 for _ in _OP_LATENCY_BUCKETS_MS],
-        "bucket_bounds_ms": list(_OP_LATENCY_BUCKETS_MS),
     }
 
 
 def _merge_latency_line(dest: dict, count: int, total_ms: float,
-                        min_ms: float, max_ms: float,
-                        buckets: list[int]) -> None:
+                        min_ms: float, max_ms: float) -> None:
     dest["count"] += count
     dest["total_ms"] += total_ms
     if count > 0:
@@ -418,8 +398,6 @@ def _merge_latency_line(dest: dict, count: int, total_ms: float,
             dest["min_ms"] = min_ms
         if dest["max_ms"] is None or max_ms > dest["max_ms"]:
             dest["max_ms"] = max_ms
-    for i, value in enumerate(buckets):
-        dest["buckets"][i] += value
 
 
 def _finalize_latency_stats(stats: dict) -> dict:
@@ -430,32 +408,7 @@ def _finalize_latency_stats(stats: dict) -> dict:
             dest["avg_ms"] = round(dest["total_ms"] / count, 3)
             dest["min_ms"] = round(dest["min_ms"], 3)
             dest["max_ms"] = round(dest["max_ms"], 3)
-            dest["p50_ms"] = _bucket_percentile(dest["buckets"], 50)
-            dest["p95_ms"] = _bucket_percentile(dest["buckets"], 95)
-            dest["p99_ms"] = _bucket_percentile(dest["buckets"], 99)
     return stats
-
-
-def _parse_latency_buckets(raw: str) -> list[int]:
-    buckets = [int(v) for v in raw.split(",")]
-    if len(buckets) < len(_OP_LATENCY_BUCKETS_MS):
-        buckets.extend([0] * (len(_OP_LATENCY_BUCKETS_MS) - len(buckets)))
-    elif len(buckets) > len(_OP_LATENCY_BUCKETS_MS):
-        buckets = buckets[:len(_OP_LATENCY_BUCKETS_MS)]
-    return buckets
-
-
-def _bucket_percentile(buckets: list[int], percentile: float) -> Optional[float]:
-    total = sum(buckets)
-    if total <= 0:
-        return None
-    rank = max(1, int((percentile / 100.0) * total + 0.999999))
-    running = 0
-    for bound, count in zip(_OP_LATENCY_BUCKETS_MS, buckets):
-        running += count
-        if running >= rank:
-            return bound
-    return _OP_LATENCY_BUCKETS_MS[-1]
 
 
 def parse_custom_mixed_op_stats(text: str) -> dict:
@@ -467,8 +420,7 @@ def parse_custom_mixed_op_stats(text: str) -> dict:
         total_ms = float(m.group("total"))
         min_ms = float(m.group("min"))
         max_ms = float(m.group("max"))
-        buckets = _parse_latency_buckets(m.group("buckets"))
-        _merge_latency_line(dest, count, total_ms, min_ms, max_ms, buckets)
+        _merge_latency_line(dest, count, total_ms, min_ms, max_ms)
     return _finalize_latency_stats(stats)
 
 
@@ -485,7 +437,6 @@ def parse_custom_mixed_query_stats(text: str) -> dict:
         total_ms = float(m.group("total"))
         min_ms = float(m.group("min"))
         max_ms = float(m.group("max"))
-        buckets = _parse_latency_buckets(m.group("buckets"))
         dest = stats.setdefault(key, _empty_op_latency())
         dest.setdefault("metadata_conflicts", [])
         for meta_key, meta_value in (
@@ -502,7 +453,7 @@ def parse_custom_mixed_query_stats(text: str) -> dict:
                     "existing": existing,
                     "incoming": meta_value,
                 })
-        _merge_latency_line(dest, count, total_ms, min_ms, max_ms, buckets)
+        _merge_latency_line(dest, count, total_ms, min_ms, max_ms)
     finalized = _finalize_latency_stats(stats)
     for dest in finalized.values():
         if not dest.get("metadata_conflicts"):
@@ -530,7 +481,6 @@ def parse_custom_mixed_op_interval_stats(text: str) -> dict:
             float(m.group("total")),
             float(m.group("min")),
             float(m.group("max")),
-            _parse_latency_buckets(m.group("buckets")),
         )
     for entry in minutes.values():
         entry["op_latency_ms"] = _finalize_latency_stats(entry["op_latency_ms"])
@@ -572,7 +522,6 @@ def parse_custom_mixed_query_interval_stats(text: str) -> dict:
             float(m.group("total")),
             float(m.group("min")),
             float(m.group("max")),
-            _parse_latency_buckets(m.group("buckets")),
         )
     for entry in minutes.values():
         finalized = _finalize_latency_stats(entry["query_latency_ms"])
@@ -3977,9 +3926,7 @@ def _main_dsql(args):
                 continue
             log(
                 f"    {op:<6} count={stats.get('count')} "
-                f"avg={stats.get('avg_ms')} p50={stats.get('p50_ms')} "
-                f"p95={stats.get('p95_ms')} p99={stats.get('p99_ms')} "
-                f"max={stats.get('max_ms')}"
+                f"avg={stats.get('avg_ms')} max={stats.get('max_ms')}"
             )
     query_latency = combined.get("query_latency_ms") or {}
     if query_latency:
@@ -3991,9 +3938,8 @@ def _main_dsql(args):
             log(
                 f"    {key:<18} type={stats.get('type')} "
                 f"category={stats.get('category')} count={stats.get('count')} "
-                f"avg={stats.get('avg_ms')} p50={stats.get('p50_ms')} "
-                f"p95={stats.get('p95_ms')} p99={stats.get('p99_ms')} "
-                f"max={stats.get('max_ms')} template={stats.get('template')}"
+                f"avg={stats.get('avg_ms')} max={stats.get('max_ms')} "
+                f"template={stats.get('template')}"
             )
     if combined.get("segments"):
         log(f"  Segments:         {combined['segments']}")
@@ -4003,7 +3949,7 @@ def _main_dsql(args):
     if not args.skip_cloudwatch and cluster_id:
         log("")
         log("Collecting DSQL CloudWatch metrics...")
-        cw_end = bench_end + timedelta(minutes=2)
+        cw_end = bench_end
         combined["cloudwatch_window"] = {
             "start_utc": bench_start.isoformat(),
             "end_utc": cw_end.isoformat(),
@@ -4526,7 +4472,10 @@ def _run_tidb_benchmark(
     log("Disabling TiDB resource control (avoids error 8249)...")
     ssh_run(host, f"""
 mysql -h {db_host} -P {port} -u root -e \
-"SET GLOBAL tidb_enable_resource_control = OFF;" 2>/dev/null || true
+"SET GLOBAL tidb_enable_1pc = OFF;
+ SET GLOBAL tidb_enable_async_commit = OFF;
+ SET GLOBAL tidb_enable_resource_control = OFF;
+ SELECT @@GLOBAL.tidb_enable_1pc, @@GLOBAL.tidb_enable_async_commit;" 2>/dev/null || true
 """, key_path, strict=False)
 
     # Initialize cost tracker
