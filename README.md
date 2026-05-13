@@ -162,7 +162,7 @@ AWS_PROFILE=sandbox python3 -m valkey.benchmark \
 AWS_PROFILE=sandbox python3 -m valkey.setup --cleanup
 ```
 
-Benchmark clients are discovered from AWS tags (`ClientSeed`, `Role=bench-client`), not local client state JSON. `--bench-client-seed` defaults to `--seed`; use it when intentionally driving a public endpoint such as DSQL from a client created for another stack. Server-stack cleanup removes the benchmark client for `--bench-client-seed` unless `--keep-client` is passed.
+Benchmark clients are discovered from AWS tags (`ClientSeed`, `Role=bench-client`), not local client state JSON. `common.client` provisions the client VM into the server stack's VPC and public subnet, then opens the server DB port from that client security group. That means TiDB, Valkey, Aurora, and Aurora PG clients are shared common tooling inside one server VPC, not a single cross-VPC VM; use the same `--seed`/`--bench-client-seed` for those private endpoints. DSQL's endpoint is public, so it can be driven from a client created for another stack by passing that client's `--bench-client-seed`. Server-stack cleanup removes the benchmark client for `--bench-client-seed` unless `--keep-client` is passed.
 
 ## DSQL
 

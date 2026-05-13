@@ -513,7 +513,7 @@ def restore_cluster_from_snapshot(rds, snapshot_id: str,
 # ---------------------------------------------------------------------------
 def cleanup_stack(session: boto3.Session, region: str, stack: str,
                   rds_session: boto3.Session | None = None,
-                  delete_snapshots: bool = False) -> None:
+                  delete_snapshots: bool = True) -> None:
     ec2_client = session.client("ec2")
     rds = (rds_session or session).client("rds")
 
@@ -679,7 +679,7 @@ def cleanup_stack(session: boto3.Session, region: str, stack: str,
         ec2_client.delete_vpc(VpcId=vpc["VpcId"])
         log(f"  Deleted VPC: {vpc['VpcId']}")
 
-    # 11. Delete snapshots (if requested)
+    # 11. Delete snapshots unless explicitly preserved
     if delete_snapshots:
         log("Deleting aurora-bench snapshots...")
         delete_all_snapshots(rds)
@@ -687,7 +687,7 @@ def cleanup_stack(session: boto3.Session, region: str, stack: str,
         snaps = list_snapshots(rds)
         if snaps:
             log(f"  Keeping {len(snaps)} snapshot(s). "
-                f"Use --delete-snapshots to remove them.")
+                f"Run with --delete-snapshots to remove them without cleanup.")
 
     # 12. Remove state file
     script_dir = Path(__file__).resolve().parent
@@ -716,7 +716,9 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--cleanup", action="store_true",
                    help="Tear down the entire stack and exit")
     p.add_argument("--delete-snapshots", action="store_true",
-                   help="Also delete snapshots during cleanup (default: keep them)")
+                   help="Delete saved snapshots and exit when used without --cleanup; cleanup deletes snapshots by default")
+    p.add_argument("--keep-snapshots", action="store_true",
+                   help="Keep snapshots during cleanup (default: delete them)")
     p.add_argument("--snapshot", action="store_true",
                    help="Create a manual cluster snapshot and exit")
     p.add_argument("--restore-snapshot", default=None, metavar="SNAPSHOT_ID",
@@ -783,7 +785,7 @@ def main() -> None:
             from common.client import cleanup_client
             cleanup_client(session.client("ec2"), args.bench_client_seed or args.seed, stack)
         cleanup_stack(session, args.region, stack, rds_session,
-                      delete_snapshots=args.delete_snapshots)
+                      delete_snapshots=not args.keep_snapshots)
         return
 
     if args.snapshot:
