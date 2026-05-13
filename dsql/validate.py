@@ -18,7 +18,6 @@ For an end-to-end smoke test, use the unified benchmark runner:
 
 import argparse
 import datetime
-import json
 import os
 import subprocess
 import sys
@@ -35,8 +34,6 @@ DEFAULT_PROFILE = os.environ.get("AWS_PROFILE", "sandbox")
 DEFAULT_DB_PROFILE = os.environ.get("DB_PROFILE", "sandbox-storage")
 DSQL_PORT = 5432
 
-STATE_FILE = Path(__file__).resolve().with_name("dsql-state.json")
-from common.aws import DEFAULT_SSH_KEY_PATH as SSH_KEY_PATH
 
 
 # ---------------------------------------------------------------------------
@@ -83,27 +80,26 @@ def ssh_capture(host_ip, script, key_path, timeout=60):
 # State & discovery
 # ---------------------------------------------------------------------------
 
-def load_state():
-    if not STATE_FILE.exists():
-        return None
-    try:
-        return json.loads(STATE_FILE.read_text())
-    except (json.JSONDecodeError, OSError):
-        return None
-
-
-def discover_client_ip(state, ec2c):
-    instance_id = state.get("client_instance_id")
-    if not instance_id:
-        return None
-    try:
-        resp = ec2c.describe_instances(InstanceIds=[instance_id])
-        for res in resp["Reservations"]:
-            for inst in res["Instances"]:
-                if inst["State"]["Name"] == "running":
-                    return inst.get("PublicIpAddress") or inst.get("PrivateIpAddress")
-    except Exception:
-        pass
+def discover_dsql_cluster(region, profile, seed):
+    client = dsql_client(region, profile)
+    expected_project = f"dsql-loadtest-{seed}"
+    token = None
+    while True:
+        kwargs = {"maxResults": 100}
+        if token:
+            kwargs["nextToken"] = token
+        resp = client.list_clusters(**kwargs)
+        for cluster in resp.get("clusters", []):
+            cluster_id = cluster.get("identifier", "")
+            if not cluster_id:
+                continue
+            info = client.get_cluster(identifier=cluster_id)
+            tags = info.get("tags", {}) or {}
+            if tags.get("Project") == expected_project:
+                return info
+        token = resp.get("nextToken")
+        if not token:
+            break
     return None
 
 
@@ -137,32 +133,17 @@ class Check:
         log(f"  FAIL  {self.name}: {detail}" if detail else f"  FAIL  {self.name}")
 
 
-def check_state_file():
-    c = Check("State file")
-    state = load_state()
-    if state and state.get("cluster_id") and state.get("endpoint"):
-        c.ok(f"cluster={state['cluster_id']}")
-    else:
-        c.fail("Missing or incomplete state file.")
-    return c, state
-
-
-def check_dsql_cluster(state, region, profile):
+def check_dsql_cluster(cluster):
     c = Check("DSQL cluster status")
-    cluster_id = state.get("cluster_id", "")
-    if not cluster_id:
-        c.fail("No cluster_id in state.")
+    if not cluster:
+        c.fail("No tagged DSQL cluster found.")
         return c
-    try:
-        client = dsql_client(region, profile)
-        info = client.get_cluster(identifier=cluster_id)
-        status = info.get("status", "unknown")
-        if status == "ACTIVE":
-            c.ok(f"{cluster_id} ({status})")
-        else:
-            c.fail(f"{cluster_id} ({status})")
-    except Exception as e:
-        c.fail(str(e))
+    cluster_id = cluster.get("identifier", "")
+    status = cluster.get("status", "unknown")
+    if status == "ACTIVE":
+        c.ok(f"{cluster_id} ({status})")
+    else:
+        c.fail(f"{cluster_id} ({status})")
     return c
 
 
@@ -231,9 +212,11 @@ def parse_args():
                         help="AWS profile for infrastructure (EC2/VPC).")
     parser.add_argument("--db-profile", default=DEFAULT_DB_PROFILE,
                         help="AWS profile for database service APIs (default: sandbox-storage).")
+    parser.add_argument("--bench-client-seed", default=None,
+                        help="Benchmark client seed (default: --seed).")
     parser.add_argument(
-        "--ssh-key", default=str(SSH_KEY_PATH),
-        help=f"SSH private key path (default: {SSH_KEY_PATH}).",
+        "--ssh-key", default=None,
+        help="SSH private key path (default: common.client key for --bench-client-seed).",
     )
     return parser.parse_args()
 
@@ -247,7 +230,10 @@ def main():
     region = args.region
     profile = args.aws_profile
     db_prof = args.db_profile or args.aws_profile
-    key_path = Path(args.ssh_key).expanduser().resolve()
+    client_seed = args.bench_client_seed or args.seed
+    from common.client import client_key_path, discover_client
+    key_path = (Path(args.ssh_key).expanduser().resolve()
+                if args.ssh_key else client_key_path(client_seed))
 
     log("=" * 70)
     log("DSQL Stack Validation")
@@ -255,19 +241,13 @@ def main():
 
     checks = []
 
-    state_check, state = check_state_file()
-    checks.append(state_check)
-    if not state:
-        log("\nCannot continue without state file.")
-        sys.exit(1)
-
-    cluster_id = state.get("cluster_id", "")
-    endpoint = state.get("endpoint", "")
-
-    checks.append(check_dsql_cluster(state, region, db_prof))
+    cluster = discover_dsql_cluster(region, db_prof, args.seed)
+    checks.append(check_dsql_cluster(cluster))
+    endpoint = cluster.get("endpoint", "") if cluster else ""
 
     ec2c = ec2_client(region=region, profile=profile)
-    client_ip = discover_client_ip(state, ec2c)
+    client = discover_client(ec2c, client_seed, server_stack=f"dsql-loadtest-{args.seed}")
+    client_ip = client.get("public_ip") if client else None
     if not client_ip:
         c = Check("Client VM discovery")
         c.fail("Could not find running client VM.")
