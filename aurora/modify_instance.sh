@@ -2,11 +2,17 @@
 set -euo pipefail
 
 NEW_TYPE="${1:?Usage: $0 <new-instance-type>  e.g. db.r6i.24xlarge}"
-PROFILE="sandbox-storage"
-REGION="us-east-1"
+PROFILE="${AWS_PROFILE:-sandbox-storage}"
+REGION="${AWS_REGION:-us-east-1}"
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-STATE_FILE="$SCRIPT_DIR/aurora-bench-state.json"
+STATE_FILE="${AURORA_STATE_FILE:-$SCRIPT_DIR/aurora-bench-state.json}"
 KEY="$(cd "$SCRIPT_DIR/.." && pwd)/common/dbbench-key.pem"
+
+if [[ ! -f "$STATE_FILE" ]]; then
+    echo "ERROR: Aurora state file not found: $STATE_FILE" >&2
+    echo "Run python3 -m aurora.setup first or set AURORA_STATE_FILE." >&2
+    exit 1
+fi
 
 WRITER_ID=$(python3 -c "import json; print(json.load(open('$STATE_FILE'))['writer_id'])")
 

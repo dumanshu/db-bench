@@ -28,9 +28,9 @@ from common.sampler import start_sampler, stop_sampler
 DEFAULT_REGION = "us-east-1"
 DEFAULT_SEED = "vlklt-001"
 DEFAULT_PROFILE = os.environ.get("AWS_PROFILE", "sandbox")
-DEFAULT_TARGET = "valkey-loadtest-vlklt-001-nlb-194011211c572f50.elb.us-east-1.amazonaws.com"
+DEFAULT_TARGET = ""
 DEFAULT_PORT = 6379
-DEFAULT_S3_BUCKET = "valkey-loadtest-vlklt-001-flamegraphs"
+DEFAULT_S3_BUCKET = ""
 
 
 def build_proxy_option(jump_host: Optional[str], jump_user: str, jump_key: Optional[Path]) -> Optional[str]:
@@ -182,7 +182,7 @@ def stream_process_output(proc: subprocess.Popen, log_path: Path):
 
 def parse_args():
     parser = argparse.ArgumentParser(description="Run valkey-benchmark and capture a flamegraph.")
-    parser.add_argument("--target-host", default=DEFAULT_TARGET, help=f"Host/IP to benchmark (default: {DEFAULT_TARGET})")
+    parser.add_argument("--target-host", default=DEFAULT_TARGET, help="Host/IP to benchmark. Required for proxy mode; auto-discovered for valkey mode when omitted.")
     parser.add_argument("--target-port", type=int, default=DEFAULT_PORT, help="Valkey/Envoy TCP port (default: 6379)")
     parser.add_argument(
         "--mode",
@@ -215,7 +215,7 @@ def parse_args():
     parser.add_argument("--flamegraph-output", type=Path, default=Path("valkey-flamegraph.svg"), help="Local path for downloaded flamegraph.")
     parser.add_argument("--flamegraph-frequency", type=int, default=99, help="perf record sampling frequency.")
     parser.add_argument("--skip-flamegraph", action="store_true", help="Disable perf capture.")
-    parser.add_argument("--s3-bucket", default=DEFAULT_S3_BUCKET, help="Upload flamegraph SVG to this S3 bucket (blank to skip).")
+    parser.add_argument("--s3-bucket", default=DEFAULT_S3_BUCKET, help="Upload flamegraph SVG to this S3 bucket (default: blank, skip upload).")
     parser.add_argument("--s3-prefix", default="profiles", help="Key prefix within the S3 bucket.")
     parser.add_argument("--aws-profile", default=DEFAULT_PROFILE, help="AWS profile for discovery/S3 uploads (default: env/instance profile).")
     return parser.parse_args()
@@ -285,10 +285,14 @@ def upload_flamegraph_to_s3(local_path: Path, bucket: str, prefix: str, profile:
 
 def main():
     args = parse_args()
-    if args.mode == "valkey" and (args.target_host == DEFAULT_TARGET or not args.target_host):
+    if args.mode == "valkey" and not args.target_host:
         print("Discovering Valkey node IP via AWS tags...")
         args.target_host = discover_valkey_ip(args.region, args.aws_profile, args.seed)
         print(f"Discovered Valkey host: {args.target_host}")
+    if not args.target_host:
+        raise SystemExit(
+            "ERROR: --target-host is required for proxy mode. Use --mode "
+            "valkey to auto-discover a Valkey node by --seed.")
     target_cmd = build_benchmark_command(args)
     print(f"Executing benchmark command: {target_cmd}")
 

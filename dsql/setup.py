@@ -468,7 +468,14 @@ def main():
     log(f"  State file:      {STATE_FILE}")
     log("")
     log("Next steps:")
-    log(f"  Benchmark: python3 -m dsql.benchmark --seed {args.seed}")
+    log(
+        "  Benchmark: python3 -m dsql.benchmark --action run "
+        f"--seed {args.seed} --host {client_info.public_ip} "
+        f"--dsql-cluster-id {cluster_id} "
+        f"--dsql-cluster-endpoint {endpoint} "
+        f"--dsql-region {_cu.REGION} --dsql-db-profile {_cu.DB_PROFILE} "
+        f"--aws-profile {_cu.AWS_PROFILE}"
+    )
     log(f"  Validate:  python3 -m dsql.validate --seed {args.seed}")
     log(f"  Cleanup:   python3 -m dsql.setup --seed {args.seed} --cleanup")
 

@@ -1340,6 +1340,68 @@ def _is_write_heavy(workload: str) -> bool:
     return any(kw in wl for kw in write_keywords)
 
 
+def resolve_profile_options(
+    args,
+    workload: str,
+    *,
+    default_tables: int,
+    default_table_size: int,
+    default_threads: int,
+    default_duration: int,
+    default_profile: Optional[str] = None,
+    default_disk_fill_pct: Optional[int] = None,
+) -> dict:
+    """Resolve profile and explicit sizing flags for sysbench engines."""
+    explicit_sizing = any(
+        getattr(args, name, None) is not None
+        for name in ("tables", "table_size", "threads", "duration")
+    )
+    profile_name = getattr(args, "profile", None)
+    if profile_name is None and default_profile and not explicit_sizing:
+        profile_name = default_profile
+
+    tables = getattr(args, "tables", None) or default_tables
+    table_size = getattr(args, "table_size", None) or default_table_size
+    threads = getattr(args, "threads", None) or default_threads
+    duration = getattr(args, "duration", None) or default_duration
+    disk_fill_pct = getattr(args, "disk_fill_pct", None)
+    multi_phase = None
+    multi_phase_name = None
+
+    if profile_name:
+        profile = WORKLOAD_PROFILES[profile_name]
+        workload = profile.get("workload", workload)
+        if getattr(args, "tables", None) is None:
+            tables = profile["tables"]
+        if getattr(args, "table_size", None) is None:
+            table_size = profile.get("table_size", table_size)
+        if getattr(args, "threads", None) is None:
+            threads = profile["threads"]
+        if getattr(args, "duration", None) is None:
+            duration = profile["duration"]
+            if _is_write_heavy(workload) and "write_duration" in profile:
+                duration = profile["write_duration"]
+        if disk_fill_pct is None:
+            disk_fill_pct = profile.get("disk_fill_pct")
+        multi_phase_name = profile.get("multi_phase")
+        multi_phase = (MULTI_PHASE_PROFILES[multi_phase_name]["phases"]
+                       if multi_phase_name else None)
+    if disk_fill_pct is None:
+        disk_fill_pct = default_disk_fill_pct
+
+    return {
+        "profile_name": profile_name,
+        "workload": workload,
+        "tables": tables,
+        "table_size": table_size,
+        "threads": threads,
+        "duration": duration,
+        "disk_fill_pct": disk_fill_pct,
+        "multi_phase": multi_phase,
+        "multi_phase_name": multi_phase_name,
+    }
+
+
 def order_workloads_read_write_read(workloads: list) -> list:
     """Reorder workloads: reads first, then writes, then reads again
     with a ``_post_write`` suffix for the second read pass."""
@@ -2758,7 +2820,7 @@ def parse_args():
 
     p.add_argument("--profile", choices=list(WORKLOAD_PROFILES.keys()),
                    default=None,
-                   help="Workload profile (quick/light/medium/heavy/stress/scaling)")
+                   help="Workload profile (quick/light/standard/heavy/stress/scaling)")
     p.add_argument("--isolation-level",
                    choices=list(ISOLATION_LEVEL_MAP.keys()),
                    default="read-committed",
@@ -2894,28 +2956,17 @@ def _build_deploy_params(args):
         else:
             tidb_endpoint = "127.0.0.1"
 
-        if profile_name:
-            profile = WORKLOAD_PROFILES[profile_name]
-            tables = args.tables if args.tables is not None else profile["tables"]
-            table_size = (args.table_size if args.table_size is not None
-                          else profile["table_size"])
-            threads = (args.threads if args.threads is not None
-                       else profile["threads"])
-            duration = (args.duration if args.duration is not None
-                        else profile["duration"])
-            if args.duration is None and _is_write_heavy(workload) and "write_duration" in profile:
-                duration = profile["write_duration"]
-            multi_phase_name = profile.get("multi_phase")
-            multi_phase = (MULTI_PHASE_PROFILES[multi_phase_name]["phases"]
-                           if multi_phase_name else None)
-            if "workload" in profile:
-                workload = profile["workload"]
-        else:
-            tables = args.tables if args.tables is not None else 16
-            table_size = args.table_size if args.table_size is not None else 100000
-            threads = args.threads if args.threads is not None else 64
-            duration = args.duration if args.duration is not None else 120
-            multi_phase = None
+        resolved = resolve_profile_options(
+            args, workload,
+            default_tables=16, default_table_size=100000,
+            default_threads=64, default_duration=120)
+        workload = resolved["workload"]
+        tables = resolved["tables"]
+        table_size = resolved["table_size"]
+        threads = resolved["threads"]
+        duration = resolved["duration"]
+        profile_name = resolved["profile_name"]
+        multi_phase = resolved["multi_phase"]
 
         extra_args = [f"--mysql-ignore-errors={MYSQL_IGNORE_ERRORS}"]
         skip_trx = workload in ("oltp_read_only", "oltp_point_select")
@@ -2983,6 +3034,11 @@ def _build_deploy_params(args):
         }
 
     elif server_type == "dsql":
+        raise SystemExit(
+            "ERROR: DSQL remote deploy is not supported because IAM auth "
+            "tokens must be generated/refreshed during the run. Use "
+            "--action run with --dsql-cluster-endpoint and "
+            "--dsql-cluster-id.")
         endpoint = getattr(args, "dsql_cluster_endpoint", None) or ""
         if not endpoint:
             endpoint = getattr(args, "endpoint", None) or ""
@@ -3243,19 +3299,15 @@ def _main_aurora(args):
                     else DEFAULT_FILL_THREADS)
     fill_db = args.fill_db or DEFAULT_FILL_DB
 
-    # Apply workload profile overrides (if --profile given and args not explicit)
-    if getattr(args, "profile", None) and args.profile in WORKLOAD_PROFILES:
-        wp = WORKLOAD_PROFILES[args.profile]
-        if args.tables is None:
-            tables = wp["tables"]
-        if args.table_size is None:
-            table_size = wp.get("table_size", table_size)
-        if args.threads is None:
-            threads = wp["threads"]
-        if args.duration is None:
-            duration = wp["duration"]
-            if _is_write_heavy(workload) and "write_duration" in wp:
-                duration = wp["write_duration"]
+    resolved = resolve_profile_options(
+        args, workload,
+        default_tables=tables, default_table_size=table_size,
+        default_threads=threads, default_duration=duration)
+    workload = resolved["workload"]
+    tables = resolved["tables"]
+    table_size = resolved["table_size"]
+    threads = resolved["threads"]
+    duration = resolved["duration"]
 
     if workload not in AURORA_WORKLOADS:
         raise SystemExit(
@@ -3287,7 +3339,7 @@ def _main_aurora(args):
 
     if not host or not endpoint:
         log("ERROR: Could not determine host or endpoint. "
-            "Run aurora_setup.py first or pass --host/--endpoint.")
+            "Run python3 -m aurora.setup first or pass --host/--endpoint.")
         sys.exit(1)
 
     instance_type = info.get("aurora_instance_type", "")
@@ -3708,18 +3760,15 @@ def _main_dsql(args):
     report_interval = (args.report_interval if args.report_interval is not None
                        else 10)
 
-    if getattr(args, "profile", None) and args.profile in WORKLOAD_PROFILES:
-        wp = WORKLOAD_PROFILES[args.profile]
-        if args.tables is None:
-            tables = wp["tables"]
-        if args.table_size is None:
-            table_size = wp.get("table_size", table_size)
-        if args.threads is None:
-            threads = wp["threads"]
-        if args.duration is None:
-            duration = wp["duration"]
-            if _is_write_heavy(workload) and "write_duration" in wp:
-                duration = wp["write_duration"]
+    resolved = resolve_profile_options(
+        args, workload,
+        default_tables=16, default_table_size=100000,
+        default_threads=64, default_duration=300)
+    workload = resolved["workload"]
+    tables = resolved["tables"]
+    table_size = resolved["table_size"]
+    threads = resolved["threads"]
+    duration = resolved["duration"]
 
     seed = args.seed or "default"
     client_state = _load_bench_client(seed)
@@ -4045,18 +4094,15 @@ def _main_aurora_pg(args):
     report_interval = (args.report_interval if args.report_interval is not None
                        else 10)
 
-    if getattr(args, "profile", None) and args.profile in WORKLOAD_PROFILES:
-        wp = WORKLOAD_PROFILES[args.profile]
-        if args.tables is None:
-            tables = wp["tables"]
-        if args.table_size is None:
-            table_size = wp.get("table_size", table_size)
-        if args.threads is None:
-            threads = wp["threads"]
-        if args.duration is None:
-            duration = wp["duration"]
-            if _is_write_heavy(workload) and "write_duration" in wp:
-                duration = wp["write_duration"]
+    resolved = resolve_profile_options(
+        args, workload,
+        default_tables=16, default_table_size=100000,
+        default_threads=64, default_duration=300)
+    workload = resolved["workload"]
+    tables = resolved["tables"]
+    table_size = resolved["table_size"]
+    threads = resolved["threads"]
+    duration = resolved["duration"]
 
     endpoint = getattr(args, "endpoint", None) or ""
     if not endpoint:
@@ -4309,7 +4355,11 @@ def _main_tidb(args):
     duration_arg = args.duration if args.duration is not None else 120
     report_interval = (args.report_interval if args.report_interval is not None
                        else 10)
-    profile_name = args.profile or "heavy"
+    explicit_sizing = any(
+        value is not None for value in (
+            args.tables, args.table_size, args.threads, args.duration))
+    profile_name = args.profile if args.profile is not None else (
+        None if explicit_sizing else "heavy")
     disk_fill_pct = args.disk_fill_pct
     downstream_port = (args.downstream_port if args.downstream_port is not None
                        else INTERNAL_SERVICE_PORT)
@@ -4446,25 +4496,24 @@ def _run_tidb_benchmark(
         log("Cleanup complete.")
         return
 
-    multi_phase = None
+    resolved = resolve_profile_options(
+        args, workload,
+        default_tables=tables, default_table_size=table_size,
+        default_threads=threads, default_duration=duration,
+        default_profile="heavy", default_disk_fill_pct=30)
+    workload = resolved["workload"]
+    tables = resolved["tables"]
+    table_size = resolved["table_size"]
+    threads = resolved["threads"]
+    duration = resolved["duration"]
+    profile_name = resolved["profile_name"]
+    disk_fill_pct = resolved["disk_fill_pct"]
+    multi_phase = resolved["multi_phase_name"]
     if profile_name:
-        profile = WORKLOAD_PROFILES[profile_name]
-        tables = profile["tables"]
-        table_size = profile["table_size"]
-        threads = profile["threads"]
-        duration = profile["duration"]
-        if _is_write_heavy(workload) and "write_duration" in profile:
-            duration = profile["write_duration"]
-        multi_phase = profile.get("multi_phase")
-        if disk_fill_pct is None:
-            disk_fill_pct = profile.get("disk_fill_pct", 30)
         log(f"Using profile '{profile_name}': {tables} tables, "
             f"{threads} threads, {duration}s")
         if multi_phase:
             log(f"  Multi-phase mode: {multi_phase}")
-    else:
-        if disk_fill_pct is None:
-            disk_fill_pct = 30
 
     try:
         print_cluster_summary(host, key_path, region, aws_profile, seed, port,
@@ -4888,3 +4937,7 @@ mysql -h {db_host} -P {port} -u root -e \
                          _dt.now(_tz.utc).isoformat(),
                          summary_data=summary_data)
     log("Benchmark complete.")
+
+
+if __name__ == "__main__":
+    main()

@@ -15,12 +15,16 @@ benchmark-results*.txt
 cleanup.log
 *.log
 *report.md
+valkey-flamegraph*.svg
 
 # DSQL local artifacts
 dsql/dsql-sysbench-*.json
 dsql/dsql-results-*.json
 dsql/dsql-sampler-*.csv
 dsql/dsql-state.json
+
+# Aurora local artifacts
+aurora/aurora-bench-state.json
 
 # TiDB local artifacts
 tidb/tidb-sysbench-*.json

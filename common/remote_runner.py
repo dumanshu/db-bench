@@ -85,15 +85,25 @@ def generate_sysbench_script(params: dict) -> tuple[str, str]:
     else:
         workload_arg = workload
 
-    pw_flag = f"--mysql-password='{password}'" if password else ""
+    pg_engine = server_type in ("aurora-pg", "dsql")
     extra_str = " ".join(extra_args) if extra_args else ""
 
-    sysbench_opts = (
-        f"--mysql-host='{endpoint}' --mysql-port={port} "
-        f"--mysql-user={user} {pw_flag} --mysql-db={db} "
-        f"--tables={tables} --table-size={table_size} "
-        f"--report-interval={report_interval} --percentile=99"
-    )
+    if pg_engine:
+        pw_flag = f"--pgsql-password='{password}'" if password else ""
+        sysbench_opts = (
+            f"--db-driver=pgsql --pgsql-host='{endpoint}' --pgsql-port={port} "
+            f"--pgsql-user={user} {pw_flag} --pgsql-db={db} "
+            f"--tables={tables} --table-size={table_size} "
+            f"--report-interval={report_interval} --percentile=99"
+        )
+    else:
+        pw_flag = f"--mysql-password='{password}'" if password else ""
+        sysbench_opts = (
+            f"--mysql-host='{endpoint}' --mysql-port={port} "
+            f"--mysql-user={user} {pw_flag} --mysql-db={db} "
+            f"--tables={tables} --table-size={table_size} "
+            f"--report-interval={report_interval} --percentile=99"
+        )
     if extra_str:
         sysbench_opts += f" {extra_str}"
 
@@ -111,11 +121,17 @@ def generate_sysbench_script(params: dict) -> tuple[str, str]:
     prepare_block = ""
     if not skip_prepare:
         pw_mysql = f"-p'{password}'" if password else ""
+        create_db_cmd = (
+            f"PGPASSWORD='{password}' createdb -h '{endpoint}' -p {port} "
+            f"-U {user} {db} 2>&1 || true"
+            if pg_engine else
+            f"mysql -h '{endpoint}' -P {port} -u {user} {pw_mysql} "
+            f"-e 'CREATE DATABASE IF NOT EXISTS {db}' 2>&1 || true"
+        )
         prepare_block = dedent(f"""\
             update_status "prepare" "" ""
             echo ">>> Creating database {db} (if not exists)"
-            mysql -h '{endpoint}' -P {port} -u {user} {pw_mysql} \\
-                -e 'CREATE DATABASE IF NOT EXISTS {db}' 2>&1 || true
+            {create_db_cmd}
             echo ">>> Phase: prepare"
             sysbench {workload_arg} {sysbench_opts} --threads={threads} prepare 2>&1
             echo ">>> Phase prepare completed with exit code $?"
