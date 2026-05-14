@@ -4763,18 +4763,19 @@ mysql -h {db_host} -P {port} -u root -e \
     )
 
     fetch_final_resource_snapshot(host, key_path, port, db_host=db_host)
-    if load_stats:
-        disk_final = get_disk_utilization(
-            host, key_path, port, detected_ebs_gb, database,
-            db_host=db_host)
-        log("")
-        log("--- Final Disk Utilization ---")
-        log(f"  EBS: {disk_final['ebs_used_gb']}GB / "
-            f"{disk_final['ebs_total_gb']}GB "
-            f"({disk_final['ebs_used_pct']}%)")
-        log(f"  TiKV stores: {disk_final['tikv_store_gb']:.1f}GB "
-            f"({disk_final['tikv_store_pct']:.1f}%)")
-        log(f"  Benchmark DB: {disk_final['db_data_gb']:.2f}GB")
+    # Always capture the post-benchmark disk picture so the result JSON has
+    # tikv_store_bytes / db_data_bytes regardless of --no-disk-fill.
+    disk_final = get_disk_utilization(
+        host, key_path, port, detected_ebs_gb, database,
+        db_host=db_host)
+    log("")
+    log("--- Final Disk Utilization ---")
+    log(f"  EBS: {disk_final['ebs_used_gb']}GB / "
+        f"{disk_final['ebs_total_gb']}GB "
+        f"({disk_final['ebs_used_pct']}%)")
+    log(f"  TiKV stores: {disk_final['tikv_store_gb']:.1f}GB "
+        f"({disk_final['tikv_store_pct']:.1f}%)")
+    log(f"  Benchmark DB: {disk_final['db_data_gb']:.2f}GB")
 
     cost_tracker.print_cost_summary()
 
@@ -4860,6 +4861,16 @@ mysql -h {db_host} -P {port} -u root -e \
             benchmark_metrics["tidb_resource_snapshots"] = parsed_snapshots
             benchmark_metrics["tidb_resource_summary"] = (
                 summarize_tidb_resource_snapshots(parsed_snapshots))
+        benchmark_metrics["disk_utilization"] = {
+            "initial": _disk_probe,
+            "final": disk_final,
+            "delta_db_data_gb": (
+                disk_final.get("db_data_gb", 0)
+                - _disk_probe.get("db_data_gb", 0)),
+            "delta_tikv_store_gb": (
+                disk_final.get("tikv_store_gb", 0)
+                - _disk_probe.get("tikv_store_gb", 0)),
+        }
         interval_data = benchmark_metrics.get('interval_data', interval_data)
         sampler_ws = benchmark_metrics.get('window_stats', sampler_ws)
 
