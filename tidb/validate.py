@@ -22,7 +22,15 @@ DEFAULT_PORT = 30400
 
 
 
-def discover_tidb_host(region: str, profile: Optional[str], seed: str) -> dict:
+def discover_tidb_host(region: str, profile: Optional[str], seed: str) -> Optional[dict]:
+    """Find the k3s control instance for this TiDB stack.
+
+    The control host runs ``kubectl`` against the in-cluster TiDB Operator and
+    is what every health check below SSHes to. ``tidb.setup`` tags it with
+    ``Role=control`` (formerly ``Role=host``); ``common.client`` tags benchmark
+    clients with ``Role=bench-client`` in a separate stack. Either is a viable
+    SSH entrypoint for validation, but ``control`` is the canonical one.
+    """
     client = ec2_client(profile=profile, region=region)
     stack = f"tidb-loadtest-{seed}"
     filters = [
@@ -30,20 +38,28 @@ def discover_tidb_host(region: str, profile: Optional[str], seed: str) -> dict:
         {"Name": "instance-state-name", "Values": ["pending", "running"]},
     ]
     resp = client.describe_instances(Filters=filters)
+    fallback = None
     for reservation in resp.get("Reservations", []):
         for inst in reservation.get("Instances", []):
             tags = {tag["Key"]: tag["Value"] for tag in inst.get("Tags", [])}
             role = tags.get("Role", "")
-            if role in ("host", "client"):
-                return {
-                    "instance_id": inst["InstanceId"],
-                    "public_ip": inst.get("PublicIpAddress"),
-                    "private_ip": inst.get("PrivateIpAddress"),
-                    "instance_type": inst.get("InstanceType"),
-                    "state": inst.get("State", {}).get("Name"),
-                    "availability_zone": inst.get("Placement", {}).get("AvailabilityZone"),
-                }
-    return None
+            info = {
+                "instance_id": inst["InstanceId"],
+                "public_ip": inst.get("PublicIpAddress"),
+                "private_ip": inst.get("PrivateIpAddress"),
+                "instance_type": inst.get("InstanceType"),
+                "state": inst.get("State", {}).get("Name"),
+                "availability_zone": inst.get("Placement", {}).get("AvailabilityZone"),
+                "role": role,
+            }
+            # Prefer the control host (canonical kubectl entrypoint).
+            if role == "control":
+                return info
+            # Backwards compatibility with older stacks that tagged the
+            # control/client host as "host" or "client".
+            if role in ("host", "client") and fallback is None:
+                fallback = info
+    return fallback
 
 
 def check_ssh_connectivity(host: str, key_path: Path) -> bool:
