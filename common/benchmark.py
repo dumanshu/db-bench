@@ -6,6 +6,7 @@ benchmarks to the remote runner (memtier_benchmark).  The CLI entry point
 """
 
 import hashlib
+import json
 import os
 import re
 import subprocess
@@ -413,6 +414,112 @@ _CUSTOM_MIXED_QUERY_INTERVAL_V1_RE = re.compile(
     r'avg_ms=(?P<avg>[\d.]+)\tmax_ms=(?P<max>[\d.]+)'
 )
 
+_CUSTOM_MIXED_QUERY_STATS_V3_RE = re.compile(
+    r'CUSTOM_MIXED_QUERY_STATS_V3\ttid=(?P<tid>-?\d+)\t'
+    r'type=(?P<type>[^\t]+)\tcategory=(?P<category>[^\t]+)\t'
+    r'key=(?P<key>[^\t]+)\ttemplate=(?P<template>.*?)\t'
+    r'count=(?P<count>\d+)\ttotal_ms=(?P<total>[\d.]+)\t'
+    r'min_ms=(?P<min>[\d.]+)\tavg_ms=(?P<avg>[\d.]+)\t'
+    r'max_ms=(?P<max>[\d.]+)\thist=(?P<hist>\{[^\n]*\})'
+)
+
+_CUSTOM_MIXED_QUERY_INTERVAL_V3_RE = re.compile(
+    r'CUSTOM_MIXED_QUERY_INTERVAL_V3\ttid=(?P<tid>-?\d+)\t'
+    r'minute=(?P<minute>\d+)\tfrom_ms=(?P<from>[\d.]+)\t'
+    r'to_ms=(?P<to>[\d.]+)\ttype=(?P<type>[^\t]+)\t'
+    r'category=(?P<category>[^\t]+)\tkey=(?P<key>[^\t]+)\t'
+    r'template=(?P<template>.*?)\tcount=(?P<count>\d+)\t'
+    r'total_ms=(?P<total>[\d.]+)\tmin_ms=(?P<min>[\d.]+)\t'
+    r'avg_ms=(?P<avg>[\d.]+)\tmax_ms=(?P<max>[\d.]+)\t'
+    r'hist=(?P<hist>\{[^\n]*\})'
+)
+
+PERCENTILE_KEYS = (
+    ("p0_ms", 0.0),
+    ("p10_ms", 10.0),
+    ("p50_ms", 50.0),
+    ("p75_ms", 75.0),
+    ("p90_ms", 90.0),
+    ("p95_ms", 95.0),
+    ("p99_ms", 99.0),
+    ("p99_9_ms", 99.9),
+    ("p100_ms", 100.0),
+)
+
+
+def _hdrh_module():
+    """Lazy-import HdrHistogram_py with a clear pip-install error message."""
+    try:
+        from hdrh.histogram import HdrHistogram
+    except ImportError as exc:
+        raise SystemExit(
+            "ERROR: hdrhistogram package is required to parse "
+            "CUSTOM_MIXED_QUERY_*_V3 lines. Install with: "
+            "pip install hdrhistogram (or pip install -r requirements.txt)"
+        ) from exc
+    return HdrHistogram
+
+
+def _hdr_from_lua_json(payload: str):
+    """Reconstruct an HdrHistogram from the compact Lua V3 JSON payload."""
+    try:
+        data = json.loads(payload)
+    except (ValueError, TypeError):
+        return None
+    HdrHistogram = _hdrh_module()
+    h = HdrHistogram(int(data["l"]), int(data["h"]), int(data["s"]))
+    for idx, count in data.get("b", []):
+        if count > 0 and 0 <= int(idx) < h.counts_len:
+            h.counts[int(idx)] += int(count)
+    h.total_count = int(data.get("t", 0))
+    if h.total_count > 0:
+        h.min_value = int(data.get("mn", 0))
+        h.max_value = int(data.get("mx", 0))
+    return h
+
+
+def _merge_hdr(target, source):
+    """In-place element-wise merge of source into target (same bucket layout)."""
+    if source is None:
+        return target
+    if target is None:
+        return source
+    for i in range(source.counts_len):
+        c = source.counts[i]
+        if c:
+            target.counts[i] += c
+    target.total_count += source.total_count
+    if source.total_count > 0:
+        if target.total_count == source.total_count:
+            target.min_value = source.min_value
+            target.max_value = source.max_value
+        else:
+            target.min_value = min(target.min_value, source.min_value)
+            target.max_value = max(target.max_value, source.max_value)
+    return target
+
+
+def _percentiles_from_hdr(hdr) -> dict:
+    """Extract avg/min/max + 9 percentiles from an HdrHistogram (us -> ms).
+
+    p0 and p100 use the raw recorded min/max (exact values), not the
+    bucket-edge HDR returns from get_value_at_percentile(0/100).
+    Everything else uses HDR's get_value_at_percentile (bucket-edge,
+    ~0.1% quantization at sig=3).
+    """
+    if hdr is None or hdr.total_count == 0:
+        return {}
+    result = {}
+    for key, p in PERCENTILE_KEYS:
+        if p == 0.0:
+            v = hdr.min_value
+        elif p == 100.0:
+            v = hdr.max_value
+        else:
+            v = hdr.get_value_at_percentile(p)
+        result[key] = round(v / 1000.0, 3)
+    return result
+
 
 # ---------------------------------------------------------------------------
 # Private helpers
@@ -490,8 +597,13 @@ def parse_custom_mixed_op_stats(text: str) -> dict:
 
 def parse_custom_mixed_query_stats(text: str) -> dict:
     stats: dict[str, dict] = {}
-    records = list(_CUSTOM_MIXED_QUERY_STATS_V1_RE.finditer(text))
-    records.extend(_CUSTOM_MIXED_QUERY_STATS_RE.finditer(text))
+    hdrs: dict[str, object] = {}
+    v3_records = list(_CUSTOM_MIXED_QUERY_STATS_V3_RE.finditer(text))
+    if v3_records:
+        records = v3_records
+    else:
+        records = list(_CUSTOM_MIXED_QUERY_STATS_V1_RE.finditer(text))
+        records.extend(_CUSTOM_MIXED_QUERY_STATS_RE.finditer(text))
     for m in records:
         key = m.group("key")
         query_type = m.group("type")
@@ -518,10 +630,16 @@ def parse_custom_mixed_query_stats(text: str) -> dict:
                     "incoming": meta_value,
                 })
         _merge_latency_line(dest, count, total_ms, min_ms, max_ms)
+        if "hist" in m.groupdict():
+            hdr = _hdr_from_lua_json(m.group("hist"))
+            if hdr is not None:
+                hdrs[key] = _merge_hdr(hdrs.get(key), hdr)
     finalized = _finalize_latency_stats(stats)
-    for dest in finalized.values():
+    for key, dest in finalized.items():
         if not dest.get("metadata_conflicts"):
             dest.pop("metadata_conflicts", None)
+        if key in hdrs:
+            dest.update(_percentiles_from_hdr(hdrs[key]))
     return finalized
 
 
@@ -553,7 +671,13 @@ def parse_custom_mixed_op_interval_stats(text: str) -> dict:
 
 def parse_custom_mixed_query_interval_stats(text: str) -> dict:
     minutes: dict[int, dict] = {}
-    for m in _CUSTOM_MIXED_QUERY_INTERVAL_V1_RE.finditer(text):
+    minute_hdrs: dict[int, dict] = {}
+    v3_records = list(_CUSTOM_MIXED_QUERY_INTERVAL_V3_RE.finditer(text))
+    if v3_records:
+        records = v3_records
+    else:
+        records = list(_CUSTOM_MIXED_QUERY_INTERVAL_V1_RE.finditer(text))
+    for m in records:
         minute = int(m.group("minute"))
         entry = minutes.setdefault(minute, {
             "minute": minute,
@@ -587,11 +711,19 @@ def parse_custom_mixed_query_interval_stats(text: str) -> dict:
             float(m.group("min")),
             float(m.group("max")),
         )
-    for entry in minutes.values():
+        if "hist" in m.groupdict():
+            hdr = _hdr_from_lua_json(m.group("hist"))
+            if hdr is not None:
+                bucket = minute_hdrs.setdefault(minute, {})
+                bucket[key] = _merge_hdr(bucket.get(key), hdr)
+    for minute, entry in minutes.items():
         finalized = _finalize_latency_stats(entry["query_latency_ms"])
-        for stats in finalized.values():
+        for key, stats in finalized.items():
             if not stats.get("metadata_conflicts"):
                 stats.pop("metadata_conflicts", None)
+            hdr = minute_hdrs.get(minute, {}).get(key)
+            if hdr is not None:
+                stats.update(_percentiles_from_hdr(hdr))
         entry["query_latency_ms"] = finalized
     return dict(sorted(minutes.items()))
 
@@ -603,7 +735,7 @@ def _offset_custom_mixed_interval_minutes(text: str, minute_offset: int,
         return text
 
     pattern = re.compile(
-        r'(CUSTOM_MIXED_(?:OP|QUERY)_INTERVAL_V1\ttid=-?\d+\tminute=)'
+        r'(CUSTOM_MIXED_(?:OP|QUERY)_INTERVAL_V[123]\ttid=-?\d+\tminute=)'
         r'(\d+)'
         r'(\tfrom_ms=)'
         r'([\d.]+)'
@@ -3997,10 +4129,16 @@ def _main_dsql(args):
             stats = query_latency[key]
             if not stats or not stats.get("count"):
                 continue
+            pct_str = ""
+            if stats.get("p50_ms") is not None:
+                pct_str = (
+                    f" p50={stats.get('p50_ms')} p95={stats.get('p95_ms')} "
+                    f"p99={stats.get('p99_ms')} p99.9={stats.get('p99_9_ms')}"
+                )
             log(
                 f"    {key:<18} type={stats.get('type')} "
                 f"category={stats.get('category')} count={stats.get('count')} "
-                f"avg={stats.get('avg_ms')} max={stats.get('max_ms')} "
+                f"avg={stats.get('avg_ms')} max={stats.get('max_ms')}{pct_str} "
                 f"template={stats.get('template')}"
             )
     if combined.get("segments"):
