@@ -24,7 +24,10 @@ aurora-pg/       Aurora PostgreSQL benchmark wrapper
 
 ## Prerequisites
 
-- Python 3.10+ with `boto3` and `botocore`
+- Python 3.10+ with deps from `requirements.txt` (`pip install -r requirements.txt`):
+  `boto3`, `botocore`, and `hdrhistogram` (used to decode per-shape per-minute
+  HDR Histogram blobs emitted by the `custom_mixed` Lua workload for
+  p0/p10/p50/p75/p90/p95/p99/p99.9/p100 reporting).
 - AWS CLI v2 configured with a profile pointing at the target account (default profile: `sandbox`)
 - `ssh` and `scp` in PATH
 
